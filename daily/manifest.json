@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "subject": "Apache Iceberg",
+  "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
+  "accent": "#22d3ee",
+  "totalDays": 63,
+  "updatedAt": null,
+  "lessons": []
+}
