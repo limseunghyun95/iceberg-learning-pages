@@ -4,6 +4,16 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": null,
-  "lessons": []
+  "updatedAt": "2026-07-29T09:04:26+09:00",
+  "lessons": [
+    {
+      "day": 1,
+      "week": 1,
+      "title": "raw Parquet/Hive partition의 한계",
+      "summary": "파일 저장 형식과 transactional table state의 책임 경계를 Iceberg metadata tree와 장애 시나리오로 학습합니다.",
+      "path": "day-01.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-29T09:04:26+09:00"
+    }
+  ]
 }
