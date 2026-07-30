@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 02</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;overflow:hidden;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 1 / DAY 02</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">file/table/catalog/engine/warehouse 경계</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Lakehouse와 Table Format 정신 모델 · 예상 학습 30분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg 운영의 첫 번째 기술은 구성요소 이름을 외우는 것이 아니라, “누가 어떤 상태를 소유하고 어느 계층에서 성공이 확정되는가”를 file format·table format·catalog·query engine·warehouse로 분리하는 것이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:30%;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">File format</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">한 파일의 바이트 배치, 타입 인코딩, 압축과 통계를 정의한다. Parquet·ORC·Avro가 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Table format</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">여러 파일을 하나의 일관된 table state로 관리하는 metadata 구조와 transaction 규칙이다. Iceberg는 open table format이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Catalog</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">table 이름을 현재 metadata 위치에 연결하고 create·load·rename·drop·commit을 조정하는 control plane의 진입점이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Query engine</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">SQL이나 API를 계획하고 task를 실행하는 계산 계층이다. Spark·Flink·Trino 등이 같은 Iceberg table을 사용할 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Warehouse</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">table의 metadata·data file이 배치되는 기본 저장 경로다. 로컬 파일 시스템, HDFS, S3 같은 object storage가 될 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Pointer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">실제 내용을 복사하는 대신 현재 유효한 객체의 위치를 가리키는 참조다. 주소표에서 최신 판의 위치를 찾는 것에 비유할 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Control path / Data path</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Control path는 이름·권한·현재 상태·commit 결정을 전달하고, data path는 실제 metadata와 row data의 바이트를 읽고 쓴다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">CAS</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Compare-and-swap. “내가 읽은 이전 값이 아직 current일 때만 새 값으로 바꾼다”는 원자적 갱신 방식이다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>장애 메시지 하나가 여러 계층에서 만들어질 수 있다. <code style="overflow-wrap:anywhere;">TABLE_OR_VIEW_NOT_FOUND</code>가 났다고 해도 warehouse에서 file이 사라졌다는 뜻은 아니다. Catalog 이름이나 namespace가 틀렸을 수 있고, engine의 catalog cache가 오래됐을 수 있으며, catalog가 가리킨 metadata file에 접근할 권한이 없을 수도 있다.</p>
+  <p>반대로 S3나 local warehouse에서 Parquet file을 직접 열 수 있다고 table이 정상인 것도 아니다. Current snapshot에서 그 file이 참조되지 않거나, delete file을 함께 적용하지 않았거나, old schema를 field ID가 아닌 이름으로 잘못 읽을 수 있다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>운영 질문:</strong> “파일이 있습니까?”보다 먼저 “어느 catalog의 어느 metadata pointer에서 시작해 어떤 snapshot과 manifest를 따라 이 파일에 도달했습니까?”를 묻는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <p>아래에서 위쪽은 control path, 아래쪽은 data path다. Query engine은 양쪽을 연결하지만 table state의 유일한 소유자는 아니다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>① Client SQL / API</strong><br><span style="font-size:14px;color:#cdebf0;">SELECT · INSERT · MERGE · ALTER</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>② Query engine</strong><br><span style="font-size:14px;color:#cdebf0;">parse → optimize → plan → execute</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓ control path</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;overflow-wrap:anywhere;"><strong>③ Catalog</strong><br><span style="font-size:14px;">catalog.namespace.table → current metadata pointer · commit CAS</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓ data path</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;overflow-wrap:anywhere;"><strong>④ Iceberg table metadata</strong><br><span style="font-size:14px;">metadata JSON → snapshot → manifest list → manifest</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓ FileIO read / write</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;overflow-wrap:anywhere;"><strong>⑤ Warehouse / object storage</strong><br><span style="font-size:14px;">metadata files · Parquet/ORC/Avro data · delete files</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Read 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Client가 <code>local.sales.orders</code>를 조회하면 engine은 <code>local</code>을 catalog 이름으로 해석한다.</li>
+    <li>Engine이 catalog에 <code>sales.orders</code> load를 요청한다. Catalog는 현재 metadata 위치를 제공한다.</li>
+    <li>Engine의 Iceberg connector는 metadata JSON에서 current snapshot을 선택한다. 이 시점부터 reader는 한 committed state를 기준으로 계획한다.</li>
+    <li>Manifest list와 manifest의 partition·column metrics로 필요 없는 file을 pruning한다.</li>
+    <li>FileIO가 warehouse에서 선택된 data/delete file만 읽는다. Engine은 delete 적용, projection, filter와 task 실행을 담당한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Write와 optimistic commit</h3>
+  <ol style="padding-left:22px;">
+    <li>Engine이 base metadata·snapshot·schema·partition spec을 읽어 write plan을 만든다.</li>
+    <li>Task가 warehouse의 고유 경로에 immutable data/delete file을 쓴다. 아직 current table state가 아니다.</li>
+    <li>Driver가 새 manifest, manifest list와 metadata JSON을 만든다.</li>
+    <li>Commit 전 현재 state가 바뀌었는지 operation별 conflict validation을 한다. Concurrent append와 predicate overwrite는 같은 조건으로 재시도할 수 없다.</li>
+    <li>Catalog가 base pointer를 비교해 새 metadata pointer로 CAS한다. <strong>이 교체 성공이 commit의 linearization point</strong>다.</li>
+    <li>CAS 실패 시 compatible update는 새 base 위에서 재시도할 수 있지만, unsafe conflict는 사용자에게 실패로 반환해야 한다. 미참조 파일은 orphan 후보로 남을 수 있다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:25%;">계층</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">소유 상태와 불변식</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>File format</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">한 파일 내부 row/column encoding과 통계를 소유한다. 파일 하나가 유효하다고 table 전체가 일관된 것은 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Table format</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Committed snapshot에서 도달 가능한 file 집합, schema·spec·sort order와 history를 소유한다. Reader가 partial state를 보지 않는 것이 핵심 불변식이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Catalog</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">이름→current metadata 연결과 commit 원자성을 소유한다. Catalog 장애는 storage의 byte를 즉시 지우지 않지만 load·refresh·commit availability를 제한한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Engine</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">계획, shuffle, task retry, row-level operation과 connector behavior를 소유한다. 같은 spec이라도 SQL 문법·지원 기능·cache가 다를 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Warehouse</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Byte durability와 path를 소유한다. “존재하는 file”과 “현재 table에 포함된 file”을 구분해야 한다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Indirection과 immutable state</h3>
+  <p>Iceberg는 기존 파일을 제자리에서 고치는 대신 새 파일과 새 metadata를 만들고 pointer를 바꾼다. 이 방식은 persistent data structure와 닮았다. Old snapshot은 이전 manifest tree를 계속 가리킬 수 있고, 새 snapshot은 변경된 일부 metadata와 file을 가리킨다. 장점은 reader isolation과 rollback 가능성이고, 비용은 metadata 증가·retention·cleanup 운영이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Failure window를 계층별로 보기</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Data file write 전 실패:</strong> table state 변화 없음.</li>
+    <li><strong>Data file write 후, metadata commit 전 실패:</strong> file은 있지만 table에 보이지 않는다. Orphan 후보지만 진행 중 writer와 구분해야 한다.</li>
+    <li><strong>Catalog pointer swap 후 응답 timeout:</strong> commit 성공 여부가 불명확하다. Blind retry 전에 current snapshot과 operation identity를 확인한다.</li>
+    <li><strong>Commit 후 engine cache 미갱신:</strong> 다른 engine과 결과가 일시적으로 다를 수 있다. Catalog·connector의 refresh semantics를 확인한다.</li>
+    <li><strong>Storage에서 참조 file 삭제:</strong> catalog와 metadata가 정상이어도 read가 실패한다. Metadata만 rollback해도 byte가 없으면 복구되지 않는다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Catalog 선택</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">동시 commit 보장, HA, 인증, multi-engine 지원과 latency를 기준으로 선택한다. 단순한 table 위치 저장소로만 평가하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>권한 분리</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog namespace/table 권한과 storage read/write/delete 권한을 별도로 설계한다. Catalog 접근과 byte 접근은 다른 공격면이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Engine 호환성</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Format version, data type, equality/position delete, deletion vector, branch/tag, maintenance procedure를 read/write별 matrix로 관리하고 배포 gate에서 검증한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>관측성</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Query latency만 보지 말고 catalog request latency/error, commit retry/conflict, metadata/manifest/file count, 평균 file size, snapshot age를 함께 본다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>DR</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog state와 warehouse byte를 함께 복구할 수 있어야 한다. Snapshot/time travel은 동일 storage가 손상되는 재해의 backup이 아니다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> 모든 engine에 warehouse 경로만 공유하고 “같은 Parquet를 보니 같은 table”이라고 가정하는 것. 서로 다른 catalog pointer·format support·cache를 사용하면 logical state와 결과가 갈라질 수 있다.</p>
+  <p><strong>Edge case:</strong> 한 engine이 v3 기능을 써서 metadata를 commit했지만 다른 reader가 그 format version을 지원하지 않으면, storage와 catalog는 정상이어도 구형 reader는 table을 열지 못해야 안전하다. 모르는 metadata를 무시하고 읽는 것이 더 위험하다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Spark에서는 table이 보이는데 Trino에서는 없거나, table 이름은 보이지만 file read가 실패한다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Engine별 table 존재 여부·row count 불일치, metadata JSON 또는 Parquet 접근 거부, stale snapshot, commit timeout.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">각 engine의 catalog 이름·type·URI·warehouse, table identifier, current metadata location, snapshot ID, connector/Iceberg version, storage URI와 IAM 오류, catalog latency/error/cache TTL, writer commit ID.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">서로 다른 catalog/namespace, stale cache, storage credential 차이, unsupported format feature, metadata pointer는 갱신됐지만 file upload 불완전, ambiguous commit.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Write와 cleanup을 잠시 멈추고 두 engine이 반환한 metadata location과 snapshot ID를 비교한다. Known-good snapshot을 read-only로 조회하고 정확한 failing URI의 HEAD/read 권한을 확인한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">잘못된 pointer commit이면 검증된 snapshot으로 rollback하고, credential/catalog 설정 문제면 기존 metadata를 변경하지 않은 채 설정을 복구한다. Unsupported feature면 호환 reader 배포 또는 사전 합의한 format 정책으로 전환한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Warehouse file을 수동 rename/delete하지 않는다. Catalog cache를 원인 확인 없이 반복 flush하지 않는다. Commit timeout 직후 동일 batch를 blind append하지 않는다. 구형 reader가 unknown metadata를 무시하도록 강제하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 30분 재현 실습</h2>
+  <p><strong>목표:</strong> 동일한 데이터라도 catalog를 통한 Iceberg table read와 warehouse의 raw Parquet read가 서로 다른 계약임을 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트 루트에서 Docker를 사용할 수 있고 local Hadoop catalog가 설정돼 있다.</li>
+    <li>먼저 예측한다: catalog 이름을 일부러 틀리면 warehouse file은 삭제될까? Raw Parquet로 읽으면 Iceberg snapshot/delete semantics가 유지될까?</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">최소 명령</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose exec spark spark-sql -e &quot;
+SHOW CURRENT NAMESPACE;
+SHOW NAMESPACES IN local;
+CREATE NAMESPACE IF NOT EXISTS local.day02;
+DROP TABLE IF EXISTS local.day02.boundary_lab;
+CREATE TABLE local.day02.boundary_lab (
+  id BIGINT,
+  category STRING,
+  event_time TIMESTAMP
+) USING iceberg;
+INSERT INTO local.day02.boundary_lab VALUES
+  (1, 'A', TIMESTAMP '2026-07-30 09:00:00'),
+  (2, 'B', TIMESTAMP '2026-07-30 09:01:00');
+DESCRIBE TABLE EXTENDED local.day02.boundary_lab;
+SELECT * FROM local.day02.boundary_lab ORDER BY id;
+SELECT snapshot_id, operation
+FROM local.day02.boundary_lab.snapshots;
+SELECT file_path, record_count
+FROM local.day02.boundary_lab.files;
+&quot;
+
+find warehouse -type f | sort</pre>
+  <p><strong>예상 관찰:</strong> <code>local</code>은 catalog 이름이고, <code>day02</code>는 namespace다. DESCRIBE의 Location은 warehouse 아래 table 위치를 보여준다. <code>snapshots</code>와 <code>files</code> metadata table은 raw Parquet file 자체가 제공하지 않는 table-level state를 보여준다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec spark spark-sql -e &quot;
+SELECT * FROM missing_catalog.day02.boundary_lab;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Catalog resolution 단계에서 실패하지만 warehouse의 metadata/data file은 그대로 남는다. Control path 장애와 data durability가 같은 상태가 아님을 확인한다.</p>
+  <p>그다음 DESCRIBE 결과의 table Location 아래 <code>data</code> 경로를 확인하고, 실제 경로에 맞춰 raw Parquet read를 시도한다.</p>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec spark spark-sql -e &quot;
+SELECT * FROM parquet.\`/workspace/warehouse/day02/boundary_lab/data\`;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 현재 실습에서는 row가 같아 보일 수 있지만 raw read는 catalog pointer, snapshot, delete file, schema/spec history를 우회한다. “지금 결과가 같다”는 것이 “계약이 같다”는 뜻은 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Raw Parquet path not found:</strong> HadoopCatalog의 실제 namespace/table 위치는 설정에 따라 다를 수 있다. DESCRIBE의 Location과 <code>find warehouse -type f</code>로 경로를 확인해 바꾼다.</li>
+    <li><strong>Unknown catalog:</strong> 실패 주입에서는 정상이다. 정상 query는 <code>local.day02.boundary_lab</code>을 사용한다.</li>
+    <li><strong>Metadata table syntax 오류:</strong> Spark/Iceberg runtime이 프로젝트 기준 버전인지 <code>make smoke</code>와 설정 파일로 확인한다.</li>
+    <li><strong>두 read 결과가 같아서 차이가 안 보임:</strong> 이 실습의 증거는 row 차이가 아니라 raw read에 snapshot ID·manifest·delete 적용 계약이 없다는 점이다. Day 04 이후 time travel/delete 실험에서 결과 차이가 드러난다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec spark spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day02.boundary_lab;
+DROP NAMESPACE IF EXISTS local.day02;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Table이 정상 drop됐는지 확인한 뒤 종료한다. 다른 namespace나 warehouse 상위 경로를 수동 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Warehouse가 catalog다.</strong> Warehouse는 byte 위치이고 catalog는 name/current pointer/commit을 관리한다.</li>
+    <li><strong>Engine이 table state를 소유한다.</strong> Engine은 state를 해석하고 cache할 수 있지만 committed state는 Iceberg metadata와 catalog pointer로 결정된다.</li>
+    <li><strong>같은 S3 prefix면 같은 table이다.</strong> 서로 다른 catalog·metadata pointer를 쓰면 같은 byte를 보더라도 logical state는 다를 수 있다.</li>
+    <li><strong>Catalog 장애면 data가 사라졌다.</strong> Catalog availability와 storage durability는 분리해서 확인해야 한다.</li>
+    <li><strong>Raw Parquet read가 더 단순하고 안전하다.</strong> Delete·snapshot·field ID·partition evolution을 우회해 조용히 틀린 결과를 만들 수 있다.</li>
+    <li><strong>Format version만 맞으면 multi-engine 호환이다.</strong> Engine별 read/write/maintenance 기능과 SQL semantics까지 검증해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “Spark와 Trino가 같은 Iceberg table을 공유하는 architecture를 설계해 보세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> workload와 latency/SLA → 공통 catalog와 warehouse → engine별 connector/version matrix → catalog pointer부터 file까지 read path → Spark write의 commit linearization → Trino refresh/cache → IAM 경계 → catalog outage·ambiguous commit 시나리오 → HA·관측성·rollout gate → 한 engine만 writer로 제한하는 대안의 trade-off.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. “Catalog와 object storage 중 어느 쪽이 source of truth입니까?”</h3>
+  <p><strong>좋은 답변 구조:</strong> 하나만 고르기보다 책임을 분리 → catalog는 current metadata pointer, storage는 immutable metadata/data byte → 둘이 함께 committed table state를 구성 → catalog pointer에서 도달 가능한 metadata tree라는 불변식 → 각각의 장애 시 영향 → backup/DR은 두 계층을 함께 복구 → raw directory listing을 source of truth로 삼는 대안의 한계.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. “Commit timeout 이후 동일 batch 재처리를 어떻게 안전하게 결정합니까?”</h3>
+  <p><strong>좋은 답변 구조:</strong> 성공 확정점은 catalog CAS → timeout은 unknown outcome → operation/batch/checkpoint identity와 current snapshot summary 수집 → data file 존재만으로 판정하지 않음 → append·overwrite·delete별 conflict validation → 이미 commit됐으면 중복 방지, 미commit이면 idempotent 재계획 → orphan cleanup은 safety window 뒤 수행 → 비용과 latency trade-off.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Storage에 Parquet file을 복사했는데 Iceberg table count가 늘지 않은 이유는?</li>
+    <li>Hive partition에서 logical timestamp filter만 사용하면 느리거나 틀린 결과가 생길 수 있는 이유는?</li>
+    <li>Raw Parquet directory가 multi-file atomic commit을 자체적으로 제공하지 못할 때 reader가 볼 수 있는 위험한 상태는?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>Current snapshot의 manifest에서 참조해야 membership이 생긴다고 답하면 통과.</li>
+    <li>Source column과 physical partition column의 변환 관계를 Hive가 자동 추론·검증하지 못할 수 있다고 답하면 통과.</li>
+    <li>Writer가 일부 file만 쓴 partial batch 또는 서로 다른 writer 결과가 섞인 상태라고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Catalog와 warehouse가 각각 소유하는 핵심 상태를 한 문장씩 설명하라.</li>
+    <li>Query engine이 warehouse의 Parquet를 직접 읽으면 Iceberg table read와 어떤 계약이 달라지는가?</li>
+    <li>Writer가 data file을 모두 썼지만 catalog CAS가 실패했다면 사용자에게 새 row가 보여야 하는가?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>Catalog는 name→current metadata와 commit, warehouse는 metadata/data byte와 path/durability를 담당한다고 답하면 통과.</li>
+    <li>Snapshot·manifest membership, delete 적용, field ID와 schema/spec history를 우회한다고 설명하면 통과.</li>
+    <li>아니다. Pointer 교체가 성공하지 않았으므로 file은 table state가 아니며 orphan 후보라고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/terms/" style="color:#087f98;overflow-wrap:anywhere;">Apache Iceberg Terms — catalog, snapshot, manifest와 구성요소 정의</a></li>
+    <li><a href="https://iceberg.apache.org/spec/" style="color:#087f98;overflow-wrap:anywhere;">Apache Iceberg Table Specification — metadata tree, atomic swap, optimistic concurrency</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-configuration/#catalogs" style="color:#087f98;overflow-wrap:anywhere;">Spark Configuration — catalog type, URI와 warehouse 설정</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/" style="color:#087f98;overflow-wrap:anywhere;">Apache Iceberg Documentation — open table format과 multi-engine 개요</a></li>
+  </ul>
+
+  <div style="margin-top:28px;background:#073642;color:#fff;padding:18px;border-radius:10px;">
+    <strong style="color:#8ee7f6;">내일 예고 · Day 03</strong><br>
+    Spark SQL로 Iceberg table을 실제 생성하고 INSERT·SELECT를 실행하면서, SQL 한 줄이 catalog·metadata·warehouse에서 어떤 상태 전이를 만드는지 추적합니다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

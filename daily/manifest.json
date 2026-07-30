@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-07-29T09:04:26+09:00",
+  "updatedAt": "2026-07-30T09:13:39+09:00",
   "lessons": [
     {
       "day": 1,
@@ -14,6 +14,15 @@
       "path": "day-01.html",
       "kind": "lesson",
       "publishedAt": "2026-07-29T09:04:26+09:00"
+    },
+    {
+      "day": 2,
+      "week": 1,
+      "title": "file/table/catalog/engine/warehouse 경계",
+      "summary": "각 계층이 소유하는 상태와 불변식, read/write 경로, commit 성공 시점과 장애 경계를 분리해 학습합니다.",
+      "path": "day-02.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-30T09:13:39+09:00"
     }
   ]
 }
