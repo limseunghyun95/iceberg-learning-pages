@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 04</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;overflow:hidden;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 1 / DAY 04</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">snapshot·time travel 첫 관찰</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Lakehouse와 Table Format 정신 모델 · 예상 학습 30분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Snapshot은 table 전체를 복사한 백업이 아니라 특정 시점의 metadata tree root이며, time travel은 current pointer를 바꾸지 않고 과거 snapshot에서 read path를 시작하는 읽기 연산이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Snapshot</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">한 commit이 만든 immutable table state다. Snapshot ID, 생성 시각, parent snapshot, operation summary와 manifest list 위치를 가진다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Current snapshot</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">기본 branch인 <code>main</code>이 현재 가리키는 snapshot이다. 일반 <code>SELECT</code>는 이 state를 읽는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Snapshot log</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">과거에 current였던 snapshot ID와 시각의 기록이다. 특정 timestamp의 time travel state를 고르는 기준이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Lineage</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Parent snapshot ID로 이어지는 계보이다. Git commit의 parent 관계와 비슷하지만 Iceberg snapshot은 table data/metadata state를 가리킨다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Time travel</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Snapshot ID, timestamp, tag 같은 selector로 과거의 유효한 state를 read-only 조회하는 기능이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Rollback</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">과거 snapshot을 다시 current로 만드는 상태 변경이다. Time travel 조회와 달리 catalog pointer와 table history를 바꾸는 commit이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Branch / Tag</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Branch는 새 commit으로 head가 움직일 수 있는 named reference이고, tag는 특정 snapshot을 붙잡는 named reference다. 각각 retention 정책을 가질 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Retention</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Snapshot과 참조 file을 얼마나 오래 보존할지 정하는 수명 정책이다. Time travel 가능 기간과 storage 비용을 함께 결정한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>데이터 파이프라인의 현재 결과가 잘못됐을 때 가장 먼저 필요한 것은 “수정”이 아니라 <strong>언제부터 무엇이 달라졌는지 재현</strong>하는 일이다. Snapshot을 알면 배포 전후 row count, file membership, schema와 operation summary를 같은 table에서 비교할 수 있다. Backfill 검증, 감사, 장애 원인 분석과 재현 가능한 분석의 공통 기반이다.</p>
+  <p>하지만 time travel을 backup으로 오해하면 위험하다. 과거 snapshot도 같은 object storage의 data file을 참조한다. Snapshot expiration이나 잘못된 file 삭제, bucket 손상, 계정/IAM 사고가 생기면 과거 state도 읽지 못할 수 있다. Time travel은 logical history이고, backup/DR은 독립 장애 영역의 복구 수단이다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Time travel reader는 선택한 snapshot에서 도달 가능한 manifest와 data/delete file만 읽으며, 조회 자체는 current snapshot을 바꾸지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <p>같은 catalog와 metadata JSON에서 시작하되 selector가 current인지 과거인지에 따라 snapshot root만 달라진다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>① SQL selector</strong><br><span style="font-size:14px;color:#cdebf0;">SELECT current · VERSION AS OF snapshot/tag · TIMESTAMP AS OF time</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓ resolve table</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;overflow-wrap:anywhere;"><strong>② Catalog pointer</strong><br><span style="font-size:14px;">table name → current metadata JSON</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓ choose root</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;overflow-wrap:anywhere;"><strong>③ Snapshot selector</strong><br><span style="font-size:14px;">current-snapshot-id OR explicit snapshot/tag OR snapshot-log timestamp lookup</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓ immutable read path</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>④ Snapshot → manifest list → manifest</strong><br><span style="font-size:14px;color:#cdebf0;">partition/file metrics로 pruning</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:22px;">↓ selected content</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;overflow-wrap:anywhere;"><strong>⑤ Data file + 적용 가능한 delete file</strong><br><span style="font-size:14px;">과거 snapshot의 schema·sequence 규칙으로 row 구성</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">A. Current SELECT</h3>
+  <ol style="padding-left:22px;">
+    <li>Engine이 catalog에서 현재 metadata location을 load한다.</li>
+    <li>Metadata JSON의 <code>current-snapshot-id</code> 또는 <code>main</code> reference를 선택한다.</li>
+    <li>선택한 snapshot의 manifest tree에서 file을 pruning하고 scan task를 만든다.</li>
+    <li>Query 도중 새 writer가 commit해도 이미 선택한 snapshot은 immutable이므로 partial state로 바뀌지 않는다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">B. VERSION AS OF</h3>
+  <ol style="padding-left:22px;">
+    <li>Client가 snapshot ID 또는 tag 이름을 selector로 제공한다.</li>
+    <li>Engine은 current metadata가 보존하는 snapshot/reference에서 selector를 검증한다.</li>
+    <li>해당 snapshot의 manifest list로 read root를 바꾼다. Catalog의 current pointer는 그대로다.</li>
+    <li>Snapshot ID나 tag로 조회할 때 schema 선택 규칙은 engine/selector에 따라 다를 수 있다. Spark 공식 문서는 snapshot ID와 tag 조회에는 snapshot schema, branch head 조회에는 table schema를 사용하는 경우를 구분한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">C. TIMESTAMP AS OF</h3>
+  <ol style="padding-left:22px;">
+    <li>Engine이 사용자가 준 timestamp를 명확한 timezone 기준으로 해석한다.</li>
+    <li>Table spec에 따라 snapshot-log에서 그 시각보다 같거나 앞선 마지막 current snapshot을 찾는다.</li>
+    <li>선택된 snapshot에서 동일한 manifest/data read path를 수행한다. 정확히 그 시각에 새 파일을 재구성하는 연산이 아니다.</li>
+    <li>해당 시각보다 앞선 snapshot이 없거나 snapshot-log가 보존되지 않았다면 informative error로 실패해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:28%;">개념</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Snapshot/time travel에서의 의미</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Persistent data structure</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">새 snapshot은 변하지 않은 manifest/data file을 과거 snapshot과 공유할 수 있다. 전체 table 복사 없이 여러 logical version을 유지한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>MVCC 정신 모델</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Multi-Version Concurrency Control처럼 reader가 한 committed version을 고정한다. 구현은 database page version이 아니라 immutable files와 metadata pointer다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>State owner</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Metadata JSON이 snapshots·snapshot-log·refs를 소유하고, snapshot이 manifest-list root를, storage가 실제 byte를 소유한다. Engine은 selector와 scan을 해석한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Ordering</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot ID는 시간순 번호가 아니다. V2/V3 sequence number는 table change 순서를 나타내며 delete 적용 판단에도 쓰인다. Timestamp lookup은 snapshot-log를 사용한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Isolation</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Reader가 잡은 snapshot root는 query 중 변하지 않는다. Writer의 catalog pointer swap은 새 reader의 root를 바꾸지만 기존 reader의 root를 mutate하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Garbage collection</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot expiration은 더 이상 보존할 history에서 snapshot을 제거하고, 어떤 retained snapshot/ref에서도 참조하지 않는 file만 삭제 가능하게 한다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Time travel과 rollback의 state transition 차이</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:25%;">연산</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">읽는 root</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Table state 변화</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;"><strong>현재 조회</strong></td><td style="padding:10px;border:1px solid #dbe3e8;">current snapshot</td><td style="padding:10px;border:1px solid #dbe3e8;">없음</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;"><strong>Time travel</strong></td><td style="padding:10px;border:1px solid #dbe3e8;">명시한 과거 snapshot</td><td style="padding:10px;border:1px solid #dbe3e8;">없음</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;"><strong>Rollback</strong></td><td style="padding:10px;border:1px solid #dbe3e8;">검증 후 과거 snapshot</td><td style="padding:10px;border:1px solid #dbe3e8;">Current reference를 바꾸는 commit</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Failure window와 비용</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Catalog outage:</strong> 이미 load한 snapshot으로 진행 중인 read는 계속될 수 있지만, 새 load/refresh와 rollback commit은 실패할 수 있다.</li>
+    <li><strong>Storage object missing:</strong> Snapshot metadata가 살아 있어도 참조 data/delete file이 없으면 과거 read가 실패한다.</li>
+    <li><strong>Expire와 장기 reader race:</strong> Reader가 사용하는 snapshot/file의 수명보다 공격적인 expiration/cleanup 정책은 query 실패나 corruption 위험을 만든다.</li>
+    <li><strong>Retention 증가:</strong> 감사·rollback 기간은 길어지지만 metadata와 더 이상 current가 아닌 data/delete file의 storage 비용도 늘어난다.</li>
+    <li><strong>Retention 축소:</strong> 비용과 metadata 크기는 줄지만 incident investigation, late reprocessing과 reproducibility window도 줄어든다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Retention SLO</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">감사 기간, 최대 backfill 지연, incident 탐지 시간, reader 최대 실행 시간을 수치화한 뒤 snapshot/ref 보존 기간을 정한다. 관성적으로 기본값만 쓰지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>재현 identity</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Dashboard·모델·batch 결과에 table identifier, snapshot ID, query/app version과 timestamp timezone을 함께 기록한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>중요 state 고정</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">감사·월말 마감처럼 만료되면 안 되는 snapshot은 명시적 tag와 retention으로 보호하고 정기적으로 refs를 감사한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Maintenance 분리</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Expire snapshots와 remove orphan files를 다른 책임과 runbook으로 운영한다. Dry-run/후보 목록, safety window, 진행 중 writer와 branch/tag를 확인한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>복구 전 검증</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">먼저 과거 snapshot을 read-only time travel로 검증하고, row/file/schema 차이를 승인한 뒤 rollback이나 compensating write를 선택한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Multi-engine</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark·Flink·Trino의 snapshot/tag/branch syntax, schema selection, timestamp precision/timezone, format version과 delete/DV 지원을 compatibility matrix로 시험한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> “최근 7일 time travel 가능”을 SLA로 약속하면서 expiration job, tag retention, backup 또는 모니터링을 코드와 운영 정책으로 고정하지 않는 것.</p>
+  <p><strong>Edge case:</strong> Partition evolution 뒤 과거 snapshot은 old partition spec의 file을 가리킬 수 있다. Reader는 snapshot→manifest의 spec ID를 따라야 하며, 현재 directory layout만 보고 과거 partition을 추측하면 안 된다. Row-level delete가 있는 table은 snapshot과 sequence number에 맞는 position/equality delete 또는 v3 deletion vector를 적용해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> 어제 snapshot을 time travel하자 “snapshot not found” 또는 file read 오류가 발생한다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Snapshot ID 없음, timestamp 이전 snapshot 없음, metadata는 열리지만 data/delete file 404, engine별 과거 row/schema 불일치.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Current metadata location, snapshots/history/refs, 요청 snapshot ID와 UTC timestamp, 최근 expire/remove-orphan 실행 시각·인자·결과, failing file URI, catalog/storage audit log, engine/connector/format version.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Snapshot expiration, tag/ref 미생성 또는 만료, timezone 오해, 잘못된 table/catalog, storage lifecycle/manual delete, engine cache 또는 unsupported selector/schema/delete feature.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Write와 maintenance를 일시 중지하고 현재 table을 변경하지 않은 채 snapshots/history/refs와 정확한 failing URI를 보존한다. Known-good snapshot을 read-only로 확인한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Snapshot과 file이 유효하면 time travel 결과를 검증한 뒤 승인된 rollback/cherry-pick/compensating write를 수행한다. File이 삭제됐다면 독립 backup/replica에서 byte와 catalog/metadata 일관성을 함께 복원하고 새 table에서 먼저 검증한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Metadata JSON이나 current pointer를 직접 편집하지 않는다. Missing file을 빈 파일로 대체하지 않는다. 증거 수집 전에 expiration/orphan cleanup을 재실행하지 않는다. Timezone을 바꿔가며 무작위 rollback하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 30분 재현 실습</h2>
+  <p><strong>목표:</strong> 두 번의 INSERT로 snapshot 2개를 만들고, 과거 snapshot 조회가 현재 state를 바꾸지 않음을 snapshot ID·row count·file path로 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트 루트에서 Docker를 사용할 수 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>예측 1: 첫 INSERT snapshot을 조회하면 두 번째 INSERT row가 보일까?</li>
+    <li>예측 2: Time travel SELECT 뒤 current snapshot ID가 바뀔까?</li>
+    <li>예측 3: 존재하지 않는 snapshot ID를 주면 current table이 손상될까, query만 실패할까?</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Snapshot 두 개 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose exec spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day04;
+DROP TABLE IF EXISTS local.day04.snapshot_lab;
+CREATE TABLE local.day04.snapshot_lab (
+  id BIGINT,
+  note STRING,
+  event_time TIMESTAMP
+) USING iceberg;
+
+INSERT INTO local.day04.snapshot_lab VALUES
+  (1, 'first commit', TIMESTAMP '2026-08-01 09:00:00');
+
+INSERT INTO local.day04.snapshot_lab VALUES
+  (2, 'second commit', TIMESTAMP '2026-08-01 09:05:00');
+
+SELECT made_current_at, snapshot_id, parent_id, is_current_ancestor
+FROM local.day04.snapshot_lab.history
+ORDER BY made_current_at;
+
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day04.snapshot_lab.snapshots
+ORDER BY committed_at;
+
+SELECT * FROM local.day04.snapshot_lab ORDER BY id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 두 append snapshot이 parent→child로 연결되고 current 조회에는 id 1, 2가 모두 보인다. 첫 snapshot ID를 복사해 <code>FIRST_SNAPSHOT_ID</code> 자리에 넣는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · 과거 state 읽기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec spark /opt/spark/bin/spark-sql -e &quot;
+SELECT *
+FROM local.day04.snapshot_lab VERSION AS OF FIRST_SNAPSHOT_ID
+ORDER BY id;
+
+SELECT * FROM local.day04.snapshot_lab ORDER BY id;
+
+SELECT snapshot_id, operation
+FROM local.day04.snapshot_lab.snapshots
+ORDER BY committed_at DESC LIMIT 1;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Time travel 결과에는 id 1만 보이고, 이어지는 current 조회에는 id 1, 2가 모두 보인다. 마지막 snapshot ID도 그대로다. 조회는 catalog pointer를 바꾸지 않았다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Metadata와 실제 file 연결</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec spark /opt/spark/bin/spark-sql -e &quot;
+SELECT snapshot_id, manifest_list
+FROM local.day04.snapshot_lab.snapshots
+ORDER BY committed_at;
+
+SELECT content, file_path, record_count
+FROM local.day04.snapshot_lab.all_files
+ORDER BY file_path;
+&quot;
+
+find warehouse/day04/snapshot_lab -type f | sort</pre>
+  <p><strong>예상 관찰:</strong> Snapshot마다 manifest list root가 있고, <code>all_files</code>는 history가 추적하는 file을 보여준다. Snapshot은 Parquet 복제본이 아니라 이 metadata graph의 root라는 증거다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · 존재하지 않는 snapshot</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec spark /opt/spark/bin/spark-sql -e &quot;
+SELECT * FROM local.day04.snapshot_lab VERSION AS OF 1;
+&quot;
+
+docker compose exec spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS current_rows FROM local.day04.snapshot_lab;
+SELECT snapshot_id FROM local.day04.snapshot_lab.snapshots
+ORDER BY committed_at DESC LIMIT 1;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 첫 명령은 snapshot을 찾지 못해 실패하지만 두 번째 명령의 current row count와 snapshot ID는 변하지 않는다. Invalid selector는 read failure이지 state mutation이 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong><code>FIRST_SNAPSHOT_ID</code> parse 오류:</strong> 문자열 그대로 두지 말고 첫 snapshot의 숫자 ID로 치환한다. Snapshot ID를 timestamp처럼 해석하지 않는다.</li>
+    <li><strong>Snapshot ID 순서 오판:</strong> 숫자 크기로 과거/현재를 정하지 말고 <code>committed_at</code>과 <code>parent_id</code>를 함께 본다.</li>
+    <li><strong>Timestamp 조회 결과가 예상과 다름:</strong> Session timezone과 literal timezone을 기록하고 snapshot-log 시각과 비교한다.</li>
+    <li><strong>Warehouse path 불일치:</strong> <code>DESCRIBE TABLE EXTENDED</code>의 Location을 확인한다. Catalog/namespace 설정에 따라 경로가 달라질 수 있다.</li>
+    <li><strong>Metadata table column 차이:</strong> Engine/Iceberg runtime별 schema를 <code>DESCRIBE local.day04.snapshot_lab.snapshots</code>로 확인하고 지원 matrix에 기록한다.</li>
+    <li><strong>Iceberg runtime cache/공간 오류:</strong> <code>make smoke</code>와 <code>docker compose ps</code>를 먼저 확인하고 Docker disk 및 프로젝트의 Ivy cache 경로를 점검한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day04.snapshot_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day04;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">실습 table만 정리한다. Snapshot/file 관계를 확인하기 전에 warehouse file을 수동 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Snapshot은 table 전체 복사다.</strong> 기존 immutable file을 공유하는 metadata root이므로 copy 비용 없이 version을 만들 수 있다.</li>
+    <li><strong>Time travel은 rollback이다.</strong> Time travel은 read-only selector이고 rollback은 current reference를 변경하는 commit이다.</li>
+    <li><strong>Snapshot ID가 클수록 최신이다.</strong> Snapshot ID는 충돌 가능성을 낮춘 고유값이며 시간순 sequence가 아니다.</li>
+    <li><strong>Timestamp는 snapshot 생성 계보만 보면 된다.</strong> Table spec은 과거 current state를 나타내는 snapshot-log를 point-in-time lookup에 사용한다.</li>
+    <li><strong>History가 있으면 file도 영원히 있다.</strong> Expiration, lifecycle, 수동 삭제와 storage 장애는 time travel 가능성을 없앨 수 있다.</li>
+    <li><strong>Time travel은 backup/DR이다.</strong> 같은 storage 장애 영역과 credentials에 의존하므로 독립 복구본을 대체하지 않는다.</li>
+    <li><strong>과거 snapshot은 현재 schema로만 읽힌다.</strong> Snapshot ID/tag/branch selector별 schema semantics와 engine 차이를 검증해야 한다.</li>
+    <li><strong>Expire와 orphan cleanup은 같은 일이다.</strong> 전자는 snapshot retention graph를 처리하고 후자는 metadata에서 참조되지 않는 file 후보를 찾는다. Safety window와 race가 다르다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “Iceberg time travel을 구현 관점에서 설명하고 backup과 비교하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> 재현/감사 요구사항 → catalog pointer→metadata JSON→snapshot-log/selector→manifest list→manifest→data/delete file read path → immutable file 공유와 snapshot isolation → current pointer 불변 → expiration/storage failure window → 30일 retention의 metadata/storage 비용 → 독립 bucket/account backup·replication 대안과 RPO/RTO.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. “하루 10만 commit table에서 90일 time travel SLO를 어떻게 설계합니까?”</h3>
+  <p><strong>좋은 답변 구조:</strong> Commit rate·snapshot/manifest/file 증가량 수치 가정 → 감사/late data/reader 최대 시간 → branch/tag와 retention 정책 → metadata rewrite·snapshot expiration schedule → object lifecycle 금지/정렬 → planning latency·storage 비용 모델 → dry-run·지표·alert → snapshot granularity를 줄이는 commit batching 대안과 latency trade-off.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. “잘못된 MERGE 뒤 rollback 여부를 어떻게 결정합니까?”</h3>
+  <p><strong>좋은 답변 구조:</strong> 영향 범위와 downstream consumption 중지 → current/parent snapshot, summary, schema/spec, data/delete/DV 증거 → 과거 snapshot read-only 검증 → rollback이 concurrent valid write를 되돌릴 위험 → compensating MERGE/cherry-pick/branch 검증 대안 → catalog CAS conflict와 ambiguous outcome → 승인·audit·재발 방지.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>INSERT의 성공이 확정되는 linearization point는 어디인가?</li>
+    <li>SELECT가 file을 고르는 경로를 catalog부터 순서대로 말하라.</li>
+    <li>Data file은 써졌지만 commit 전에 실패한 file과 row의 상태는?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>Catalog의 current metadata pointer 원자 교체가 성공하는 순간이라고 답하면 통과.</li>
+    <li>Catalog pointer → metadata JSON → snapshot → manifest list → manifest → data/delete file 순서를 말하면 통과.</li>
+    <li>Storage에는 존재할 수 있지만 current snapshot에서 도달하지 않는 orphan 후보이며 row는 공개되지 않았다고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Time travel과 rollback의 table state 변화 차이를 설명하라.</li>
+    <li>Timestamp time travel은 어떤 history를 기준으로 snapshot을 고르는가?</li>
+    <li>Snapshot retention을 짧게 잡을 때 비용 외에 잃는 운영 능력 세 가지는?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>Time travel은 current를 바꾸지 않는 read, rollback은 current reference를 바꾸는 commit이라고 답하면 통과.</li>
+    <li>그 시각 이전의 마지막 current state를 나타내는 snapshot-log라고 답하면 통과.</li>
+    <li>Incident 조사·감사/재현·late backfill 또는 rollback window 중 세 가지를 비용과 연결해 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Spark Queries</a> — VERSION/TIMESTAMP AS OF, metadata table과 schema 선택 규칙.</li>
+    <li><a href="https://iceberg.apache.org/spec/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Table Specification</a> — snapshot, snapshot-log, refs, point-in-time read와 retention의 표준 의미.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/branching/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Branching and Tagging</a> — named reference와 snapshot별 lifecycle 관리.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/maintenance/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Maintenance</a> — snapshot expiration, old metadata와 orphan file 정리의 책임 경계.</li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">확인 기준: 2026-08-01. 본 프로젝트 runtime은 Spark 3.5.8 + Iceberg 1.11.0이다. 다른 engine/catalog의 SQL 문법, timestamp precision, schema 선택과 refs 지원은 별도 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <p><strong>Day 05 · metadata table과 warehouse file mapping</strong></p>
+  <p><code>snapshots</code>·<code>manifests</code>·<code>files</code> metadata table의 각 row를 warehouse의 metadata JSON, Avro manifest와 Parquet file path에 직접 연결한다.</p>
+
+  <div style="margin-top:32px;padding:16px 18px;background:#073642;color:#d5edf2;border-radius:10px;">
+    <strong style="color:#8ee7f6;">ChatGPT Project에서 더 깊게 물어볼 질문</strong><br>
+    “Snapshot expiration과 장기 실행 reader, branch/tag, streaming writer, object storage lifecycle이 동시에 있을 때 어떤 reference graph와 safety window로 file 삭제 가능성을 판정하는지 incident timeline으로 설명해 줘.”
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-07-31T09:13:26+09:00",
+  "updatedAt": "2026-08-01T09:12:18+09:00",
   "lessons": [
     {
       "day": 1,
@@ -32,6 +32,15 @@
       "path": "day-03.html",
       "kind": "lesson",
       "publishedAt": "2026-07-31T09:13:26+09:00"
+    },
+    {
+      "day": 4,
+      "week": 1,
+      "title": "snapshot·time travel 첫 관찰",
+      "summary": "Snapshot을 immutable metadata root로 이해하고 time travel의 selector, read path, retention과 복구 경계를 추적합니다.",
+      "path": "day-04.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-01T09:12:18+09:00"
     }
   ]
 }
