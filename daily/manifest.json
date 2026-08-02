@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-01T09:12:18+09:00",
+  "updatedAt": "2026-08-02T09:09:33+09:00",
   "lessons": [
     {
       "day": 1,
@@ -41,6 +41,15 @@
       "path": "day-04.html",
       "kind": "lesson",
       "publishedAt": "2026-08-01T09:12:18+09:00"
+    },
+    {
+      "day": 5,
+      "week": 1,
+      "title": "metadata table과 warehouse file mapping",
+      "summary": "Metadata table의 logical row를 metadata JSON, manifest와 data/delete file path에 연결해 table membership을 추적합니다.",
+      "path": "day-05.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-02T09:09:33+09:00"
     }
   ]
 }
