@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 06</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 1 / DAY 06 · 통합 랩</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">랩: SQL 한 번마다 생기는 파일 추적</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Lakehouse와 Table Format 정신 모델 · 예상 학습 25분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    SQL의 효과는 “파일이 생겼다”가 아니라 catalog pointer가 가리키는 immutable metadata graph의 전후 차이로 판정한다. CREATE는 최초 metadata를, INSERT는 data file과 snapshot chain을 만들고, SELECT와 분석 단계에서 실패한 INSERT는 table state를 바꾸지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Checkpoint</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">실험의 한 시점에서 SQL 결과, current snapshot, metadata row와 warehouse file 목록을 함께 저장한 관찰 지점이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">State diff</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">두 checkpoint 사이에 추가·제거·변경된 상태의 차이다. File 수만이 아니라 pointer, snapshot, manifest와 row를 비교한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Control path</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">무엇이 table의 현재 상태인지 결정하는 경로다. Catalog pointer → metadata JSON → snapshot → manifest list → manifest 순서다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Data path</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">실제 row byte를 읽고 쓰는 data/delete file 경로다. Control path가 선택한 file만 table scan에 참여한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Linearization point</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">동시 작업 사이에서 commit이 한순간에 성공한 것으로 간주되는 지점이다. Iceberg에서는 catalog의 current metadata pointer가 원자적으로 교체되는 순간이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Invariant</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">모든 정상 상태에서 반드시 지켜져야 하는 조건이다. 예: current snapshot의 manifest에서 도달 가능한 data file만 현재 table row를 구성한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Orphan candidate</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Storage에는 있지만 유효한 metadata graph에서 보이지 않는 file 후보다. 진행 중 writer와 retained snapshot을 확인하기 전에는 삭제 대상이 아니다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>데이터 엔지니어는 “INSERT가 성공했다”는 console 문구보다 강한 증거가 필요하다. Data file upload 뒤 catalog commit이 실패할 수 있고, 반대로 catalog commit 뒤 client response가 끊기면 실패처럼 보여도 새 snapshot은 이미 current일 수 있다. SQL 전후의 metadata graph를 저장하면 성공이 확정된 시점과 실패 window를 분리할 수 있다.</p>
+  <p>이 랩은 Week 1의 다섯 개 개념을 하나의 증거 사슬로 묶는다. Raw Parquet와 table state의 차이, file/table/catalog/engine/warehouse의 책임 경계, CREATE·INSERT·SELECT의 state transition, snapshot/time travel, metadata table과 실제 path mapping을 직접 검증한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>판정 원칙:</strong> SQL 종료 코드 + current snapshot ID + metadata table diff + warehouse file diff를 함께 기록한다. 어느 하나만으로 commit 결과를 단정하지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>⓪ T0 · Baseline</strong><br><span style="font-size:14px;color:#cdebf0;">namespace/table 없음 · inventory 저장</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ CREATE TABLE</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;overflow-wrap:anywhere;"><strong>① T1 · 최초 metadata state</strong><br><span style="font-size:14px;">catalog entry → metadata JSON · snapshot/data file 없음</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ INSERT #1 → optimistic commit</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;overflow-wrap:anywhere;"><strong>② T2 · Snapshot S1</strong><br><span style="font-size:14px;">data file → manifest → manifest list → metadata JSON → pointer swap</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ INSERT #2 → validate current → commit</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>③ T3 · Snapshot S2</strong><br><span style="font-size:14px;color:#cdebf0;">새 file과 snapshot · 이전 immutable object 공유 가능</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ SELECT / invalid INSERT</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;overflow-wrap:anywhere;"><strong>④ T4/T5 · State 불변</strong><br><span style="font-size:14px;">read-only SELECT와 분석 단계 실패는 current pointer를 바꾸지 않음</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>T0:</strong> Table path와 catalog entry가 없는 기준 상태를 저장한다. 이 기준이 없으면 기존 file을 이번 SQL의 산출물로 오판한다.</li>
+    <li><strong>CREATE:</strong> Engine이 schema의 stable field ID, partition transform/spec ID와 table property를 metadata JSON에 기록하고 catalog에 table identifier를 등록한다. 빈 table은 current snapshot이 없을 수 있다.</li>
+    <li><strong>INSERT #1:</strong> Writer task가 partition별 data file을 쓴다. Driver가 manifest와 manifest list, 새 metadata JSON을 준비한 뒤 base metadata location이 여전히 current인지 검증하고 pointer를 교체한다.</li>
+    <li><strong>INSERT #2:</strong> 새 snapshot은 parent S1을 가리킨다. 새 manifest와 기존 manifest를 함께 참조하거나 manifest merge를 할 수 있어 물리 file의 정확한 개수는 engine 설정과 task 수에 따라 달라진다.</li>
+    <li><strong>SELECT:</strong> Reader는 catalog → metadata JSON → current snapshot → manifest list → manifest → data/delete file 순서로 계획하고 metrics로 pruning한다. 정상 table SELECT는 새 snapshot을 만들지 않는다.</li>
+    <li><strong>Invalid INSERT:</strong> Column 수가 맞지 않아 Spark 분석 단계에서 거절되면 data write와 commit이 시작되지 않는다. 실패 시점이 더 늦다면 uncommitted file이 남을 수 있으므로 동일 결론을 일반화하지 않는다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:25%;">SQL</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">소유자·불변식·성공 확정</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>CREATE</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog가 identifier와 current metadata location을 소유한다. Metadata JSON이 schema/spec를 소유한다. Catalog create가 성공해 새 table을 load할 수 있을 때 확정된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>INSERT</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Storage가 immutable object byte를, metadata graph가 membership을 소유한다. Base state conflict validation 후 pointer swap이 성공해야 row가 current가 된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>SELECT</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Reader는 선택한 snapshot의 일관된 view를 소유한다. 결과 전달은 query 성공이지만 table state 전환은 없다. Engine 임시 shuffle/cache file은 table metadata 밖의 상태다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>실패 write</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">분석 전 실패, data write 후 실패, pointer swap 후 응답 유실을 구분한다. “Client가 오류를 봄”은 commit 실패와 동치가 아니다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Persistent data structure와 optimistic transaction</h3>
+  <p>Iceberg metadata tree는 기존 object를 덮어쓰지 않고 새 root를 만드는 persistent data structure와 닮았다. Writer는 base metadata를 읽고 새 data/delete file과 metadata를 만든다. Commit 시 catalog의 pointer가 여전히 base를 가리키는지 비교한 뒤 교체한다. Append는 재계획·재시도할 수 있는 경우가 있지만 overwrite/delete는 겹치는 file·partition·predicate에 대한 conflict validation 의미가 더 강하므로 blind retry하면 안 된다.</p>
+  <p>Catalog pointer → metadata JSON → snapshot → manifest list → manifest → data/delete file이 read path다. Manifest list와 manifest의 partition summary·field-ID 기반 lower/upper bounds는 두 단계 pruning을 돕는다. Partition evolution은 spec ID별 해석, schema evolution은 field ID별 해석이 필요하다. Sequence number는 이후 COW/MOR delete 및 v3 deletion vector의 적용 순서를 판단하는 핵심이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Failure window와 비용 trade-off</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Data upload 전:</strong> Table state와 storage 모두 대체로 불변이다. Parser·analyzer 오류가 여기에 해당한다.</li>
+    <li><strong>Data upload 후 pointer swap 전:</strong> Storage 비용은 생겼지만 table에는 보이지 않는 orphan 후보가 남을 수 있다.</li>
+    <li><strong>Pointer swap 후 응답 전:</strong> Commit은 성공했지만 client는 timeout을 볼 수 있다. Operation identity와 새 snapshot을 먼저 조회한다.</li>
+    <li><strong>많은 작은 INSERT:</strong> Snapshot·manifest·data file이 빠르게 늘어 read planning과 storage 요청 비용이 증가한다. 큰 batch는 효율적이지만 latency와 retry 비용이 커진다.</li>
+    <li><strong>Multi-engine:</strong> 같은 spec table이라도 metadata table schema, write distribution, manifest merge, refresh와 v2/v3 feature 지원은 connector/version별로 다르다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>증거 단위</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Job/batch ID, 시작 base snapshot, 종료 current snapshot, operation summary, record/file count와 exact metadata location을 한 묶음으로 남긴다. Ambiguous commit을 재현할 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Checkpoint 간격</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">교육/incident 재현은 SQL 한 문장마다, production은 commit마다 snapshot metrics를 수집한다. Object 전체 listing은 비싸므로 sampling과 metadata table을 우선한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>재시도 정책</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Append/overwrite/delete를 구분하고 source batch identity와 conflict scope를 검증한다. Timeout 직후 동일 INSERT를 실행하는 anti-pattern은 중복 append를 만든다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>운영 metric</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Commit latency/conflict, snapshot·manifest·data/delete file 증가량, 평균 file size, planning latency와 catalog/object-storage 오류율을 함께 본다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>호환성 gate</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark·Flink·Trino의 runtime/connector, format version, supported write/delete/DV, metadata table column과 refresh 동작을 표와 자동 test로 고정한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> Warehouse file의 mtime 정렬을 commit 순서로 간주하고, 가장 최근 file을 수동 삭제하거나 metadata JSON을 편집하는 것. Object clock·retry·병렬 upload는 순서를 보장하지 않는다.</p>
+  <p><strong>Edge case:</strong> SELECT 자체는 table state를 바꾸지 않지만 engine의 result cache, shuffle, spill, query history는 별도 시스템 상태를 만들 수 있다. “아무 file도 생기지 않는다”가 아니라 “Iceberg table graph가 바뀌지 않는다”가 정확하다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> INSERT client가 timeout됐고 warehouse에는 새 Parquet가 보이지만 row 반영 여부가 불명확하다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Client timeout/connection reset, 새 storage file, source checkpoint 미진행, row 수 또는 engine별 결과 불일치.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">시작/현재 metadata location과 snapshot ID, snapshots/history/manifests/files 결과, snapshot summary의 operation·added files/records, exact object URI·mtime·size, job/batch ID, catalog audit/compare-and-swap 응답, writer log.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">분석/계획 단계 실패, data upload 후 commit 실패, concurrent writer conflict, pointer swap 성공 후 응답 유실, stale catalog cache, 다른 catalog/namespace 관찰.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">동일 batch 재실행과 cleanup을 멈춘다. 새 session에서 catalog를 refresh/load하고 base 이후 snapshot의 summary와 source batch identity를 read-only로 대조한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Commit 성공이면 source checkpoint를 idempotently 전진시키고 검증한다. 실패면 operation semantics에 맞게 재계획한다. 잘못된 중복 commit은 검증된 snapshot rollback 또는 조건부 overwrite/delete로 새 commit을 만들고, orphan은 safety window 뒤 정리한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Timeout만 보고 즉시 INSERT를 반복하지 않는다. Warehouse file을 수동 table member로 만들거나 삭제하지 않는다. Current metadata pointer/JSON을 직접 수정하지 않는다. Active writer 중 orphan cleanup을 실행하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 통합 랩</h2>
+  <p><strong>목표:</strong> CREATE, 두 번의 INSERT, SELECT, 분석 실패 INSERT 직후 checkpoint를 저장하고 “어떤 SQL이 어떤 persistent table file/state를 만들었는가”를 증거표로 완성한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트 루트에서 Docker를 실행할 수 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>먼저 예측한다: CREATE 뒤 snapshot 수, INSERT마다 snapshot 증가량, SELECT와 invalid INSERT 뒤 current snapshot 변화량은 각각 얼마인가?</li>
+    <li>File 정확한 개수는 task/partition/manifest merge 설정에 따라 달라진다. 대신 file 종류와 metadata reachability를 예측한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · T0, CREATE, T1</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+mkdir -p /tmp/day06-trace
+find warehouse/day06 -type f 2&gt;/dev/null | sort &gt; /tmp/day06-trace/t0-files.txt
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day06;
+DROP TABLE IF EXISTS local.day06.sql_trace;
+CREATE TABLE local.day06.sql_trace (
+  id BIGINT,
+  category STRING,
+  event_time TIMESTAMP
+) USING iceberg
+PARTITIONED BY (days(event_time));
+&quot;
+
+find warehouse/day06 -type f | sort &gt; /tmp/day06-trace/t1-files.txt
+diff -u /tmp/day06-trace/t0-files.txt /tmp/day06-trace/t1-files.txt || true</pre>
+  <p><strong>예상 관찰:</strong> CREATE는 catalog entry와 최초 metadata JSON을 만든다. 아직 data file, manifest list와 snapshot row는 없다. Catalog 구현에 따라 catalog state가 warehouse 밖에 있을 수 있으므로 file listing만으로 CREATE 성공을 판정하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · INSERT #1/#2와 T2/T3</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day06.sql_trace VALUES
+  (1, 'A', TIMESTAMP '2026-08-05 09:00:00'),
+  (2, 'B', TIMESTAMP '2026-08-05 10:00:00');
+&quot;
+find warehouse/day06 -type f | sort &gt; /tmp/day06-trace/t2-files.txt
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day06.sql_trace VALUES
+  (3, 'A', TIMESTAMP '2026-08-06 09:00:00');
+&quot;
+find warehouse/day06 -type f | sort &gt; /tmp/day06-trace/t3-files.txt
+
+diff -u /tmp/day06-trace/t1-files.txt /tmp/day06-trace/t2-files.txt || true
+diff -u /tmp/day06-trace/t2-files.txt /tmp/day06-trace/t3-files.txt || true
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT committed_at, snapshot_id, parent_id, operation, manifest_list, summary
+FROM local.day06.sql_trace.snapshots ORDER BY committed_at;
+SELECT content, path, partition_spec_id,
+       added_data_files_count, existing_data_files_count
+FROM local.day06.sql_trace.manifests ORDER BY path;
+SELECT content, file_path, spec_id, partition, record_count
+FROM local.day06.sql_trace.files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> INSERT마다 append snapshot이 하나씩 늘고 S2의 parent가 S1이다. 각 commit은 새 metadata JSON과 manifest list를 만든다. 날짜가 달라 data file은 최소 두 partition에 분포한다. Manifest 재사용/merge 때문에 manifest 수가 단순히 1씩 늘지 않을 수 있다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · SELECT와 T4</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT category, count(*) AS rows
+FROM local.day06.sql_trace
+WHERE event_time &gt;= TIMESTAMP '2026-08-05 00:00:00'
+GROUP BY category ORDER BY category;
+SELECT snapshot_id FROM local.day06.sql_trace.snapshots ORDER BY committed_at;
+&quot;
+find warehouse/day06 -type f | sort &gt; /tmp/day06-trace/t4-files.txt
+diff -u /tmp/day06-trace/t3-files.txt /tmp/day06-trace/t4-files.txt</pre>
+  <p><strong>예상 관찰:</strong> Row는 A=2, B=1이고 diff는 비어 있다. SELECT는 manifest metrics로 file pruning을 계획하고 data file을 읽지만 Iceberg table의 current pointer/snapshot/file membership을 바꾸지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · 분석 단계에서 invalid INSERT</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day06.sql_trace VALUES (99, 'BROKEN');
+&quot;
+# 위 명령은 실패해야 한다. 이어서 별도 실행한다.
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS rows_after_failure FROM local.day06.sql_trace;
+SELECT snapshot_id FROM local.day06.sql_trace.snapshots ORDER BY committed_at;
+&quot;
+find warehouse/day06 -type f | sort &gt; /tmp/day06-trace/t5-files.txt
+diff -u /tmp/day06-trace/t4-files.txt /tmp/day06-trace/t5-files.txt</pre>
+  <p><strong>예상 관찰:</strong> Column 수 불일치로 분석 단계에서 실패하고 row는 3, snapshot은 2개, file diff는 비어 있다. 실패를 예측한 뒤 실행하고, 실제 error class와 어느 단계까지 진행했는지 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong><code>warehouse/day06</code>가 없음:</strong> T0의 <code>find</code> 오류를 무시하는 것은 정상이다. CREATE 뒤 <code>DESCRIBE TABLE EXTENDED</code>의 Location을 확인한다.</li>
+    <li><strong>Namespace path가 다름:</strong> Catalog warehouse 설정과 identifier mapping을 확인하고 실제 Location을 checkpoint 명령에 반영한다.</li>
+    <li><strong>Metadata table column 오류:</strong> <code>DESCRIBE local.day06.sql_trace.snapshots</code>로 runtime schema를 확인한다. Connector/version별 column 차이를 기록한다.</li>
+    <li><strong>Manifest/file 수가 예측과 다름:</strong> Partition, task 수, distribution mode, target file size와 manifest merge를 확인한다. 고정 개수보다 parent/path/reachability를 채점한다.</li>
+    <li><strong>SELECT 뒤 diff가 있음:</strong> Table path가 아닌 engine temp/cache path를 섞지 않았는지 확인한다. Current snapshot ID가 바뀌었는지를 우선 본다.</li>
+    <li><strong>Invalid INSERT가 다른 단계까지 진행:</strong> Runtime/SQL coercion 차이일 수 있다. Error log, snapshot/file diff를 보존하고 더 확실한 schema mismatch로 바꾸되 같은 실패를 반복하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day06.sql_trace PURGE;
+DROP NAMESPACE IF EXISTS local.day06;
+&quot;
+rm -r /tmp/day06-trace</pre>
+  <p style="font-size:14px;color:#52636d;">실습용 namespace/table과 정확히 만든 trace directory만 정리한다. Warehouse의 metadata/data file을 개별 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>SQL 한 번이면 file 하나다.</strong> Partition과 task 수, manifest merge에 따라 여러 file이 생기거나 기존 manifest가 공유된다.</li>
+    <li><strong>CREATE는 아무 state도 만들지 않는다.</strong> Data snapshot은 없어도 catalog entry와 최초 metadata JSON은 생긴다.</li>
+    <li><strong>SELECT는 아무 file도 만들지 않는다.</strong> Iceberg table graph는 불변이지만 engine temp/cache/log는 별도다.</li>
+    <li><strong>모든 실패 INSERT는 file을 만들지 않는다.</strong> 분석 전 실패와 data upload/commit 단계 실패는 failure window가 다르다.</li>
+    <li><strong>Client 성공/실패가 commit 결과다.</strong> Pointer swap과 response 사이 네트워크 오류 때문에 결과가 불명확할 수 있다.</li>
+    <li><strong>Warehouse 최신 file이 current다.</strong> Mtime이 아니라 catalog에서 metadata graph를 따라 reachability를 판정한다.</li>
+    <li><strong>두 engine의 file count가 다르면 corruption이다.</strong> 같은 catalog pointer인지, cache/refresh와 metadata table 지원을 먼저 비교한다.</li>
+    <li><strong>실패 뒤 보이는 file은 즉시 삭제한다.</strong> Active writer, retained snapshot/ref와 safety window 없이 삭제하면 정상 data를 잃는다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “하나의 INSERT가 성공하기까지 내부 경로와 확정 시점을 설명하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Batch 크기·partition/task 수 가정 → base metadata load → data file → manifest → manifest list → metadata JSON → optimistic conflict validation → catalog pointer swap이라는 linearization point → response 유실 failure window → snapshot summary와 batch identity 검증 → retry/rollback·small-file trade-off.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. “Timeout 난 append를 안전하게 재처리하는 runbook을 설계하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Idempotency key/source checkpoint 요구 → 시작/현재 snapshot과 operation summary 수집 → catalog/object audit와 exact file path → 성공·실패·불명확 세 상태 → 성공이면 checkpoint 전진, 실패면 재계획 → 중복이면 새 corrective commit → orphan safety window → blind retry 대안과 RPO/RTO.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. “하루 10만 commit 때문에 planning이 느려졌다면 무엇을 바꾸겠습니까?”</h3>
+  <p><strong>좋은 답변 구조:</strong> Commit rate, 평균 file/manifest size, latency SLO 수치 → snapshot/manifest/file growth 측정 → streaming trigger·batching·distribution/target size → manifest/data rewrite 순서와 concurrent maintenance race → latency·recovery granularity·write amplification trade-off → multi-engine compatibility와 rollback window.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Warehouse file 존재가 current table membership의 충분조건이 아닌 이유는?</li>
+    <li><code>files</code>와 <code>all_files</code> metadata table은 관찰 범위가 어떻게 다른가?</li>
+    <li>Partition evolution 뒤 old/new file을 directory 이름 하나로 해석하면 왜 위험한가?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>Current snapshot의 manifest entry에서 도달 가능해야 membership이 생긴다고 답하면 통과.</li>
+    <li><code>files</code>는 current, <code>all_files</code>는 retained snapshots 전체의 tracked files라고 답하면 통과.</li>
+    <li>Manifest마다 spec ID와 typed partition tuple로 해석해야 old/new transform을 함께 처리할 수 있다고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>CREATE, INSERT, SELECT 중 catalog pointer와 snapshot을 각각 어떻게 바꾸는가?</li>
+    <li>INSERT client timeout 뒤 가장 먼저 반복하면 안 되는 행동과 먼저 수집할 증거는?</li>
+    <li>분석 단계 invalid INSERT의 T4→T5 diff가 비어 있어야 하는 이유는?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>CREATE는 최초 metadata/catalog entry, INSERT는 새 snapshot과 pointer swap, SELECT는 table state 불변이라고 답하면 통과.</li>
+    <li>Blind retry를 멈추고 base/current metadata location·snapshot, operation summary와 batch identity를 먼저 본다고 답하면 통과.</li>
+    <li>Schema/arity 검증에서 data write·commit 전에 거절되어 current pointer와 warehouse table file이 변하지 않는다고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-writes/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Spark Writes</a> — INSERT, overwrite, MERGE와 write 동작의 공식 기준.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Spark Queries</a> — snapshots, manifests, files 등 metadata table 조회.</li>
+    <li><a href="https://iceberg.apache.org/spec/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Table Specification</a> — metadata tree, snapshot, manifest, sequence와 commit 요구사항.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/performance/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Performance</a> — manifest/file pruning과 scan planning.</li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">확인 기준: 2026-08-05. 공식 latest 문서는 현재 1.11.0을 표시한다. 본 프로젝트 runtime은 Spark 3.5.8 + Iceberg 1.11.0이며, SQL error와 metadata table column은 engine/connector/version별로 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <p><strong>Day 07 · 회상: “Parquet만으로 부족한 이유” 설명</strong></p>
+  <p>Week 1의 file/table/catalog 경계와 metadata tree, commit 확정 시점, snapshot/time travel을 그림 없이 자신의 말로 재구성하고 면접 답변으로 압축한다.</p>
+
+  <div style="margin-top:32px;padding:16px 18px;background:#073642;color:#d5edf2;border-radius:10px;">
+    <strong style="color:#8ee7f6;">ChatGPT Project에서 더 깊게 물어볼 질문</strong><br>
+    “INSERT의 base metadata load부터 catalog pointer swap까지 상태 기계를 그리고, data upload 후 실패와 pointer swap 후 response 유실을 구분하는 증거·idempotent retry·orphan 처리 runbook을 설계해 줘.”
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

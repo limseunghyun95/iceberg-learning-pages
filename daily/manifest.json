@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-02T09:09:33+09:00",
+  "updatedAt": "2026-08-05T09:22:30+09:00",
   "lessons": [
     {
       "day": 1,
@@ -50,6 +50,15 @@
       "path": "day-05.html",
       "kind": "lesson",
       "publishedAt": "2026-08-02T09:09:33+09:00"
+    },
+    {
+      "day": 6,
+      "week": 1,
+      "title": "랩: SQL 한 번마다 생기는 파일 추적",
+      "summary": "CREATE·INSERT·SELECT·실패 SQL 전후의 catalog pointer, snapshot, manifest와 warehouse file diff로 state transition과 commit 확정 시점을 추적합니다.",
+      "path": "day-06.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-05T09:22:30+09:00"
     }
   ]
 }
