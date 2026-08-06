@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-05T09:22:30+09:00",
+  "updatedAt": "2026-08-06T09:21:18+09:00",
   "lessons": [
     {
       "day": 1,
@@ -59,6 +59,15 @@
       "path": "day-06.html",
       "kind": "lab",
       "publishedAt": "2026-08-05T09:22:30+09:00"
+    },
+    {
+      "day": 7,
+      "week": 1,
+      "title": "회상: “Parquet만으로 부족한 이유” 설명",
+      "summary": "Parquet의 file-internal 책임과 Iceberg의 table state·transaction protocol을 구분하고 metadata read/write path와 운영 trade-off를 회상합니다.",
+      "path": "day-07.html",
+      "kind": "review",
+      "publishedAt": "2026-08-06T09:21:18+09:00"
     }
   ]
 }

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 07</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 1 / DAY 07 · 회상·복습</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">회상: “Parquet만으로 부족한 이유” 설명</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Lakehouse와 Table Format 정신 모델 · 예상 학습 25분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Parquet는 한 파일 안의 row를 효율적으로 저장하는 형식이고, Iceberg는 여러 immutable 파일 중 무엇이 현재 table인지 원자적으로 전환·추적하는 table protocol이다. 둘은 경쟁재가 아니라 서로 다른 계층의 책임을 맡는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">File format</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">한 파일 내부의 column encoding, compression, page·row group과 statistics를 정의한다. Parquet가 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Table format</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">여러 data/delete file의 membership, schema·partition, snapshot, commit과 evolution을 정의하는 metadata protocol이다. Iceberg가 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Catalog</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Table 이름을 current metadata JSON 위치에 연결하고 pointer 교체의 원자성을 제공하는 control-plane 구성요소다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Snapshot</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">특정 commit이 만든 immutable table state의 root다. Data 전체 복사본이 아니라 manifest list를 가리키는 metadata node다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Atomic commit</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">독자가 old state 또는 new state만 보고 중간 상태는 보지 않게 current pointer를 한 번에 교체하는 동작이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Optimistic concurrency</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">미리 lock을 잡기보다 base state에서 새 state를 준비하고 commit 직전에 current가 바뀌지 않았는지 검증하는 방식이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Pruning</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Predicate와 metadata statistics로 읽을 필요가 없는 manifest·file·row group을 미리 제외하는 최적화다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>“Iceberg는 Parquet의 단점을 해결한다”는 말은 절반만 맞다. Parquet의 책임은 한 파일 내부의 columnar I/O다. 여러 writer가 만든 수천만 파일 중 현재 읽을 집합, rename된 column의 동일성, partition 변경 뒤 old/new layout, 원자적 overwrite와 rollback을 정의하는 것은 file format 바깥의 문제다.</p>
+  <p>책임 경계를 정확히 말하면 장애 대응도 달라진다. Parquet footer가 정상이어도 manifest에 없으면 Iceberg row가 아니다. Warehouse file이 모두 있어도 catalog pointer나 metadata JSON을 읽지 못하면 table을 load할 수 없다. 반대로 catalog가 살아 있어도 referenced object가 사라지면 scan은 실패한다. “어디가 source of truth인가”를 계층별로 답해야 한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>면접용 핵심 문장:</strong> Parquet는 byte layout, Iceberg는 table state와 transaction protocol, catalog는 current-state pointer의 소유자, engine은 이 protocol의 실행자다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>① Engine</strong><br><span style="font-size:14px;color:#cdebf0;">SQL parse·plan·read/write task 실행</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ table identifier 조회 / commit compare-and-swap</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;overflow-wrap:anywhere;"><strong>② Catalog pointer</strong><br><span style="font-size:14px;">namespace.table → current metadata JSON</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ control path</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;overflow-wrap:anywhere;"><strong>③ Metadata tree</strong><br><span style="font-size:14px;">metadata JSON → snapshot → manifest list → manifest</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ live file path·partition·metrics·sequence</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>④ Data path</strong><br><span style="font-size:14px;color:#cdebf0;">Parquet/ORC/Avro data file + delete file/DV</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ column/page pruning·decode</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;overflow-wrap:anywhere;"><strong>⑤ Query rows</strong><br><span style="font-size:14px;">선택 snapshot에 일관된 결과</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Read 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Engine이 table identifier를 catalog에 보내 current metadata location을 받는다. Warehouse directory listing으로 table을 재구성하지 않는다.</li>
+    <li>Metadata JSON에서 current snapshot, schema field ID, partition spec ID와 properties를 읽는다.</li>
+    <li>Snapshot의 manifest list에서 partition summary로 manifest를 pruning하고, manifest의 partition·field metrics로 data/delete file을 pruning한다.</li>
+    <li>남은 Parquet file의 footer·row group·column page를 읽고 file-level pruning을 더 적용한다. Row-level delete table이면 sequence number에 따라 equality/position delete 또는 deletion vector를 적용한다.</li>
+    <li>Read는 선택 snapshot의 state를 관찰할 뿐 current pointer를 바꾸지 않는다. 이것이 data path와 control path의 분리다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Write 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer는 base metadata location과 snapshot을 load한다.</li>
+    <li>새 immutable data/delete file을 쓰고 manifest, manifest list, metadata JSON을 차례로 만든다. COW는 data file을 다시 쓰고, MOR은 delete file/DV를 추가해 read 비용을 미룰 수 있다.</li>
+    <li>Commit 전 append/overwrite/delete operation에 맞는 conflict validation을 수행한다. Concurrent state가 안전하게 병합되지 않으면 실패한다.</li>
+    <li>Catalog pointer가 새 metadata JSON으로 원자 교체되는 순간 commit이 확정된다. Object storage rename이 table transaction의 필수 선형화 지점인 것은 아니다.</li>
+    <li>응답 전에 network가 끊기면 성공/실패가 불명확하다. Current snapshot과 operation identity를 확인하기 전 blind retry하지 않는다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">CS 개념</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">왜 Parquet만으로 부족한가 / Iceberg가 추가하는 것</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Namespace &amp; identity</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">File path/column name만으로 안정적 identity를 만들기 어렵다. Catalog identifier, table UUID, field ID와 spec ID가 rename/evolution 뒤 동일성을 보존한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Persistent data structure</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">새 snapshot은 전체 byte를 복제하지 않고 immutable manifest/data object를 공유하며 새 root를 만든다. Time travel과 rollback 가능성의 기반이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Transaction</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">여러 file 쓰기를 하나의 atomic table state로 묶고 optimistic validation과 pointer swap으로 isolation을 제공한다. Parquet file 자체는 cross-file commit을 정의하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Secondary index</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Manifest list와 manifest가 membership·partition·column metrics의 계층형 index다. Object store의 O(n) listing과 모든 footer open을 피한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>MVCC</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Multi-version concurrency control처럼 reader는 선택 snapshot을, writer는 새 version을 다룬다. 기존 data byte를 in-place 수정하지 않아 reader/writer 간 간섭을 줄인다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Garbage collection</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot/ref reachability와 retention을 기준으로 expire·orphan cleanup을 한다. Directory mtime만으로 삭제하면 active writer나 rollback state를 파괴한다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">상태의 소유자와 불변식</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Parquet:</strong> 한 file의 schema annotation, encoding, statistics와 row byte를 소유한다. Table current state는 소유하지 않는다.</li>
+    <li><strong>Iceberg metadata:</strong> Schema/spec/sort order, snapshot lineage, manifest와 file membership을 소유한다.</li>
+    <li><strong>Catalog:</strong> Table identifier와 current metadata pointer의 atomic update를 소유한다.</li>
+    <li><strong>Engine/connector:</strong> Spec을 읽고 write/validation/delete/pruning을 실행한다. 같은 table을 읽는다고 모든 version/feature 지원이 같지는 않다.</li>
+    <li><strong>Object storage:</strong> Byte durability·availability를 소유한다. Object 존재가 table membership을 의미하지 않는다.</li>
+  </ul>
+  <p><strong>핵심 불변식:</strong> Reader가 관찰한 snapshot에서 manifest를 통해 도달 가능한 data/delete file 집합은 일관돼야 한다. Writer가 만든 file은 catalog pointer swap 전까지 current state가 아니며, swap 후에는 새 reader가 새 state를 볼 수 있어야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Raw vs table</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Landing zone의 immutable raw file과 curated Iceberg table 계약을 분리한다. Directory scan과 table scan을 같은 dataset API로 섞지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Commit 증거</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Job exit code 외에 base/current snapshot, operation summary, source batch identity와 added records/files를 기록해 ambiguous commit을 판정한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Evolution</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Schema는 field ID, partition은 spec ID와 transform으로 관리한다. 변경 가능성과 downstream 의미 호환성을 별도 검토한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>COW/MOR</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Read/write 비율, update 범위, delete-file 누적과 compaction SLO로 선택한다. V3 DV는 spec 존재와 engine 지원을 구분한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Maintenance</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot expiration, data/manifest rewrite, orphan cleanup을 각기 다른 transaction으로 취급하고 active reader/writer·refs·rollback window를 guardrail로 둔다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Multi-engine</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark/Flink/Trino별 connector, format version, read/write/delete/DV, type mapping, refresh와 procedure 지원을 compatibility matrix와 test gate로 관리한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> “ACID table”이라는 이름만 믿고 catalog·object storage 장애, commit timeout, small file, delete-file 누적과 maintenance race를 관찰하지 않는 것. Protocol의 성공 지점과 비용을 설명하지 못하면 기능 목록일 뿐이다.</p>
+  <p><strong>Edge case:</strong> Parquet footer schema가 읽을 수 있어도 Iceberg field ID mapping·delete applicability·partition spec 해석을 우회하면 silent wrong result가 가능하다. Raw Parquet read로 Iceberg table을 검증하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Warehouse에 정상 Parquet가 있는데 Iceberg query 결과에서 일부 row가 보이지 않는다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Raw directory read와 Iceberg table row count 불일치, engine별 결과 차이, 새 file은 보이나 snapshot/file metadata 증가 없음.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Catalog identifier와 current metadata location, snapshot/history, manifests/entries/files/all_files, exact object URI·size·mtime, schema field ID/spec ID/sequence, writer batch·commit log, engine/connector/format version, catalog/object audit log.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Manual/raw copy, failed commit orphan, pointer swap 후 stale cache, 다른 catalog/namespace, missing manifest reference, field/spec mismatch, delete file/DV 적용, expired snapshot, referenced object 손실.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Write와 cleanup을 멈추고 current metadata chain과 exact paths를 보존한다. 새 session에서 catalog를 refresh하고 metadata table을 read-only로 대조해 membership과 delete 적용을 확인한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">올바른 과거 snapshot이 retained됐으면 검증 후 rollback을 새 commit으로 수행한다. 미commit data는 정식 Iceberg write/add-files 절차로 새 snapshot에 포함하고, missing referenced object는 backup에서 복원한다. Orphan은 safety window 뒤 정리한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Parquet가 읽힌다는 이유로 manifest/metadata JSON을 수동 편집하지 않는다. Directory mtime 기준 삭제, blind INSERT retry, active writer 중 orphan cleanup, raw read 결과를 source of truth로 삼지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 30분 회상·반증 실습</h2>
+  <p><strong>목표:</strong> 먼저 기억만으로 90초 설명을 만들고, 그 설명의 핵심 명제인 “Parquet file 존재 ≠ Iceberg table membership”을 직접 반증 실험으로 증명한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트 루트에서 Docker를 사용할 수 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>자료를 덮고 90초 동안 답한다: 문제 → 책임 경계 → read path → commit → failure/cost 순서다.</li>
+    <li>예측한다: INSERT 후 Parquet를 하나 복사하면 raw directory row와 Iceberg table row는 각각 몇 개가 되는가?</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 기억에서 architecture 재구성</h3>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:15px 17px;margin:12px 0;">
+    <strong>빈 종이에 적을 7개 상자</strong><br>
+    Engine → Catalog pointer → metadata JSON → Snapshot → Manifest list → Manifest → Data/Delete file<br>
+    각 화살표 위에 “무엇을 요청하고 무엇을 돌려받는가”, 각 상자 아래에 “누가 상태를 소유하는가”를 쓴다.
+  </div>
+  <p><strong>채점:</strong> Parquet를 마지막 data-file 계층에 두고, catalog pointer swap을 commit 성공 시점으로 표시하며, warehouse listing을 catalog로 그리지 않으면 1차 통과다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · 정상 table과 metadata 증거 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day07;
+DROP TABLE IF EXISTS local.day07.recall_lab;
+CREATE TABLE local.day07.recall_lab (
+  id BIGINT, category STRING
+) USING iceberg;
+INSERT INTO local.day07.recall_lab VALUES (1, 'A'), (2, 'B');
+
+SELECT count(*) AS iceberg_rows FROM local.day07.recall_lab;
+SELECT snapshot_id, operation, manifest_list
+FROM local.day07.recall_lab.snapshots;
+SELECT file_path, record_count
+FROM local.day07.recall_lab.files;
+&quot;
+
+find warehouse/day07/recall_lab -type f | sort</pre>
+  <p><strong>예상 관찰:</strong> Iceberg row는 2개다. Catalog가 가리키는 metadata JSON에서 append snapshot, manifest list·manifest를 거쳐 하나 이상의 Parquet path에 도달한다. Exact file 수는 task와 writer 설정에 따라 다를 수 있다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · Metadata를 우회해 Parquet 복사</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">KNOWN_FILE=$(find warehouse/day07/recall_lab/data -type f -name '*.parquet' | head -n 1)
+cp &quot;$KNOWN_FILE&quot; warehouse/day07/recall_lab/data/rogue-copy.parquet
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS iceberg_rows_after_copy FROM local.day07.recall_lab;
+SELECT file_path FROM local.day07.recall_lab.files ORDER BY file_path;
+&quot;
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS raw_rows
+FROM parquet.&#96;/workspace/warehouse/day07/recall_lab/data&#96;;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Iceberg table은 여전히 2 row이고 <code>files</code>에 rogue copy가 없다. Raw Parquet directory read는 정상 file과 복사본을 모두 읽어 <code>2 + 선택한 file의 record count</code> row가 된다. 예시 runtime처럼 선택 file에 1 row가 있으면 raw 결과는 3이다. 같은 byte를 읽어도 scan contract가 다르다는 증거다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · 90초 teach-back 다시 녹음/작성</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>요구사항:</strong> 수천만 file, concurrent writer, schema/partition evolution, time travel이 있다고 가정한다.</li>
+    <li><strong>내부 경로:</strong> Catalog pointer부터 Parquet까지 7단계를 순서대로 말한다.</li>
+    <li><strong>Transaction:</strong> 새 immutable object 준비, conflict validation, pointer swap 성공 시점을 말한다.</li>
+    <li><strong>장애:</strong> Data upload 후 commit 실패와 pointer swap 후 response 유실을 구분한다.</li>
+    <li><strong>Trade-off:</strong> Metadata/pruning 이득과 small file·manifest·maintenance 비용을 말한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong><code>KNOWN_FILE</code>이 비어 있음:</strong> INSERT와 <code>files</code> 결과를 확인하고 <code>DESCRIBE TABLE EXTENDED</code>의 실제 Location으로 경로를 수정한다.</li>
+    <li><strong>Raw path가 없음:</strong> 이 프로젝트의 container mount는 <code>/workspace/warehouse</code>, host는 <code>warehouse</code>다. 다른 환경에서는 catalog warehouse 설정과 volume mount를 확인한다.</li>
+    <li><strong>Raw row 수가 예상과 다름:</strong> Writer가 여러 file을 만들 수 있다. 결과는 원래 2 row에 선택한 file의 record count를 더한 값이어야 한다.</li>
+    <li><strong>Iceberg row도 증가함:</strong> Raw path가 아니라 table identifier를 조회했는지, 같은 catalog/namespace인지와 <code>files</code> path를 다시 확인한다.</li>
+    <li><strong>Permission/cache 오류:</strong> <code>make smoke</code>, Docker disk와 프로젝트 Ivy cache 설정을 확인한다.</li>
+    <li><strong>설명이 기능 나열에 그침:</strong> 상태 소유자, 불변식, 성공 확정, failure window와 비용을 문장마다 하나씩 추가한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">rm warehouse/day07/recall_lab/data/rogue-copy.parquet
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day07.recall_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day07;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">정확히 만든 rogue copy 한 개를 먼저 제거하고 실습 table을 PURGE한다. Metadata/data file을 개별 탐색 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Iceberg가 Parquet를 대체한다.</strong> Iceberg table의 data file로 Parquet를 흔히 사용하며 두 형식의 계층이 다르다.</li>
+    <li><strong>Warehouse directory가 table이다.</strong> Catalog pointer에서 current snapshot을 따라 도달 가능한 file 집합이 table state다.</li>
+    <li><strong>Snapshot은 table 전체 복사본이다.</strong> Immutable metadata root이며 기존 manifest/data file을 공유할 수 있다.</li>
+    <li><strong>ACID는 object storage rename이다.</strong> 새 metadata를 준비하고 catalog pointer를 원자적으로 교체하는 protocol이 핵심이다.</li>
+    <li><strong>모든 conflict는 retry하면 된다.</strong> Append, overwrite, delete의 validation scope와 idempotency가 다르다.</li>
+    <li><strong>Schema rename은 이름 문자열만 바꾼다.</strong> Stable field ID가 old/new file의 column identity를 보존한다.</li>
+    <li><strong>Time travel은 backup이다.</strong> 같은 catalog/storage와 retention에 의존하므로 독립 DR copy가 아니다.</li>
+    <li><strong>Spec 기능은 모든 engine 기능이다.</strong> Format v2/v3, MOR/DV와 procedure 지원을 connector별로 확인해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “왜 Parquet 파일만으로는 데이터 레이크 table을 운영하기 어렵습니까?”</h3>
+  <p><strong>좋은 답변 구조:</strong> 10PB·수천만 object·동시 writer·다중 engine 가정 → Parquet의 file-internal 책임 → cross-file membership/schema/partition/transaction 부재 → catalog→metadata→snapshot→manifest→file read path → optimistic commit/pointer swap → timeout/orphan → metadata/small-file 비용과 Delta/Hudi/DB 대안.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. “Iceberg append가 atomic한 이유와 실패 창을 설명하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Base metadata load → immutable data/manifest/list/JSON 생성 → operation별 conflict validation → catalog compare-and-swap 선형화 → old/new snapshot isolation → upload 후 commit 전 orphan과 swap 후 response 유실 → batch identity 검증·retry·cleanup safety window.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. “Raw Parquet와 Iceberg를 함께 쓰는 플랫폼 경계를 설계하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Landing/curated 소비자·SLO·RPO/RTO → raw immutability와 Iceberg table contract → ingestion idempotency/validation → schema/partition evolution → Spark/Flink/Trino compatibility → catalog/storage outage → COW/MOR·compaction/retention 비용 → governance와 migration 대안.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>CREATE, INSERT, SELECT는 각각 어떤 Iceberg persistent state를 바꾸는가?</li>
+    <li>Writer가 만든 data file은 어느 시점부터 current table member가 되는가?</li>
+    <li>Client timeout 뒤 동일 INSERT를 바로 반복하면 왜 위험한가?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>CREATE는 catalog/최초 metadata, INSERT는 새 snapshot/pointer, SELECT는 table state 불변이라고 답하면 통과.</li>
+    <li>새 metadata JSON으로 catalog pointer swap이 성공한 뒤라고 답하면 통과.</li>
+    <li>Swap은 성공하고 response만 유실됐을 수 있어 중복 append가 생긴다고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Parquet, Iceberg metadata, catalog, engine이 각각 소유하는 상태를 한 문장씩 말하라.</li>
+    <li>Warehouse에 valid Parquet를 복사했는데 Iceberg row가 늘지 않는 이유를 read path로 설명하라.</li>
+    <li>Iceberg가 추가하는 reliability와 그 대가로 생기는 운영 비용을 두 가지씩 말하라.</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>File byte layout / table metadata graph / current pointer / protocol 실행자로 구분하면 통과.</li>
+    <li>Catalog→current snapshot→manifest에서 복사본 path에 도달하지 못해 membership이 없다고 답하면 통과.</li>
+    <li>Atomic commit·snapshot isolation/evolution 중 둘, metadata planning·small files·maintenance/compatibility 중 둘을 trade-off로 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Introduction</a> — open table format의 user experience, reliability, performance와 engine interoperability.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/reliability/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Reliability</a> — atomic transaction, optimistic concurrency와 retry 원칙.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/evolution/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Evolution</a> — schema·partition·sort evolution과 stable identity.</li>
+    <li><a href="https://iceberg.apache.org/spec/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Table Specification</a> — metadata tree, snapshot, manifest, sequence와 format-version의 규범.</li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">확인 기준: 2026-08-06. 공식 latest 문서는 현재 1.11.0을 표시한다. 본 프로젝트 runtime은 Spark 3.5.8 + Iceberg 1.11.0이며, 엔진별 지원 범위는 connector/version matrix로 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <p><strong>Day 08 · metadata JSON 구조·version log</strong></p>
+  <p>Week 2에서는 catalog가 가리키는 metadata JSON을 직접 열어 schema/spec/sort order, current snapshot, snapshot log와 metadata log를 file path 기준으로 해부한다.</p>
+
+  <div style="margin-top:32px;padding:16px 18px;background:#073642;color:#d5edf2;border-radius:10px;">
+    <strong style="color:#8ee7f6;">ChatGPT Project에서 더 깊게 물어볼 질문</strong><br>
+    “10PB 규모 raw Parquet lake를 Iceberg로 전환한다고 가정하고, file/table/catalog/engine/storage 책임 경계와 commit 상태 기계, multi-engine 호환성 gate, backfill·rollback·orphan cleanup 계획을 설계 리뷰 형식으로 질문해 줘.”
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
