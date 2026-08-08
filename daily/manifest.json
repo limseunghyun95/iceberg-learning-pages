@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-06T09:21:18+09:00",
+  "updatedAt": "2026-08-08T09:01:49+09:00",
   "lessons": [
     {
       "day": 1,
@@ -68,6 +68,15 @@
       "path": "day-07.html",
       "kind": "review",
       "publishedAt": "2026-08-06T09:21:18+09:00"
+    },
+    {
+      "day": 8,
+      "week": 2,
+      "title": "metadata JSON 구조·version log",
+      "summary": "Metadata JSON의 identity·evolution·snapshot/log 구조를 해부하고 metadata version, snapshot, sequence와 catalog current pointer를 구분합니다.",
+      "path": "day-08.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-08T09:01:49+09:00"
     }
   ]
 }

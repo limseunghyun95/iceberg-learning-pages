@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 08</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 2 / DAY 08</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">metadata JSON 구조·version log</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Metadata Tree와 Scan Planning · 예상 학습 30분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Metadata JSON은 한 시점의 table-level root state이며, catalog가 가리키는 새 JSON으로 pointer를 교체할 때 commit이 확정된다. Snapshot log는 current snapshot 변화, metadata log는 이전 metadata file 위치를 추적하므로 둘의 개수와 의미는 같지 않다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Metadata JSON</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Schema, partition spec, sort order, properties, snapshot 목록과 log를 담는 immutable table metadata file이다. Data row 자체는 담지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Metadata version</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Table metadata가 commit될 때 생기는 새 JSON 세대다. 파일명의 <code>v3</code>와 spec의 <code>format-version</code> 1/2/3은 다른 개념이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Format version</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Table이 사용하는 Iceberg specification 기능 수준이다. Metadata file 세대 번호가 아니다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Snapshot log</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">어느 timestamp에 어떤 snapshot이 current가 되었는지 기록하는 ordered log다. 모든 metadata commit을 기록하지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Metadata log</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">현재 JSON이 추적하는 이전 metadata JSON의 timestamp와 file path 목록이다. Current JSON 위치는 catalog pointer가 제공한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Sequence number</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Commit 순서를 나타내는 monotonic table sequence다. Snapshot ID의 숫자 크기를 시간 순서로 쓰지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Current pointer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Catalog가 table identifier에 대해 보관하는 current metadata JSON location이다. Directory의 가장 큰 파일명이 source of truth는 아니다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Metadata JSON은 Iceberg table을 읽는 출발점이자 commit의 새 root다. “현재 schema는 무엇인가”, “어느 snapshot이 current인가”, “어떤 partition spec과 sort order가 존재하는가”, “이전 metadata file은 어디인가”라는 table-level 질문의 답이 이 파일에 모인다. 장애 시 warehouse를 무작정 listing하기 전에 catalog의 current location과 JSON을 확보해야 하는 이유다.</p>
+  <p>특히 metadata version과 snapshot을 동일시하면 진단이 틀린다. <code>ALTER TABLE ADD COLUMN</code>이나 property 변경은 새 metadata JSON을 만들 수 있지만 data snapshot을 만들 필요는 없다. 반대로 한 JSON은 여러 retained snapshot을 담는다. 따라서 “JSON이 5개니까 snapshot도 5개”라는 추론은 성립하지 않는다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Catalog가 가리키는 current metadata JSON은 자기 안의 <code>current-snapshot-id</code>, schema/spec/order IDs와 참조 대상들을 일관되게 해석할 수 있어야 한다. 이름이 최신처럼 보이는 고아 JSON은 current state가 아니다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>① Catalog current pointer</strong><br><span style="font-size:14px;color:#cdebf0;">table → /metadata/vN.metadata.json</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ load table root</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;overflow-wrap:anywhere;"><strong>② Identity &amp; configuration</strong><br><span style="font-size:14px;">format-version · table-uuid · location · properties</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ select IDs</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;overflow-wrap:anywhere;"><strong>③ Evolution state</strong><br><span style="font-size:14px;">schemas/current-schema-id · partition-specs/default-spec-id · sort-orders</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ current-snapshot-id / refs</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>④ Snapshot state &amp; logs</strong><br><span style="font-size:14px;color:#cdebf0;">snapshots · snapshot-log · metadata-log · last-sequence-number</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ manifest-list path</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;overflow-wrap:anywhere;"><strong>⑤ Manifest list → Manifest → Data/Delete file</strong><br><span style="font-size:14px;">scan planning과 row byte read</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Reader 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Engine이 catalog에 table identifier를 보내 current metadata location을 받는다. 이 응답이 root 선택이며 directory 정렬로 대체할 수 없다.</li>
+    <li>JSON의 <code>current-schema-id</code>, <code>default-spec-id</code>, <code>default-sort-order-id</code>로 현재 write/read interpretation을 찾는다. Old ID도 retained file 해석을 위해 공존한다.</li>
+    <li><code>current-snapshot-id</code> 또는 branch/tag <code>refs</code>가 선택한 snapshot에서 manifest-list path를 얻는다.</li>
+    <li>Manifest list와 manifest metrics로 pruning한 뒤 data/delete file을 연다. Sequence number로 delete applicability와 incremental ordering을 판단한다.</li>
+    <li>Read는 JSON과 snapshot을 관찰할 뿐 metadata JSON을 새로 만들지 않는다. Cache가 있다면 동일 pointer에 대한 view인지 확인한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Writer commit과 version 전이</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer는 base metadata location을 load해 예상 current root를 고정한다.</li>
+    <li>Data change라면 새 data/delete file → manifest → manifest list를 만들고 snapshot entry와 snapshot-log를 포함한 새 JSON을 쓴다.</li>
+    <li>Schema/property-only change라면 새 JSON은 만들지만 새 data snapshot은 필요하지 않을 수 있다. 이때 metadata-log는 늘고 snapshot-log는 그대로일 수 있다.</li>
+    <li>Operation별 conflict validation 뒤 catalog가 base pointer를 새 JSON path로 compare-and-swap한다. 이 순간이 성공의 선형화 지점이다.</li>
+    <li>Swap 전에 실패하면 새 JSON과 data file은 orphan 후보가 될 수 있다. Swap 후 응답을 잃으면 client는 실패처럼 보여도 current pointer는 이미 바뀌었을 수 있다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">Metadata 영역</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">상태·불변식·비용</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Identity</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><code>table-uuid</code>와 location은 table 정체성·기본 경로를 제공한다. Catalog에서 다른 table path를 잘못 연결하면 byte가 있어도 잘못된 state를 읽는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Evolution arrays</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Schemas/specs/orders는 immutable ID 버전을 누적하고 current/default ID가 활성 항목을 선택한다. Field ID와 spec ID가 old/new file 해석을 안정화한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Snapshots</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot은 parent, sequence, timestamp, manifest-list와 summary를 가진 version node다. ID 숫자 크기가 ordering 규칙은 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Snapshot log</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Current snapshot 전이의 ordered history다. Timestamp time travel 선택에 쓰이지만 독립 backup은 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Metadata log</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">이전 root file의 bounded history다. Metadata GC/retention에 따라 영구 audit log가 아니며 current file 자체는 catalog pointer로 안다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Persistent root</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">새 JSON은 기존 snapshot/manifest/data object를 공유하는 immutable root다. 작은 atomic pointer로 큰 table state를 전환하지만 metadata file 누적·load 비용이 생긴다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">세 가지 서로 다른 번호</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Metadata filename version:</strong> HadoopCatalog의 <code>v5.metadata.json</code> 같은 구현상 generation 이름이다. 모든 catalog가 같은 naming을 보장하지 않는다.</li>
+    <li><strong><code>format-version</code>:</strong> Table spec 기능 수준이다. V1/V2/V3 feature와 engine compatibility를 결정한다.</li>
+    <li><strong><code>last-sequence-number</code>:</strong> Table commit ordering에 쓰이는 monotonic sequence다. Snapshot ID나 filename과 같은 번호가 아니다.</li>
+  </ul>
+  <p><code>version-hint.text</code>도 Hadoop table operation이 metadata 찾기를 가속하기 위한 구현 artifact일 수 있다. Catalog current pointer와 동일한 보편적 source of truth로 간주하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">미래 기능과의 연결</h3>
+  <p>Metadata JSON의 schema/spec/order ID는 rewrite 없는 evolution의 기반이다. Snapshot sequence는 v2 equality/position delete가 어느 data file에 적용되는지, v3 deletion vector가 referenced data file과 어떤 순서 관계를 갖는지 해석하는 토대다. COW/MOR 선택, pruning, multi-engine 호환성과 maintenance race 모두 이 root metadata를 올바르게 공유해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Current 판정</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog API가 반환한 exact metadata location을 기록한다. Filename max, mtime, object listing이나 <code>version-hint</code>만으로 current를 추측하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Commit 관측</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Base/new metadata location, current snapshot, last sequence, operation summary와 batch identity를 한 event로 남긴다. Ambiguous commit 판정에 쓴다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Retention</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Metadata/snapshot 보존 기간을 rollback·audit 요구와 맞추고 file 누적 비용을 측정한다. Metadata-log를 영구 감사 원장으로 오해하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Compatibility</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Format version을 올리기 전에 모든 Spark/Flink/Trino connector의 read/write/delete/DV 지원을 test gate로 확인한다. 알 수 없는 필드 처리도 검증한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Forensics</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">장애 시 JSON을 수정하지 말고 current pointer, JSON hash/path, referenced manifests와 object audit log를 read-only로 보존한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> Warehouse에서 가장 큰 <code>vNN.metadata.json</code>을 골라 catalog pointer를 수동 변경하는 것. Failed commit의 unreferenced JSON이 더 큰 이름일 수 있고, catalog별 naming/atomicity도 다르다.</p>
+  <p><strong>Edge case:</strong> Property/schema-only commit은 metadata version을 늘리지만 snapshot을 늘리지 않는다. Monitoring이 “metadata file count = data commit count”를 전제로 하면 false alert와 누락이 생긴다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Warehouse에 더 최신처럼 보이는 metadata JSON이 있는데 engine은 이전 schema/snapshot을 읽는다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Engine별 schema/current snapshot 차이, directory에는 큰 version JSON 존재, recent write timeout, metadata_log_entries와 listing 불일치.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">각 engine/catalog가 반환한 exact metadata location, table UUID/location, current snapshot/ref, snapshot-log·metadata-log, JSON hash/mtime, writer base/new path와 commit log, catalog compare-and-swap/audit log, connector cache·version.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Pointer swap 전 실패한 orphan JSON, swap 후 stale cache, 다른 catalog/namespace, response 유실로 결과 불명확, version-hint 지연, manual copy, referenced metadata/object 손실.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Write와 cleanup을 멈추고 catalog source of truth를 read-only로 조회한다. 각 engine을 refresh한 뒤 동일 metadata location/table UUID인지 비교하고 의심 JSON의 reference chain을 보존한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Catalog pointer와 valid log가 확인되면 정상 connector/API로 known-good metadata/snapshot에 rollback 또는 새 corrective commit을 만든다. Missing referenced file은 backup에서 복원하고 orphan은 safety window 뒤 정리한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">JSON·version-hint·catalog DB를 수동 편집하지 않는다. Filename/mtime만 보고 pointer를 바꾸거나 파일을 삭제하지 않는다. 결과 불명확 상태에서 동일 write를 blind retry하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> CREATE, INSERT, schema/property change, 두 번째 INSERT마다 metadata JSON과 snapshot log가 어떻게 다르게 증가하는지 확인하고, unreferenced JSON 복사본이 current state가 아님을 증명한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트 루트에서 Docker와 <code>jq</code>를 사용할 수 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>예측 1: CREATE→INSERT→ADD COLUMN→SET PROPERTY→INSERT 뒤 metadata JSON과 snapshot은 각각 몇 번 증가할까?</li>
+    <li>예측 2: 마지막 JSON을 다른 이름으로 복사하면 current schema/snapshot이 바뀔까?</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 서로 다른 종류의 metadata commit 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day08;
+DROP TABLE IF EXISTS local.day08.metadata_lab;
+CREATE TABLE local.day08.metadata_lab (
+  id BIGINT, category STRING
+) USING iceberg;
+
+INSERT INTO local.day08.metadata_lab VALUES (1, 'A');
+ALTER TABLE local.day08.metadata_lab ADD COLUMN note STRING;
+ALTER TABLE local.day08.metadata_lab SET TBLPROPERTIES ('day08.marker'='yes');
+INSERT INTO local.day08.metadata_lab VALUES (2, 'B', 'new-schema');
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> HadoopCatalog 기반 이 환경에서는 각 table metadata commit마다 새 JSON이 생긴다. CREATE와 두 INSERT, 두 ALTER로 여러 JSON generation이 생기지만 data snapshot은 두 INSERT에 대해서만 2개다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · SQL log와 물리 JSON 대조</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT * FROM local.day08.metadata_lab.metadata_log_entries
+ORDER BY timestamp;
+SELECT committed_at, snapshot_id, parent_id, operation
+FROM local.day08.metadata_lab.snapshots ORDER BY committed_at;
+SELECT * FROM local.day08.metadata_lab.history ORDER BY made_current_at;
+DESCRIBE TABLE local.day08.metadata_lab;
+&quot;
+
+find warehouse/day08/metadata_lab/metadata -type f | sort
+
+for f in warehouse/day08/metadata_lab/metadata/*.metadata.json; do
+  jq -r '[input_filename, .&quot;format-version&quot;,
+    .&quot;last-sequence-number&quot;, .&quot;current-schema-id&quot;,
+    .&quot;current-snapshot-id&quot;,
+    (.snapshots | length), (.&quot;snapshot-log&quot; | length),
+    (.&quot;metadata-log&quot; | length)] | @tsv' &quot;$f&quot;
+done</pre>
+  <p><strong>예상 관찰:</strong> JSON generation은 snapshot 수보다 많다. ADD COLUMN 뒤 <code>current-schema-id</code>와 last column ID가 변하지만 current snapshot은 유지될 수 있다. Property change도 새 JSON을 만들지만 snapshot-log는 그대로다. 마지막 INSERT에서 snapshot·snapshot-log·sequence가 증가한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · 최신처럼 보이는 unreferenced JSON 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">KNOWN_JSON=$(find warehouse/day08/metadata_lab/metadata \
+  -name 'v*.metadata.json' | sort -V | tail -n 1)
+cp &quot;$KNOWN_JSON&quot; \
+  warehouse/day08/metadata_lab/metadata/rogue-unreferenced.metadata.json
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS rows_after_copy FROM local.day08.metadata_lab;
+SELECT * FROM local.day08.metadata_lab.metadata_log_entries
+ORDER BY timestamp;
+&quot;
+
+find warehouse/day08/metadata_lab/metadata -name '*.metadata.json' | sort</pre>
+  <p><strong>예상 관찰:</strong> Directory에는 JSON 하나가 늘지만 table row, schema, current snapshot과 metadata-log result는 바뀌지 않는다. 복사본은 catalog pointer에서도 metadata-log에서도 도달하지 못한다. <code>sort -V</code>는 실습 복사 대상을 고르는 편의일 뿐 current 판정법이 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Metadata table column 차이:</strong> <code>DESCRIBE local.day08.metadata_lab.metadata_log_entries</code>로 runtime schema를 확인한다. Engine/connector version별 표현을 기록한다.</li>
+    <li><strong><code>jq</code>가 null length 오류:</strong> Older/format-specific JSON에서 optional field가 없을 수 있다. <code>(.&quot;metadata-log&quot; // [] | length)</code>처럼 default를 사용한다.</li>
+    <li><strong>JSON 수가 예상과 다름:</strong> Catalog 구현, metadata retention 설정, retry와 cleanup 차이를 확인한다. 고정 수보다 SQL 종류별 snapshot 변화 여부를 채점한다.</li>
+    <li><strong>Filename이 UUID 기반:</strong> 정상이다. 모든 catalog가 <code>vN</code> naming을 쓰지 않는다. Metadata table과 catalog API path를 기준으로 추적한다.</li>
+    <li><strong>복사 뒤 table load 실패:</strong> Rogue file 이름이 catalog naming과 충돌하지 않는지 확인하고 즉시 정확한 복사본만 제거한다.</li>
+    <li><strong>Permission/cache 오류:</strong> <code>make smoke</code>, Docker disk, warehouse mount와 Ivy cache 설정을 확인한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">rm warehouse/day08/metadata_lab/metadata/rogue-unreferenced.metadata.json
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day08.metadata_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day08;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">정확히 만든 rogue JSON 한 개를 먼저 제거하고 실습 table을 PURGE한다. 다른 metadata JSON이나 version-hint를 수동 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong><code>v5.metadata.json</code>은 format v5다.</strong> Filename generation과 <code>format-version</code>은 별개다.</li>
+    <li><strong>Metadata JSON 하나는 snapshot 하나다.</strong> 한 JSON은 여러 snapshot을 담고 schema/property commit은 snapshot 없이 새 JSON을 만든다.</li>
+    <li><strong>Snapshot ID가 크면 최신이다.</strong> Snapshot-log timestamp, parent와 sequence를 사용한다.</li>
+    <li><strong>Metadata-log에 current JSON도 반드시 있다.</strong> Spec field는 이전 metadata file 목록이며 current location은 catalog가 제공한다.</li>
+    <li><strong>Directory의 최신 mtime이 current다.</strong> Failed commit/복사/clock 차이 때문에 catalog pointer만 authoritative하다.</li>
+    <li><strong>Version-hint가 catalog pointer다.</strong> Hadoop 구현 artifact일 수 있으며 모든 catalog의 transaction source가 아니다.</li>
+    <li><strong>JSON은 사람이 고쳐도 된다.</strong> Hash/reference/ID 불변식을 깨고 multi-engine corruption을 만들 수 있다.</li>
+    <li><strong>Metadata history는 영구 audit log다.</strong> Retention/GC와 catalog 종류에 따라 bounded될 수 있어 별도 audit가 필요하다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “Iceberg metadata JSON을 읽어 table state를 복원하는 절차를 설명하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> 10PB·수천만 file 가정 → catalog exact location → UUID/location/format → current schema/spec/order IDs → current snapshot/refs → manifest list→manifest→data/delete file → field/spec ID·sequence/pruning → missing/stale object failure → cache/metadata size 비용과 복구 대안.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. “Metadata version, snapshot, sequence number의 차이를 commit 예제로 설명하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> CREATE·append·ADD COLUMN·property change 수치 예 → 모든 metadata commit은 새 root, data commit만 snapshot → sequence와 snapshot ID ordering 차이 → snapshot-log/metadata-log → optimistic swap → response 유실/orphan → retention trade-off.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. “최신처럼 보이는 JSON과 catalog state가 다를 때 incident를 처리하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> 영향 engine·SLO/RPO 가정 → write freeze → exact pointer/UUID/log/hash/audit 수집 → failed commit vs stale cache vs wrong catalog 가설 → read-only refresh → known-good API rollback/corrective commit → orphan safety window → 수동 JSON/pointer 편집 금지와 DR 대안.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Parquet, Iceberg metadata, catalog가 각각 소유하는 상태는 무엇인가?</li>
+    <li>Warehouse에 valid Parquet를 복사해도 Iceberg row가 늘지 않는 이유는?</li>
+    <li>Iceberg commit의 성공이 확정되는 선형화 지점은 어디인가?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>File 내부 byte layout / table metadata graph / current metadata pointer로 구분하면 통과.</li>
+    <li>Current snapshot의 manifest에서 복사본 path에 도달하지 못해 membership이 없다고 답하면 통과.</li>
+    <li>Conflict validation 뒤 catalog current metadata pointer가 원자 교체되는 순간이라고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Metadata JSON generation, format-version, sequence number를 구분하라.</li>
+    <li>Snapshot-log와 metadata-log가 서로 다른 이유를 schema-only commit 예로 설명하라.</li>
+    <li>Directory의 가장 큰 <code>vN.metadata.json</code>을 current로 간주하면 안 되는 이유는?</li>
+  </ol>
+  <h3 style="font-size:18px;color:#07566a;">짧은 정답/채점 기준</h3>
+  <ol style="padding-left:22px;">
+    <li>Root file 세대 / spec 기능 수준 / commit ordering이라고 각각 답하면 통과.</li>
+    <li>Schema-only commit은 새 JSON·metadata-log를 만들지만 current snapshot 변화가 없어 snapshot-log는 늘지 않을 수 있다고 답하면 통과.</li>
+    <li>Failed commit·복사본·catalog-specific naming 때문에 file 존재/이름은 authoritative하지 않고 catalog pointer가 기준이라고 답하면 통과.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#table-metadata" style="color:#0b7185;overflow-wrap:anywhere;">Iceberg Specification · Table Metadata</a> — metadata JSON field와 ID/log 구조의 규범.</li>
+    <li><a href="https://iceberg.apache.org/spec/#snapshot-log" style="color:#0b7185;overflow-wrap:anywhere;">Iceberg Specification · Snapshot Log</a> — current snapshot 변화 history의 요구사항.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Spark Queries</a> — snapshots, history, metadata_log_entries 조회.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/reliability/" style="color:#0b7185;overflow-wrap:anywhere;">Apache Iceberg Reliability</a> — optimistic concurrency와 atomic commit.</li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">확인 기준: 2026-08-08. 공식 latest 문서는 현재 1.11.0을 표시한다. 본 프로젝트 runtime은 Spark 3.5.8 + Iceberg 1.11.0이며, filename과 metadata table column은 catalog/engine/connector별로 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <p><strong>Day 09 · snapshot, history, refs</strong></p>
+  <p>Snapshot node, current 전이 history와 branch/tag ref가 서로 어떤 상태를 소유하며 retention·time travel·rollback에 어떻게 영향을 주는지 추적한다.</p>
+
+  <div style="margin-top:32px;padding:16px 18px;background:#073642;color:#d5edf2;border-radius:10px;">
+    <strong style="color:#8ee7f6;">ChatGPT Project에서 더 깊게 물어볼 질문</strong><br>
+    “실제 metadata JSON 예시를 field별로 리뷰하고, schema-only commit·append·concurrent conflict·response 유실 때 metadata-log와 snapshot-log가 어떻게 달라지는지 state transition 표로 질문해 줘.”
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
