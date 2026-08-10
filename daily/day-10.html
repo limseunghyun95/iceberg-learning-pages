@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 10</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 2 / DAY 10</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">manifest list와 manifest entry</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Metadata Tree와 Scan Planning · 예상 학습 30분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Manifest list는 snapshot이 사용할 manifest들의 작은 색인이고, manifest entry는 각 data/delete file의 table membership과 통계를 기록한다. 이 두 층 덕분에 Iceberg는 object storage 전체를 나열하지 않고 필요한 파일만 찾는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Avro</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Schema와 record를 함께 다루는 직렬화 file format이다. Iceberg의 manifest list와 manifest는 Avro로 저장된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Manifest list</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">한 snapshot에 속한 manifest file 목록과 요약을 담는 snapshot별 Avro index다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Manifest</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">같은 partition spec과 같은 content 종류의 file entry 묶음이다. Data manifest와 delete manifest가 분리된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Manifest entry</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">File 하나에 대한 status, snapshot/sequence와 data_file 구조를 담는 record다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Pruning</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Predicate와 절대 겹치지 않는 metadata/file을 읽기 전에 제외하는 과정이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Sequence number</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">File content의 상대적 나이를 나타내는 commit 순서 값이다. Delete 적용과 incremental ordering에 사용된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">COW / MOR / DV</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Copy-on-write는 data file을 다시 쓰고, merge-on-read는 delete 정보를 읽을 때 합친다. DV(deletion vector)는 v3의 delete 표현이며 engine 지원은 별도 확인한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Object storage directory를 전부 list해 현재 file을 찾으면 table 크기와 무관하게 path 수에 비례한 O(n) metadata I/O가 필요하다. Iceberg는 catalog에서 시작하는 명시적 graph를 따라가므로 “존재하는 object”와 “현재 snapshot에 속한 object”를 분리한다.</p>
+  <p>Manifest list와 manifest는 단순 파일 목록이 아니다. Partition 범위, file 수, row 수, column bounds를 여러 층에 둔 index다. Query planner는 작은 상위 index에서 후보를 줄인 뒤 더 자세한 하위 index를 읽는다. 동시에 writer는 기존 manifest를 재사용해 매 commit마다 table 전체 파일 목록을 다시 쓰지 않는다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Snapshot의 manifest list에서 도달해 live로 해석되는 entry만 table state에 속한다. Warehouse에 object가 존재하거나 entry의 status가 DELETED라는 사실만으로 즉시 물리 삭제 여부를 판단하지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>① Catalog pointer</strong><br><span style="font-size:14px;color:#cdebf0;">Current metadata JSON location</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ current-snapshot-id</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;overflow-wrap:anywhere;"><strong>② Snapshot</strong><br><span style="font-size:14px;">manifest-list path · schema/spec/sequence context</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ partition summary로 manifest pruning</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;overflow-wrap:anywhere;"><strong>③ Manifest list</strong><br><span style="font-size:14px;">manifest path/length · spec ID · content · sequence · file/row counts</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ 필요한 manifest만 read</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>④ Manifest entries</strong><br><span style="font-size:14px;color:#cdebf0;">status · snapshot/sequence · path · partition · record/file/column metrics</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ entry/file metrics로 file pruning</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;overflow-wrap:anywhere;"><strong>⑤ Data / Delete files</strong><br><span style="font-size:14px;">Parquet row-group pruning · COW 또는 MOR/DV merge</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Read 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Reader는 catalog가 가리키는 metadata JSON과 선택 snapshot을 고정한다. 이것이 control path의 root다.</li>
+    <li>Manifest list의 partition summaries를 query predicate와 비교해 겹치지 않는 manifest를 제외한다.</li>
+    <li>남은 manifest만 읽고 각 entry의 partition과 column metrics로 data/delete file 후보를 줄인다.</li>
+    <li>Data path는 선택된 file byte를 읽는다. MOR에서는 sequence rule로 적용 가능한 equality/position delete 또는 DV를 병합한다.</li>
+    <li>Reader가 고정한 snapshot graph는 concurrent commit이 current pointer를 바꿔도 변하지 않는다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Write·commit 요청과 상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer는 base snapshot과 expected catalog pointer를 읽고 immutable data/delete file과 새 manifest를 쓴다.</li>
+    <li>작은 manifest merge 정책에 따라 기존 manifest를 그대로 재사용하거나 entries를 새 manifest로 rewrite한다.</li>
+    <li>Commit attempt마다 새 manifest list와 snapshot, metadata JSON을 만든다. 새 manifest의 optimistic sequence 값은 commit에서 확정된다.</li>
+    <li>Engine은 append/overwrite/delete 범위와 base 이후 변경을 validation한다. Conflict면 새 current를 load해 안전한 operation만 재계획한다.</li>
+    <li>Catalog의 atomic pointer swap이 성공하는 순간 commit이 확정된다. 그 전 object는 생성됐어도 current table state가 아니다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:27%;">개념</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Manifest tree에서의 의미</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Two-level index</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Manifest list는 manifest 범위 index, manifest는 file-level index다. 필요한 하위 block만 읽어 planning I/O를 줄인다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Persistent structure</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">새 snapshot은 바뀐 manifest를 추가하면서 unchanged manifest를 공유한다. Version 생성 비용이 전체 table 크기보다 변경량에 가까워진다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Tri-state delta</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">EXISTING(0), ADDED(1), DELETED(2)는 manifest가 추가된 snapshot을 기준으로 membership 변화를 표현한다. DELETED entry는 scan에 쓰지 않는 정보다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Context inheritance</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Added entry의 nullable snapshot/sequence는 manifest-list metadata에서 상속될 수 있다. Raw null을 “값 없음”으로 해석하면 안 된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Logical clock</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Data sequence는 content age와 delete applicability, file sequence는 file이 table에 들어온 순서를 표현한다. 둘은 목적이 다르다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Linearization point</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Manifest byte 생성이 아니라 catalog pointer CAS/atomic swap 성공이 commit의 단일 확정 시점이다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Manifest list가 저장하는 것</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>주소와 크기:</strong> manifest_path, manifest_length.</li>
+    <li><strong>해석 context:</strong> partition_spec_id, data/delete content, sequence_number, min_sequence_number, added_snapshot_id.</li>
+    <li><strong>요약:</strong> ADDED/EXISTING/DELETED file·row count와 partition field lower/upper/null summaries.</li>
+    <li><strong>Version 경계:</strong> v1은 content와 sequence가 없어서 reader가 data/0으로 해석한다. v3에는 row lineage 관련 field가 추가될 수 있다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Manifest entry가 저장하는 것</h3>
+  <p><code>status</code>, <code>snapshot_id</code>, <code>sequence_number</code>, <code>file_sequence_number</code>와 중첩된 <code>data_file</code> 구조다. Data_file에는 content, path, format, partition tuple, record_count, file_size와 field ID별 value/null/NaN count, lower/upper bounds 등이 있다. Field ID가 column rename/reorder 뒤에도 metric 의미를 연결하고 partition spec ID가 old/new partition tuple을 해석한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Manifest 크기</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Planning latency, manifest count/bytes, entries per manifest와 commit rate를 같이 본다. 너무 작으면 open/I/O가 늘고 너무 크면 selective query도 큰 index를 읽는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Partition clustering</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">자주 쓰는 predicate의 partition range가 manifest마다 겹치지 않게 쓰기 분배와 manifest clustering을 관찰한다. 같은 file 수라도 pruning 효과가 달라진다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Rewrite manifests</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Before/after manifest count, planning p95와 predicate별 scanned manifests를 비교한다. Rewrite도 새 optimistic commit이므로 writer race와 retry를 runbook에 넣는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Format version</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">V1/V2/V3 manifest field와 delete/DV 지원을 engine별 compatibility matrix로 검증한다. Spec 가능과 connector 구현을 동일시하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>관찰 API</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">운영 진단은 Spark <code>manifests</code>, <code>all_manifests</code>, <code>entries</code>, <code>files</code> metadata table을 우선 사용한다. Column 이름은 runtime의 DESCRIBE로 확인한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> Manifest 수가 많다는 이유만으로 writer와 동시에 무조건 rewrite를 반복하는 것. Planning 개선보다 maintenance commit, object I/O와 conflict 비용이 더 커질 수 있다.</p>
+  <p><strong>Edge case:</strong> Partition evolution 뒤에는 서로 다른 spec ID의 manifest가 공존한다. 같은 position의 partition value를 같은 의미로 비교하지 말고 spec ID와 field ID 기반으로 predicate를 projection해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Commit rate가 오른 뒤 query planning p95가 급증하고 driver가 manifest I/O에 오래 머문다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Planning p95 상승, manifest GET/bytes 증가, driver CPU/heap 상승, 실행 task가 시작되기 전 지연, selective query도 많은 manifest scan.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Current snapshot/metadata location, manifests/all_manifests row와 size/count, entries/file count, partition summaries 겹침, commit rate, planning/scan report, object GET latency/404, recent rewrite와 writer conflict log.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">작은 append가 만든 manifest 폭증, range가 겹치는 poor clustering, stale cache, object storage throttling, partition evolution 혼재, connector regression, maintenance와 writer race.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Read-only로 current snapshot의 manifest 분포와 query predicate가 건너뛴 비율을 확인한다. 작은 비핵심 table/branch에서 rewrite 효과와 conflict를 재현하고 write rate를 임시 완화한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Rewrite commit이 성능/호환 문제를 만들었으면 retained known-good snapshot으로 rollback한다. Writer policy와 rewrite threshold를 조정하고 canary·planning SLO를 둔다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Manifest Avro를 직접 삭제·편집하지 않는다. Current graph 확인 없이 metadata directory를 정리하지 않는다. Active writer와 무제한 rewrite를 경쟁시키지 않는다. 단일 query latency만으로 원인을 확정하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 세 번의 append가 만든 snapshot→manifest list→manifest→entry→data file 경로를 metadata table과 실제 path로 연결하고, 참조되지 않은 rogue manifest가 table state를 바꾸지 못함을 증명한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon이 실행 중이고 프로젝트 루트에서 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>예측한다: Append를 세 번 하면 data file, snapshot, current manifest 수는 각각 반드시 3인가?</li>
+    <li>Metadata directory에 유효한 Avro file을 복사하면 current table의 manifest 수가 늘어나는가?</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Partition이 다른 append 세 번</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day10;
+DROP TABLE IF EXISTS local.day10.manifest_lab PURGE;
+CREATE TABLE local.day10.manifest_lab (
+  id BIGINT, event_time TIMESTAMP, payload STRING
+) USING iceberg PARTITIONED BY (days(event_time));
+INSERT INTO local.day10.manifest_lab VALUES
+  (1, TIMESTAMP '2026-08-01 01:00:00', 'a');
+INSERT INTO local.day10.manifest_lab VALUES
+  (2, TIMESTAMP '2026-08-02 01:00:00', 'b');
+INSERT INTO local.day10.manifest_lab VALUES
+  (3, TIMESTAMP '2026-08-03 01:00:00', 'c');
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Snapshot은 세 append만큼 늘고 각 insert가 적어도 한 data file을 만든다. Current manifest 수는 writer의 merge/target 설정에 따라 3과 다를 수 있으므로 결과를 먼저 단정하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Logical metadata graph 조회</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT committed_at, snapshot_id, parent_id, operation, manifest_list
+FROM local.day10.manifest_lab.snapshots ORDER BY committed_at;
+
+SELECT content, path, length, partition_spec_id, added_snapshot_id,
+       added_data_files_count, existing_data_files_count,
+       deleted_data_files_count, partition_summaries
+FROM local.day10.manifest_lab.manifests ORDER BY path;
+
+SELECT status, snapshot_id, sequence_number, file_sequence_number,
+       data_file.content, data_file.file_path,
+       data_file.partition, data_file.record_count
+FROM local.day10.manifest_lab.entries ORDER BY data_file.file_path;
+
+SELECT content, file_path, partition, record_count, file_size_in_bytes
+FROM local.day10.manifest_lab.files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Snapshot의 manifest_list path가 manifest rows를 가리키고, live entry의 data_file.file_path가 files row와 연결된다. Entry status는 0/1/2이며 current scan은 live 상태만 사용한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Physical path와 연결</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">find warehouse/day10/manifest_lab/metadata -type f | sort
+find warehouse/day10/manifest_lab/data -type f | sort</pre>
+  <p><strong>예상 관찰:</strong> Metadata directory에는 metadata JSON, snapshot별 manifest list Avro와 재사용 가능한 manifest Avro가 있다. Directory file 수와 current metadata table row 수는 같지 않다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · 참조되지 않은 rogue manifest</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">MANIFEST_SOURCE=$(find warehouse/day10/manifest_lab/metadata -type f -name '*-m*.avro' | head -n 1)
+test -n &quot;$MANIFEST_SOURCE&quot;
+cp &quot;$MANIFEST_SOURCE&quot; warehouse/day10/manifest_lab/metadata/rogue-manifest.avro
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS manifest_count FROM local.day10.manifest_lab.manifests;
+SELECT count(*) AS entry_count FROM local.day10.manifest_lab.entries;
+SELECT count(*) AS row_count FROM local.day10.manifest_lab;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Rogue Avro object는 directory에는 있지만 어떤 current manifest list도 가리키지 않는다. Manifest/entry/table row count는 복사 전과 동일해야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>entries column 오류:</strong> <code>DESCRIBE local.day10.manifest_lab.entries</code>로 runtime schema를 보고 nested field 이름을 조정한다.</li>
+    <li><strong>manifest pattern이 비어 있음:</strong> <code>find .../metadata -type f</code>로 실제 writer naming을 확인하고 manifest row의 path와 대조한다.</li>
+    <li><strong>Current manifest 수가 예상과 다름:</strong> Writer manifest merge가 동작할 수 있다. Snapshots의 manifest_list와 all_manifests를 함께 본다.</li>
+    <li><strong>Sequence가 null:</strong> Added entry는 manifest-list context에서 상속될 수 있다. Metadata table projection과 spec version을 확인한다.</li>
+    <li><strong>Warehouse 경로가 다름:</strong> Metadata table의 absolute path를 기준으로 catalog warehouse 설정을 확인한다.</li>
+    <li><strong>Docker 연결 실패:</strong> Docker daemon을 시작하고 <code>make smoke</code>가 성공한 뒤 실습을 재개한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">rm warehouse/day10/manifest_lab/metadata/rogue-manifest.avro
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day10.manifest_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day10;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">실패 주입으로 만든 exact rogue path만 먼저 제거한다. Iceberg가 관리하는 metadata/data file은 직접 지우지 않고 table PURGE에 맡긴다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Manifest list와 manifest는 같은 파일이다.</strong> 전자는 snapshot별 manifest index, 후자는 file entry 묶음이다.</li>
+    <li><strong>Manifest 하나는 한 commit이다.</strong> Manifest는 snapshot 사이에서 재사용·merge될 수 있어 1:1이 아니다.</li>
+    <li><strong>DELETED entry면 object가 즉시 사라진다.</strong> Scan에서 제외된 logical delta이며 물리 삭제는 snapshot expiration/GC 뒤다.</li>
+    <li><strong>Null sequence는 unknown이다.</strong> Added entry는 manifest-list context에서 값을 상속할 수 있다.</li>
+    <li><strong>File path가 warehouse에 있으면 live다.</strong> Current graph reachability와 entry status가 membership을 결정한다.</li>
+    <li><strong>Partition value position만 보면 된다.</strong> Evolution 후에는 partition spec ID와 field ID를 함께 해석한다.</li>
+    <li><strong>Manifest rewrite는 무상이다.</strong> Object I/O와 새 commit, writer conflict, cache invalidation 비용이 있다.</li>
+    <li><strong>모든 engine이 V3/DV와 metadata table을 동일 지원한다.</strong> Spec과 connector version의 차이를 compatibility test로 고정한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “10PB table에서 predicate에 맞는 file을 어떻게 찾습니까?”</h3>
+  <p><strong>좋은 답변 구조:</strong> File/partition/manifest 수 가정 → catalog root → snapshot → manifest list partition summary → manifest entry partition/column metric → Parquet row group → single-node planning I/O 수치 → poor clustering/false positive → distributed listing 대안과 trade-off.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. “ADDED/EXISTING/DELETED와 sequence inheritance를 설명하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Manifest가 추가된 snapshot 기준 delta → 각 status의 scan 의미 → snapshot/data/file sequence 구분 → added null 상속 → delete applicability → COW/MOR/DV → v1/v2/v3와 engine 지원 경계 → raw Avro 진단 함정.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. “Manifest 폭증으로 planning latency가 느릴 때 운영 설계를 제시하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Planning p95·manifest count/bytes·commit rate 수치 → partition summary 겹침 → write/merge 정책 → canary rewrite → optimistic conflict/maintenance race → rollback snapshot → engine cache/compatibility → data file compaction과 구분.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Snapshot, history, refs는 각각 어떤 질문에 답하는가?</li>
+    <li>Branch/tag를 만들어도 full table copy가 필요 없는 이유는?</li>
+    <li>Snapshot expiration 전에 refs를 inventory해야 하는 이유는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong><br>
+    ① Snapshot=immutable state node, history=main current 전이 log, ref=named snapshot pointer를 모두 구분하면 3점.<br>
+    ② Ref가 기존 snapshot/manifest/file graph root를 공유하며 file을 복제하지 않는다고 설명하면 2점.<br>
+    ③ Live ref와 retention이 old snapshot/file reachability를 보호하므로 잘못 expire하면 감사·branch read가 깨진다고 설명하면 2점.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>Manifest list와 manifest가 각각 어느 수준에서 pruning하는가?</li>
+    <li>Manifest entry의 DELETED는 무엇을 의미하며 물리 file 삭제와 왜 다른가?</li>
+    <li>Added entry의 null sequence를 raw null로 해석하면 안 되는 이유는?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #a8d8bd;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong><br>
+    ① Manifest list는 partition summary로 manifest를, manifest는 partition/column metric으로 file을 pruning한다고 답하면 2점.<br>
+    ② Snapshot 기준 logical membership delta이며 scan에서 제외되지만 object GC는 retained snapshot 만료 뒤라고 답하면 2점.<br>
+    ③ Snapshot/data/file sequence가 manifest-list context에서 상속될 수 있고 delete applicability에 필요하다고 답하면 3점.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;overflow-wrap:anywhere;">
+    <li><a href="https://iceberg.apache.org/spec/#manifest-lists" style="color:#0b7185;">Iceberg Table Specification · Manifest Lists</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#manifests" style="color:#0b7185;">Iceberg Table Specification · Manifests / Entry Fields</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/" style="color:#0b7185;">Spark Queries · Metadata Tables</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/performance/" style="color:#0b7185;">Performance · Scan Planning</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">공식 문서 확인 기준: 2026-08-10. Table spec version과 Spark/Iceberg connector version별 field·metadata-table 지원 차이는 실제 runtime에서 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:8px;">
+    <strong style="color:#8ee7f6;">Day 11 · file metrics, bounds, counts</strong><br>
+    Manifest entry 안의 value/null/NaN counts와 lower/upper bounds가 어떤 predicate를 안전하게 제외하고, truncate·NaN·null·암호화·engine 차이에서 어떤 false positive를 허용하는지 파고든다.
+  </div>
+</td></tr>
+<tr><td style="padding:18px 26px;background:#eef3f5;color:#52636d;font-size:13px;text-align:center;">Iceberg 9주·63일 심화 커리큘럼 · Week 2 / Day 10</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
