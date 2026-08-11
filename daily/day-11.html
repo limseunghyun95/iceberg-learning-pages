@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 11</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 2 / DAY 11</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">file metrics, bounds, counts</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Metadata Tree와 Scan Planning · 예상 학습 30분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    File metric은 “이 file에 답이 절대 없다”는 것을 data byte를 읽기 전에 안전하게 증명하는 보수적 요약이다. Bounds와 counts는 정답을 확정하는 통계가 아니라 false negative를 만들지 않는 pruning guard다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Metric</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">File 전체를 짧게 요약한 metadata다. Row 수, column별 값·null·NaN 수, 최소·최대 범위 등이 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Lower / upper bound</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">모든 non-null·non-NaN 값보다 작거나 같은 하한과 크거나 같은 상한이다. 반드시 실제 min/max와 같을 필요는 없다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Value count</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">해당 column의 값 개수다. Iceberg spec에서 null과 NaN도 포함한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Null / NaN count</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">NULL과 floating-point의 NaN(Not a Number)을 별도로 센 값이다. Bounds는 이 값을 포함하지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">Field ID</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">Column 이름과 별개인 영구 숫자 ID다. Metric map의 key라서 rename 뒤에도 통계가 같은 logical field에 연결된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">False positive</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">답이 없는데 후보 file을 읽는 것. 성능은 손해지만 결과는 맞다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;overflow-wrap:anywhere;">False negative</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;overflow-wrap:anywhere;">답이 있는 file을 잘못 제외하는 것. Query 결과를 틀리게 하므로 허용되지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Partition만으로는 같은 날짜 안의 수천 file 중 어떤 file에 <code>customer_id = 42</code>가 있는지 알 수 없다. Iceberg는 manifest entry에 file-level column 요약을 넣어 data file을 열기 전에 후보를 줄인다. 이 단계가 잘 작동하면 object GET, network byte, task 수와 query latency가 함께 감소한다.</p>
+  <p>그러나 metric은 작은 index이므로 완전한 진실을 모두 담지 않는다. Truncated string bound, 빠진 map key, null/NaN, delete file과 schema evolution을 잘못 해석하면 pruning이 느려지거나 더 심각하게는 결과가 틀릴 수 있다. 그래서 writer가 보수적 bound 불변식을 지키고 reader는 “정보 없음”을 “값 없음”으로 오해하지 않아야 한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Lower bound ≤ file의 모든 non-null·non-NaN 값 ≤ upper bound여야 한다. Metric이 없거나 모호하면 file을 유지해 false positive를 허용하고, 근거 없이 제외해 false negative를 만들지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>① Catalog → metadata JSON</strong><br><span style="font-size:14px;color:#cdebf0;">Current snapshot root 선택</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ snapshot → manifest list</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;overflow-wrap:anywhere;"><strong>② Manifest-level pruning</strong><br><span style="font-size:14px;">Partition summaries로 읽을 manifest 선택</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ manifest entry</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;overflow-wrap:anywhere;"><strong>③ File metrics</strong><br><span style="font-size:14px;">record/file size · value/null/NaN counts · lower/upper bounds</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ predicate와 안전하게 비교</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;overflow-wrap:anywhere;"><strong>④ Candidate data/delete files</strong><br><span style="font-size:14px;color:#cdebf0;">COW/MOR · sequence와 delete overlap 확인</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ 실제 byte read</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;overflow-wrap:anywhere;"><strong>⑤ Parquet row-group/page pruning</strong><br><span style="font-size:14px;">남은 file 내부 index로 한 번 더 축소</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Read 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Planner가 query predicate를 field ID와 현재 schema 기준 expression으로 bind한다.</li>
+    <li>Partition spec ID별로 predicate를 projection해 manifest를 줄인 뒤, 남은 entry의 metric map을 field ID로 조회한다.</li>
+    <li><code>id = 42</code>인데 file bound가 [100, 200]이면 그 file은 제외한다. Bound가 없으면 후보로 남긴다.</li>
+    <li><code>note IS NULL</code>인데 null count가 0이면 제외할 수 있다. Count가 missing이면 “0”으로 간주하지 않는다.</li>
+    <li>MOR에서는 data와 delete file metric 범위, partition과 sequence를 함께 보아 적용 가능한 delete 후보를 정한다. V3 DV는 referenced data file과 offset/length를 사용한다.</li>
+    <li>선택 file의 Parquet row-group/footer를 읽고 더 세밀한 filtering을 한 뒤 row predicate를 실제로 평가한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Write·commit 요청과 상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer task가 data/delete file을 만들며 file format 통계에서 metric을 수집한다. 수집 mode는 none/counts/truncate/full 같은 정책에 영향을 받는다.</li>
+    <li>Metric은 column 이름이 아니라 field ID key와 typed binary bound로 manifest entry에 기록된다. Delete file metric은 모든 deleted row를 반영하거나 생략해야 한다.</li>
+    <li>새 manifest와 manifest list, snapshot, metadata JSON을 쓴 뒤 base 이후 변경에 대해 optimistic conflict validation한다.</li>
+    <li>Catalog pointer swap이 성공해야 metric이 current state의 control path에 들어온다. Response 유실 시 snapshot/file path로 성공 여부를 먼저 확인한다.</li>
+    <li>Commit 실패 전에 생성된 object는 current graph에 없을 수 있다. Object listing만 보고 metric/file을 table에 수동 연결하지 않는다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:28%;">Metric</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">정확한 의미와 pruning 예</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>record_count</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Data file의 물리 record 수, DV라면 cardinality다. MOR delete 적용 후 live row 수와 같지 않을 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>file_size / column_sizes</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Scan cost와 split planning에 유용하다. Column size는 해당 column region byte이며 footer 등 공통 byte를 포함하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>value_counts</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Null과 NaN을 포함한 값 개수다. Nested field에서는 record_count와 단순히 같다고 가정하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>null counts</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><code>IS NULL</code>/<code>IS NOT NULL</code> 후보를 줄인다. Missing count는 0이 아니라 unknown이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>NaN counts</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Float/double의 NaN 존재를 별도로 나타낸다. NaN은 lower/upper bound에 넣지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>lower / upper</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Inclusive conservative interval이다. Predicate interval과 겹치지 않을 때만 제외한다. 문자열 truncate는 interval이 넓어 false positive가 늘 수 있다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">왜 “요약”이 정답이 아닌가</h3>
+  <p>Bound [10, 100]은 42가 존재한다는 뜻이 아니라 존재할 가능성을 배제하지 못한다는 뜻이다. Bloom filter처럼 membership을 더 좁히는 별도 index가 있어도 최종 row predicate는 data를 읽고 평가한다. 이 구조는 approximate synopsis를 exact result의 대체물이 아니라 I/O guard로 사용한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Schema, partition, delete와 연결</h3>
+  <p>V3 이하 metric map은 field ID가 key이므로 rename/reorder에도 안전하다. Partition evolution에서는 spec ID별 partition projection 뒤 file metric을 적용한다. COW는 새 data file metric을 쓰고, MOR은 data와 equality/position delete metric overlap 및 sequence를 함께 본다. V3 DV는 한 data file을 직접 참조하지만 engine/connector 지원을 확인해야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Format version 경계</h3>
+  <p>공식 spec에서 V3 이하 metric은 field-ID map이며, 더 새로운 spec text에는 typed <code>content_stats</code> 표현이 기술되어 있다. 실제 table format adoption과 Spark/Flink/Trino reader 지원은 별도다. Runtime이 쓰지 못하는 spec 기능을 단순히 문서에 있다는 이유로 활성화하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>수집 mode</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Join/filter 핵심 column은 full 또는 충분한 truncate, 민감하거나 넓은 payload는 counts/none을 검토한다. Planning 이득과 manifest 크기·privacy 비용을 수치로 비교한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>정확성 gate</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">새 writer/engine 도입 시 sample file의 실제 min/max/null/NaN과 readable_metrics를 대조한다. 잘못 좁은 bound는 성능 문제가 아니라 correctness 사고다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Pruning SLO</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Predicate별 candidate/total files, planning p95, scanned bytes와 manifest bytes를 함께 본다. File size만 최적화하면 metric selectivity를 놓친다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>민감정보</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Name, email, token 같은 column의 bounds는 manifest를 읽을 권한에 값을 노출할 수 있다. Metadata IAM·encryption과 metrics mode를 함께 설계한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Multi-engine</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Field ID binding, NaN/decimal/timestamp ordering, truncated string과 delete metric 처리 결과를 Spark/Flink/Trino compatibility test로 고정한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> 모든 column에 무조건 full bounds를 저장하는 것. Manifest가 커지고 write CPU·metadata I/O·민감정보 노출이 늘어도 query에서 사용되지 않을 수 있다.</p>
+  <p><strong>Edge case:</strong> Data file <code>record_count</code>는 equality/position delete나 DV 적용 전 물리 row 수다. <code>SUM(record_count)</code>를 현재 table의 <code>COUNT(*)</code>로 사용하면 MOR table에서 틀릴 수 있다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> 특정 predicate query가 갑자기 거의 모든 file을 읽거나 engine별 결과가 다르다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Candidate file 비율 급증, scanned bytes/p95 상승, readable_metrics null, engine별 file count/결과 차이, null·NaN·timestamp filter에서 재현.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Current metadata/snapshot ID, files/entries readable_metrics, field/schema/spec ID, table metrics properties, writer/reader version, query plan·scan report, 실제 Parquet footer sample, delete files/DV와 sequence.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Metrics mode none/counts, truncate 폭이 짧음, 새 column metric 누락, field ID binding 오류, NaN/null 해석 차이, bad writer bound, stale metadata cache, delete overlap 증가.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">문제 snapshot을 고정하고 read-only로 metadata metric과 실제 file sample을 비교한다. 성능 문제면 정확성을 유지한 채 수집 mode를 새 file부터 canary 적용한다. 결과 불일치면 영향 engine/write를 중지한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Bad writer가 만든 snapshot이면 retained known-good snapshot으로 rollback하고 file을 정상 writer로 rewrite한다. Metric 누락만 있으면 data rewrite/compaction으로 새 metric을 만들고 canary 검증 후 publish한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;overflow-wrap:anywhere;">Manifest binary bound를 수동 편집하지 않는다. Missing metric을 0/empty로 간주하지 않는다. Correctness 불일치를 cache 문제로 단정하지 않는다. 검증 전 snapshot expiration/orphan cleanup을 실행하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 의도적으로 range와 null/NaN 분포가 다른 file을 만들고 <code>readable_metrics</code>로 query 후보를 예측한다. 이어 한 column의 metric 수집을 끄면 정답은 유지되지만 pruning 근거가 사라짐을 관찰한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon이 실행 중이고 프로젝트 루트에서 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>예측한다: <code>id = 101</code>, <code>note IS NULL</code>, <code>score = 20</code>은 각각 어느 file이 후보인가?</li>
+    <li><code>payload</code> metric을 none으로 바꾼 뒤 <code>payload = 'needle'</code> 결과와 후보 수 중 무엇이 변하는가?</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 분포가 분리된 file 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day11;
+DROP TABLE IF EXISTS local.day11.metrics_lab PURGE;
+CREATE TABLE local.day11.metrics_lab (
+  id BIGINT, score DOUBLE, note STRING, payload STRING
+) USING iceberg
+TBLPROPERTIES (
+  'write.metadata.metrics.column.id'='full',
+  'write.metadata.metrics.column.score'='full',
+  'write.metadata.metrics.column.note'='full',
+  'write.metadata.metrics.column.payload'='full'
+);
+INSERT INTO local.day11.metrics_lab VALUES
+  (1, 10.0, NULL, 'alpha'),
+  (2, 20.0, 'x', 'beta'),
+  (3, 30.0, NULL, 'gamma');
+INSERT INTO local.day11.metrics_lab VALUES
+  (100, 70.0, 'y', 'omega'),
+  (101, CAST('NaN' AS DOUBLE), 'z', 'needle'),
+  (102, NULL, 'w', 'zulu');
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 두 insert가 서로 다른 range의 data file을 만든다. File merge 설정에 따라 물리 file 수는 달라질 수 있으므로 metadata 결과를 기준으로 판단한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Human-readable metric 읽기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT file_path, record_count, file_size_in_bytes,
+       readable_metrics['id'] AS id_metric,
+       readable_metrics['score'] AS score_metric,
+       readable_metrics['note'] AS note_metric,
+       readable_metrics['payload'] AS payload_metric
+FROM local.day11.metrics_lab.files ORDER BY file_path;
+
+EXPLAIN EXTENDED SELECT * FROM local.day11.metrics_lab WHERE id = 101;
+SELECT * FROM local.day11.metrics_lab WHERE id = 101;
+SELECT count(*) FROM local.day11.metrics_lab WHERE note IS NULL;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> ID range가 겹치지 않는 file은 <code>id = 101</code> 후보에서 제외할 수 있다. Note의 null count가 0인 file은 <code>IS NULL</code> 후보가 아니다. Score의 NaN/null count는 bounds와 별도로 보인다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Field ID key 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT file_path, value_counts, null_value_counts,
+       nan_value_counts, lower_bounds, upper_bounds
+FROM local.day11.metrics_lab.files ORDER BY file_path;
+ALTER TABLE local.day11.metrics_lab RENAME COLUMN note TO memo;
+SELECT file_path, readable_metrics['memo'] AS memo_metric
+FROM local.day11.metrics_lab.files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Raw map은 숫자 field ID가 key다. Rename 뒤 old file을 rewrite하지 않아도 같은 field ID metric이 새 이름 <code>memo</code>로 해석된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · payload metric 수집 중단</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day11.metrics_lab SET TBLPROPERTIES
+  ('write.metadata.metrics.column.payload'='none');
+INSERT INTO local.day11.metrics_lab VALUES
+  (1000, 99.0, 'metric-off', 'needle');
+
+SELECT file_path, readable_metrics['payload'] AS payload_metric
+FROM local.day11.metrics_lab.files ORDER BY file_path;
+EXPLAIN EXTENDED SELECT * FROM local.day11.metrics_lab
+WHERE payload = 'needle';
+SELECT count(*) AS exact_rows FROM local.day11.metrics_lab
+WHERE payload = 'needle';
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 새 file의 payload metric은 없고 query는 여전히 정확한 2 rows를 반환한다. Planner는 새 file을 metric으로 제외할 수 없어 false positive I/O를 허용한다. Missing은 “needle 없음”이 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>readable_metrics column 없음:</strong> <code>DESCRIBE local.day11.metrics_lab.files</code>로 runtime metadata-table schema를 확인한다.</li>
+    <li><strong>Map key 오류:</strong> Raw maps는 column 이름이 아닌 field ID가 key다. Human-readable projection을 우선 사용한다.</li>
+    <li><strong>NaN cast 오류:</strong> Runtime에 맞춰 <code>CAST('NaN' AS DOUBLE)</code> 또는 지원되는 literal syntax를 확인한다.</li>
+    <li><strong>File이 예상보다 많음:</strong> Writer task/partition 수와 append별 file을 metadata path로 대조한다. 실습 목적은 정확한 file 개수가 아니라 range 차이다.</li>
+    <li><strong>Explain에 file 수가 안 보임:</strong> Engine의 scan report/metrics를 사용하고, files table의 interval로 후보를 직접 계산한다.</li>
+    <li><strong>Docker 연결 실패:</strong> Docker daemon을 시작하고 <code>make smoke</code>가 성공한 뒤 재개한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day11.metrics_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day11;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Table property와 file은 table lifecycle에 맡긴다. Manifest나 Parquet footer를 직접 수정하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Bounds 안에 값이 있으면 row가 존재한다.</strong> 존재 가능성만 남을 뿐 exact membership은 아니다.</li>
+    <li><strong>Missing metric은 0이다.</strong> Unknown이므로 안전하게 file을 유지해야 한다.</li>
+    <li><strong>Value count는 non-null count다.</strong> Null과 NaN도 포함한다.</li>
+    <li><strong>NaN은 min/max에 들어간다.</strong> Spec상 bounds에서 제외되고 별도 count로 추적한다.</li>
+    <li><strong>Record count는 현재 live row 수다.</strong> MOR delete/DV 적용 전 file record 수일 수 있다.</li>
+    <li><strong>Metric map key는 column 이름이다.</strong> V3 이하에서는 field ID다.</li>
+    <li><strong>Full metric이 항상 최선이다.</strong> Write/metadata/privacy 비용과 query 가치의 trade-off다.</li>
+    <li><strong>Spec 지원은 engine 지원이다.</strong> Format version과 Spark/Flink/Trino connector 구현을 분리한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “File metrics로 pruning해도 query correctness가 유지되는 이유를 증명하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> 10억 file·predicate 가정 → conservative interval 불변식 → partition/manifest/file/row-group 순서 → missing metric 처리 → false positive 허용/false negative 금지 → null/NaN/truncate edge → bad writer 검증과 rollback.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. “Metrics mode를 column별로 설계하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Query log와 filter selectivity 수치 → key/time/category/payload 분류 → full/truncate/counts/none → manifest/write CPU/storage/privacy 비용 → canary와 candidate-file SLO → schema evolution·multi-engine compatibility → external index 대안.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. “Data file record_count 합이 COUNT(*)와 다른 장애를 분석하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Snapshot 고정 → data/delete files와 sequence → COW/MOR/DV 구분 → position/equality delete 적용 → partition/spec/field ID → metadata table 증거 → 안전한 read 검증 → compaction/rollback과 하지 말아야 할 수동 수정.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Manifest list와 manifest entry는 각각 무엇을 색인하는가?</li>
+    <li>ADDED/EXISTING/DELETED는 물리 file 상태인가, snapshot 기준 membership delta인가?</li>
+    <li>Added entry의 null sequence를 어떻게 해석해야 하는가?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong><br>
+    ① Manifest list=manifest index, manifest entry=data/delete file record와 metric이라고 구분하면 2점.<br>
+    ② Snapshot에서 manifest가 추가될 때의 logical delta이며 DELETED가 즉시 object 삭제를 뜻하지 않는다고 답하면 2점.<br>
+    ③ Manifest-list context의 snapshot/data/file sequence를 상속하며 raw null=unknown이 아니라고 답하면 3점.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>Bound [100, 200]인 file을 <code>id = 42</code>에서 제외해도 되는 이유는?</li>
+    <li>Null count가 missing일 때 <code>IS NULL</code> query에서 어떻게 해야 하는가?</li>
+    <li>Data file record_count 합과 현재 COUNT(*)가 달라질 수 있는 이유는?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #a8d8bd;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong><br>
+    ① 42가 conservative lower bound보다 작아 어떤 non-null 값도 match할 수 없다고 설명하면 2점.<br>
+    ② Missing=unknown이므로 file을 후보로 유지하고 row predicate를 평가한다고 답하면 2점.<br>
+    ③ MOR equality/position delete 또는 DV가 물리 data row를 logical view에서 제외할 수 있다고 답하면 3점.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;overflow-wrap:anywhere;">
+    <li><a href="https://iceberg.apache.org/spec/#data-file-fields" style="color:#0b7185;">Iceberg Table Specification · Data File Fields</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#field-level-metrics-and-statistics" style="color:#0b7185;">Iceberg Table Specification · Field-level Metrics</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/performance/#data-filtering" style="color:#0b7185;">Performance · Data Filtering</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/#files" style="color:#0b7185;">Spark Queries · Files / readable_metrics</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">공식 문서 확인 기준: 2026-08-11. Table spec의 최신 표현과 실제 released engine/connector 지원은 분리해 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:8px;">
+    <strong style="color:#8ee7f6;">Day 12 · partition/manifest/file pruning</strong><br>
+    하나의 predicate가 partition transform, manifest summary, file metric과 Parquet row group을 차례로 통과하는 전체 scan planning pipeline을 수치와 failure window로 연결한다.
+  </div>
+</td></tr>
+<tr><td style="padding:18px 26px;background:#eef3f5;color:#52636d;font-size:13px;text-align:center;">Iceberg 9주·63일 심화 커리큘럼 · Week 2 / Day 11</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
