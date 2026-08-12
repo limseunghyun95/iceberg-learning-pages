@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 12</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 2 / DAY 12</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">partition/manifest/file pruning</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Metadata Tree와 Scan Planning · 예상 학습 30분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg scan planning은 query predicate를 partition transform에 투영해 manifest를 줄이고, manifest entry의 partition·column metric으로 file을 줄인 뒤, file format index로 row group을 줄이는 계층형 증명 과정이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Predicate</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">WHERE 절처럼 row가 조건을 만족하는지 판정하는 식이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Projection</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Source-column predicate를 partition transform의 값에 적용 가능한 보수적 predicate로 바꾸는 과정이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Partition spec</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Source field ID, transform, partition field ID와 이름의 집합이다. Evolution 뒤 여러 spec이 공존할 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Partition summary</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Manifest list가 manifest 안 partition 값의 null/NaN 여부와 lower/upper 범위를 요약한 index다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">File metric</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Manifest entry의 field-ID별 value/null/NaN count와 lower/upper bound다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Sargable</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Index가 검색 범위를 계산할 수 있는 predicate 형태를 뜻한다. 임의 함수로 감싸면 pushdown이 약해질 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Candidate file</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Metadata만으로 match 가능성을 배제하지 못해 실제로 읽어야 하는 file이다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>1PB table에서 query가 하루치 1GB만 필요해도 planner가 모든 object를 list하고 모든 footer를 열면 scan 시작 전부터 비용이 폭발한다. Iceberg는 catalog가 가리키는 metadata graph와 작은 synopsis를 위에서 아래로 읽어 후보 집합을 단계별로 축소한다.</p>
+  <p>Pruning은 단순한 “partition skip”이 아니다. Query predicate → spec별 partition predicate → manifest summary → entry partition/metric → Parquet row group으로 이어지는 pipeline이다. 어느 단계가 selectivity를 잃었는지 알아야 partition spec, sort order, metric mode, file size와 manifest maintenance를 올바르게 조정할 수 있다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> 각 단계는 match가 불가능하다고 증명된 후보만 제거한다. 정보가 없거나 transform을 이해하지 못하면 유지한다. False positive I/O는 허용하지만 답이 있는 file을 제거하는 false negative는 허용하지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog pointer → metadata JSON</strong><br><span style="font-size:14px;color:#cdebf0;">Current snapshot과 schema/spec 선택</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ query predicate를 field ID에 bind</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>② Snapshot → manifest list</strong><br><span style="font-size:14px;">Spec별 partition summary로 manifest pruning</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ 남은 manifest만 GET</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>③ Manifest entries</strong><br><span style="font-size:14px;">Partition tuple + file counts/bounds로 file pruning</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ data/delete candidate pairing</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>④ Data/Delete files</strong><br><span style="font-size:14px;color:#cdebf0;">Sequence · COW/MOR · DV applicability</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ selected byte range read</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;"><strong>⑤ Parquet row-group/page</strong><br><span style="font-size:14px;">File-internal statistics와 최종 row predicate</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Read 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Reader가 catalog에서 current metadata JSON을 얻고 snapshot, schema ID와 모든 partition spec을 고정한다. 이것이 control path의 일관된 root다.</li>
+    <li><code>event_time BETWEEN t1 AND t2</code>를 각 manifest의 spec에 맞게 <code>day(event_time)</code>, <code>hour(event_time)</code> 같은 partition predicate로 투영한다.</li>
+    <li>Manifest list의 partition summary와 file count로 절대 match하지 않는 manifest를 건너뛴다.</li>
+    <li>남은 manifest entry에서 해당 spec의 partition tuple을 먼저, 그 다음 field-ID별 bounds/counts를 검사해 data/delete file을 줄인다.</li>
+    <li>MOR에서는 partition·sequence·metric overlap으로 equality/position delete를 data file과 짝짓는다. V3 DV는 referenced data file을 직접 가리키지만 engine 지원을 확인한다.</li>
+    <li>실행기는 선택 file의 Parquet row-group/page 통계로 더 줄이고 최종 row predicate를 평가한다. Concurrent commit은 고정 snapshot을 바꾸지 않는다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Write·commit과 다음 scan의 상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer가 current spec으로 partition 값을 만들고 immutable data/delete file과 field metric을 쓴다.</li>
+    <li>Manifest entry와 manifest summary를 만들고 기존 manifest를 재사용하거나 merge한다. Partition evolution 전 manifest는 old spec ID를 유지한다.</li>
+    <li>새 manifest list, snapshot, metadata JSON을 쓰고 base 이후 변경과 operation 범위를 optimistic validation한다.</li>
+    <li>Catalog pointer swap이 성공해야 새 file과 summary가 다음 scan의 control path에 들어온다. 실패 object는 table membership이 아니다.</li>
+    <li>Rewrite manifests/data files도 새 commit이다. Active writer와 race하면 conflict·retry가 발생할 수 있으므로 planning SLO와 commit 실패율을 함께 본다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:28%;">단계</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">입력 → 판정 → 비용</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Partition projection</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Logical predicate → spec transform → partition interval. Hidden partitioning이라 user가 물리 column을 쓸 필요가 없다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Manifest pruning</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Partition interval → manifest-list summary → manifest GET 여부. 작은 상위 index가 object request를 크게 줄인다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>File pruning</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Entry partition/metric → candidate files. Bound가 넓거나 missing이면 false positive가 남는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Delete planning</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Data/delete partition·sequence·bounds → applicable delete set. Read amplification과 correctness가 만나는 단계다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>File-format pruning</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Candidate file → Parquet footer/row groups → byte ranges. Iceberg metric과 Parquet 통계는 서로 다른 granularity다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Final evaluation</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Decoded rows → exact predicate → result. 앞 단계의 synopsis는 정답 자체가 아니다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Spec evolution을 안전하게 읽는 법</h3>
+  <p>Manifest를 쓴 partition spec ID가 기준이다. Current spec 하나로 old manifest를 해석하면 안 된다. Reader는 source field ID와 각 spec의 transform으로 predicate를 따로 투영하고 결과 후보를 합친다. Unknown transform이면 filtering에서 그 field를 무시해 file을 유지해야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Selectivity와 비용 모델</h3>
+  <p>전체 manifest M, entry F, 선택 file K라고 하면 이상적인 planner는 manifest list O(M)의 작은 summary를 보고 일부 manifest의 entry만 읽어 K를 찾는다. 그러나 manifest range가 심하게 겹치거나 file metric이 없으면 M과 F 대부분을 읽는다. Partition 수만 늘리는 것이 아니라 summary 겹침, files/manifest, candidate ratio와 object GET latency를 같이 측정해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Partition transform</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Query 시간 범위·cardinality·file size를 수치화해 day/hour/bucket/truncate를 고른다. 지나치게 미세하면 small file과 metadata가 늘어난다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Metric / sort</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Partition 내부 핵심 predicate column에 metric을 유지하고 sort/clustering으로 file bounds 겹침을 낮춘다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>관측성</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Total→manifest→file→row-group candidate 수, planning p95, metadata/data bytes와 GET count를 단계별로 기록한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Maintenance</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Rewrite manifests는 summary locality, rewrite data files는 size·clustering을 개선한다. 효과와 optimistic conflict 비용을 canary에서 비교한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Multi-engine</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark/Flink/Trino별 predicate pushdown, transform/timezone, null·NaN, delete/DV와 scan metric 노출 차이를 compatibility gate로 고정한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> 느린 query에 partition을 무조건 더 세분화하는 것. File 수와 manifest 수, commit/maintenance 비용이 커져 planning이 오히려 느려질 수 있다.</p>
+  <p><strong>Edge case:</strong> Timestamp with/without time zone의 day/hour projection이 engine session timezone과 충돌하면 경계 file 후보가 달라질 수 있다. 결과 correctness는 보수적으로 유지하되 scan 비용이 달라질 수 있으므로 engine별 경계 테스트가 필요하다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> 하루치 selective query가 table의 대부분 file을 읽기 시작했다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Planning p95·object GET·candidate file·scanned bytes 급증, explain에서 pushdown filter 누락, engine별 scan량 차이.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Current snapshot/metadata, query text/plan, spec IDs와 transforms, manifests partition_summaries, files readable_metrics, candidate ratio, writer/reader version, delete file/DV, object-store latency/404.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Non-sargable predicate, partition evolution 처리 차이, range-overlapping manifests/files, metric none, small-file 폭증, stale cache, timezone cast, maintenance/writer race, connector regression.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Snapshot을 고정하고 read-only metadata tables와 explain으로 어느 단계부터 후보가 줄지 않는지 확인한다. Exact source predicate로 canary query를 비교하고 write/maintenance 변경을 일시 중지한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Connector regression이면 known-good version/engine으로 되돌린다. Bad rewrite/commit이면 retained snapshot으로 rollback한다. Metric·clustering 문제는 canary rewrite 후 새 snapshot을 publish한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Manifest/partition path를 수동 삭제하지 않는다. 근거 없이 spec을 다시 만들지 않는다. Active writer와 대규모 rewrite를 동시에 시작하지 않는다. Missing metric을 empty로 간주하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> Day partition이 다른 날짜를, ID bounds가 같은 날짜 안의 file을 줄이는 두 단계 pruning을 예측한다. 이어 새 file의 ID metric을 끄고 false-positive 후보가 남는 상황을 만든다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon이 실행 중이고 프로젝트 루트에서 <code>make smoke</code>가 성공해야 한다.</li>
+    <li><code>2026-08-02</code>의 <code>id=101</code> query에서 partition 단계와 file metric 단계가 각각 무엇을 제외하는지 적는다.</li>
+    <li>같은 날짜에 ID metric이 없는 file을 추가하면 query 결과와 candidate file 중 무엇이 변할지 예측한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 날짜와 ID range가 분리된 file 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day12;
+DROP TABLE IF EXISTS local.day12.pruning_lab PURGE;
+CREATE TABLE local.day12.pruning_lab (
+  id BIGINT, event_time TIMESTAMP, payload STRING
+) USING iceberg
+PARTITIONED BY (days(event_time))
+TBLPROPERTIES ('write.metadata.metrics.column.id'='full');
+
+INSERT INTO local.day12.pruning_lab VALUES
+  (1, TIMESTAMP '2026-08-01 01:00:00', 'a'),
+  (2, TIMESTAMP '2026-08-01 02:00:00', 'b');
+INSERT INTO local.day12.pruning_lab VALUES
+  (100, TIMESTAMP '2026-08-02 01:00:00', 'c'),
+  (101, TIMESTAMP '2026-08-02 02:00:00', 'd');
+INSERT INTO local.day12.pruning_lab VALUES
+  (1000, TIMESTAMP '2026-08-02 03:00:00', 'e'),
+  (1001, TIMESTAMP '2026-08-02 04:00:00', 'f');
+INSERT INTO local.day12.pruning_lab VALUES
+  (2000, TIMESTAMP '2026-08-03 01:00:00', 'g');
+&quot;</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Manifest와 file index 관찰</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT path, partition_spec_id, partition_summaries,
+       added_data_files_count, existing_data_files_count
+FROM local.day12.pruning_lab.manifests ORDER BY path;
+
+SELECT file_path, partition,
+       readable_metrics['id'] AS id_metric
+FROM local.day12.pruning_lab.files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Manifest summary는 partition date 범위를, file metric은 ID 범위를 보여준다. Manifest 하나가 여러 partition을 담을 수 있으므로 manifest 수와 partition 수는 1:1이 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · 두 predicate의 pipeline 비교</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+EXPLAIN EXTENDED
+SELECT * FROM local.day12.pruning_lab
+WHERE event_time &gt;= TIMESTAMP '2026-08-02 00:00:00'
+  AND event_time &lt; TIMESTAMP '2026-08-03 00:00:00'
+  AND id = 101;
+
+SELECT * FROM local.day12.pruning_lab
+WHERE event_time &gt;= TIMESTAMP '2026-08-02 00:00:00'
+  AND event_time &lt; TIMESTAMP '2026-08-03 00:00:00'
+  AND id = 101;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Day transform은 8월 1일·3일 file을, ID bound는 같은 8월 2일의 [1000,1001] file을 제외할 수 있다. 최종 결과는 id 101 한 row다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · 새 file의 ID metric 제거</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day12.pruning_lab SET TBLPROPERTIES
+  ('write.metadata.metrics.column.id'='none');
+INSERT INTO local.day12.pruning_lab VALUES
+  (9999, TIMESTAMP '2026-08-02 05:00:00', 'metric-off');
+
+SELECT file_path, partition, readable_metrics['id'] AS id_metric
+FROM local.day12.pruning_lab.files ORDER BY file_path;
+SELECT count(*) AS exact_rows FROM local.day12.pruning_lab
+WHERE event_time &gt;= TIMESTAMP '2026-08-02 00:00:00'
+  AND event_time &lt; TIMESTAMP '2026-08-03 00:00:00'
+  AND id = 101;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 새 file은 day partition 때문에 8월 2일 후보지만 ID metric이 없어 <code>id=101</code>에서 제외할 근거가 없다. Extra I/O는 생겨도 최종 결과는 여전히 1 row다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>days transform 문법:</strong> Runtime에 따라 <code>days(event_time)</code> DDL 지원을 확인한다.</li>
+    <li><strong>readable_metrics 없음:</strong> <code>DESCRIBE local.day12.pruning_lab.files</code>로 metadata-table schema를 확인한다.</li>
+    <li><strong>Manifest 수가 예상과 다름:</strong> Writer manifest merge/reuse 설정 때문이다. Partition summary와 file path 연결을 기준으로 본다.</li>
+    <li><strong>Explain에 candidate 수가 없음:</strong> Engine scan report/metrics를 사용하고 metadata bounds로 수동 예측한다.</li>
+    <li><strong>Timezone 경계 차이:</strong> Session timezone과 timestamp type을 고정한 뒤 다시 비교한다.</li>
+    <li><strong>Docker 연결 실패:</strong> Docker daemon을 시작하고 <code>make smoke</code>가 성공한 뒤 재개한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day12.pruning_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day12;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Table lifecycle에 정리를 맡기고 manifest/data file을 개별 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Partition pruning은 directory listing이다.</strong> Iceberg는 manifest metadata와 spec transform을 사용한다.</li>
+    <li><strong>Current spec만 보면 된다.</strong> Manifest를 쓴 spec ID로 predicate를 각각 투영해야 한다.</li>
+    <li><strong>Bound가 겹치면 row가 있다.</strong> Candidate일 뿐 최종 predicate가 필요하다.</li>
+    <li><strong>Missing metric은 empty다.</strong> Unknown이므로 file을 유지한다.</li>
+    <li><strong>More partitions는 항상 빠르다.</strong> Small file·manifest·commit 비용이 늘 수 있다.</li>
+    <li><strong>Data file만 prune하면 된다.</strong> MOR은 delete file/DV applicability도 함께 계획해야 한다.</li>
+    <li><strong>Manifest rewrite는 data clustering을 고친다.</strong> Metadata locality만 바꾸며 data rewrite와 책임이 다르다.</li>
+    <li><strong>모든 engine의 pushdown이 같다.</strong> Transform, timezone, function, format version 지원을 engine별로 검증한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “10PB table의 1시간 query scan planning을 설계하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> File/manifest/commit rate 수치 → catalog root/snapshot → spec별 hour/day projection → manifest/file/row-group candidate 비율 → object GET·metadata bytes → delete planning → SLO/observability → partition·sort·metric 대안과 trade-off.</p>
+  <h3 style="font-size:18px;color:#07566a;">Q2. “Partition evolution 뒤에도 old/new data를 정확히 prune하는 이유는?”</h3>
+  <p><strong>좋은 답변 구조:</strong> Source field ID와 spec ID → manifest별 transform → predicate projection → unknown transform 보수 처리 → candidate union → no rewrite evolution → engine compatibility와 timezone edge → false-positive 비용.</p>
+  <h3 style="font-size:18px;color:#07566a;">Q3. “Planning p95가 10배 느려진 장애를 분석하세요.”</h3>
+  <p><strong>좋은 답변 구조:</strong> Snapshot 고정 → 단계별 candidate/GET/bytes → query shape/spec/summary/metric/delete 확인 → connector/object-store/maintenance 가설 → safe canary → rewrite manifests vs data files → optimistic race/rollback → 하지 말아야 할 수동 삭제.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Lower/upper bound가 실제 min/max와 반드시 같지 않아도 안전한 이유는?</li>
+    <li>Missing null count를 0으로 해석하면 왜 위험한가?</li>
+    <li>Data file record_count 합이 현재 COUNT(*)와 다를 수 있는 이유는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong><br>
+    ① 모든 실제 값을 포함하는 conservative interval이면 겹치지 않을 때만 제외해 안전하다고 답하면 2점.<br>
+    ② Missing=unknown인데 0으로 보면 NULL row가 있는 file을 false-negative로 제거할 수 있다고 답하면 2점.<br>
+    ③ MOR equality/position delete 또는 DV가 물리 row를 logical view에서 제외한다고 답하면 3점.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>Manifest list와 manifest는 각각 어느 후보를 제거하는가?</li>
+    <li>Partition evolution 뒤 predicate를 current spec 하나로만 해석하면 안 되는 이유는?</li>
+    <li>Manifest rewrite와 data-file rewrite의 pruning 개선 범위는 어떻게 다른가?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #a8d8bd;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong><br>
+    ① Manifest list summary는 manifest를, entry partition/metric은 data/delete file을 제거한다고 답하면 2점.<br>
+    ② Old manifest는 old spec transform/ID로 작성돼 spec별 projection이 필요하다고 답하면 2점.<br>
+    ③ Manifest rewrite는 metadata grouping/summary locality, data rewrite는 file size·sort/clustering·bounds를 바꾼다고 답하면 3점.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;overflow-wrap:anywhere;">
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#0b7185;">Iceberg Table Specification · Scan Planning</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/performance/" style="color:#0b7185;">Performance · Metadata/Data Filtering</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/partitioning/" style="color:#0b7185;">Partitioning · Hidden Partitioning</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/" style="color:#0b7185;">Spark Queries · Metadata Tables</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">공식 문서 확인 기준: 2026-08-12. Predicate pushdown과 scan metric 노출은 engine/connector version별로 확인한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:8px;">
+    <strong style="color:#8ee7f6;">Day 13 · 랩: metadata tree를 file path로 재구성</strong><br>
+    Catalog current pointer부터 metadata JSON, snapshot, manifest list, manifest entry와 data/delete file까지 실제 path를 따라가며 하나의 read plan을 수작업으로 재구성한다.
+  </div>
+</td></tr>
+<tr><td style="padding:18px 26px;background:#eef3f5;color:#52636d;font-size:13px;text-align:center;">Iceberg 9주·63일 심화 커리큘럼 · Week 2 / Day 12</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

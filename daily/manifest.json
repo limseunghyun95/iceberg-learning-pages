@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-11T09:25:47+09:00",
+  "updatedAt": "2026-08-12T09:22:59+09:00",
   "lessons": [
     {
       "day": 1,
@@ -104,6 +104,15 @@
       "path": "day-11.html",
       "kind": "lesson",
       "publishedAt": "2026-08-11T09:25:47+09:00"
+    },
+    {
+      "day": 12,
+      "week": 2,
+      "title": "partition/manifest/file pruning",
+      "summary": "Query predicate가 spec별 partition projection, manifest summary, file metric과 Parquet index를 통과하는 scan planning pipeline을 추적합니다.",
+      "path": "day-12.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-12T09:22:59+09:00"
     }
   ]
 }
