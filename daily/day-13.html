@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 13</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 2 / DAY 13 · 통합 랩</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">랩: metadata tree를 file path로 재구성</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Metadata Tree Forensics · 예상 학습 25분 + 실습 40분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg table의 현재 file 집합은 warehouse listing이 아니라 catalog pointer → metadata JSON → snapshot → manifest list → manifest entry의 도달 가능한 경로로 결정된다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Catalog pointer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Table 이름을 현재 metadata JSON 위치에 연결하는 작은 기준점이다. 도서관의 “최신 판 색인 카드”에 가깝다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Metadata JSON</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Schema, partition spec, properties, current snapshot ID, snapshot log를 담는 immutable table metadata file이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Snapshot</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">특정 commit에서 유효한 table state를 나타내는 immutable node다. Manifest list path와 parent snapshot ID를 가진다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Manifest list</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">한 snapshot이 사용하는 manifest들의 목록이다. Manifest path, content, partition spec ID, sequence와 partition summary를 기록한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Manifest entry</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Data/delete file의 path, status, partition, metrics, sequence를 담는 행이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Reachability</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Root에서 reference를 따라 도달할 수 있는가라는 graph 개념이다. Object가 존재해도 current snapshot에서 도달 불가하면 현재 table row가 아니다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Linearization point</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">분산된 write가 논리적으로 한 순간에 성공한 것으로 보이는 지점이다. Iceberg에서는 catalog의 조건부 pointer 교체가 이 역할을 한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Control / data path</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">무엇을 읽을지 결정하는 metadata 경로가 control path, 실제 Parquet와 delete 내용을 읽는 경로가 data path다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>“S3에 Parquet가 보인다”와 “현재 table에 포함된다”는 서로 다른 사실이다. Commit에 실패한 writer가 남긴 orphan file은 전자만 참이고, 잘못된 lifecycle rule로 지워진 referenced file은 후자만 참이다. 두 경우 모두 directory listing만 보면 오판하기 쉽다.</p>
+  <p>Metadata tree를 path 단위로 재구성하면 query의 404, 잘못된 row count, stale catalog cache, maintenance race와 multi-engine 차이를 하나의 증거 사슬로 설명할 수 있다. 특히 장애 중에는 임의 복구보다 <strong>어느 root와 snapshot을 기준으로 어떤 file이 도달 가능한지</strong>를 먼저 고정해야 한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> 현재 table state는 catalog가 가리키는 metadata JSON의 current snapshot에서 도달 가능한 live entry 집합이다. Object listing, 최근 수정 시각, 파일명 순서는 membership의 권위 있는 근거가 아니다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog: table → current metadata JSON</strong><br><span style="font-size:14px;color:#cdebf0;">권위 있는 mutable root · conditional swap</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ current-snapshot-id / schemas / partition-specs</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② Metadata JSON → ③ Snapshot</strong><br><span style="font-size:14px;">Snapshot ID · parent · sequence · manifest-list path</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ snapshot이 소유한 manifest list GET</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>④ Manifest list → ⑤ Manifest files</strong><br><span style="font-size:14px;">content · spec ID · sequence · partition summaries</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ live entries + partition/metric pruning</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑥ Data files + Delete files / DV</strong><br><span style="font-size:14px;color:#cdebf0;">file path · field ID metric · sequence 적용성</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ selected object byte ranges</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #a8d8bd;border-radius:8px;"><strong>⑦ Row materialization</strong><br><span style="font-size:14px;">COW는 새 data file, MOR은 data + delete를 병합</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Read 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Reader는 catalog에서 정확한 table 식별자와 current metadata location을 받는다. 이 응답을 받은 뒤 warehouse를 전역 list하지 않는다.</li>
+    <li>Metadata JSON의 current snapshot ID와 해당 snapshot의 manifest-list path를 찾고, schema field ID와 partition spec ID를 함께 고정한다.</li>
+    <li>Manifest list에서 data manifest와 delete manifest를 구분하고 partition summary로 불가능한 manifest를 제외한다.</li>
+    <li>남은 manifest entry의 status, file path, partition, field-ID metric과 sequence를 해석한다. Snapshot에서 live인 ADDED/EXISTING file만 후보가 된다.</li>
+    <li>COW(Copy-on-Write)는 수정된 row가 새 data file에 반영된다. MOR(Merge-on-Read)은 data file에 적용되는 position/equality delete 또는 V3 deletion vector를 pairing한다.</li>
+    <li>실행기가 candidate object와 Parquet 범위를 읽고 delete를 적용한 뒤 최종 predicate를 평가한다. 이 동안 새 commit이 생겨도 pin한 snapshot의 graph는 변하지 않는다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Writer의 optimistic commit 경로</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer A가 base metadata와 snapshot을 읽고 새 immutable data/delete file을 쓴다. 아직 current table에는 보이지 않는다.</li>
+    <li>Manifest, manifest list, snapshot을 포함한 새 metadata JSON을 만든다. Field ID, spec ID와 sequence는 logical identity와 delete 적용성을 보존한다.</li>
+    <li>Catalog current pointer가 여전히 base인지 확인하면서 새 metadata location으로 조건부 교체한다. 동시에 Writer B가 먼저 교체했다면 A는 conflict validation을 수행한다.</li>
+    <li>Operation 범위와 isolation 조건이 허용하면 A는 최신 base 위에서 metadata를 다시 만들고 retry한다. 충돌하면 실패하고 새 object는 orphan 후보가 된다.</li>
+    <li><strong>성공 확정 시점은 object upload 완료가 아니라 catalog pointer swap 성공 응답</strong>이다. 이 한 점이 독자에게 원자적인 state transition을 제공한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">관점</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">상태 · 불변식 · 비용</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Persistent graph</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Immutable metadata node를 공유하므로 새 snapshot은 전체를 복사하지 않고 기존 manifest를 재사용할 수 있다. 대신 오래된 node의 retention과 GC가 필요하다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>MVCC / isolation</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Reader는 snapshot을 pin하고 writer는 새 version을 publish한다. Serializable/snapshot isolation과 operation별 validation 범위는 engine·API 설정을 확인한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Identity</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Column name 대신 field ID, directory name 대신 spec ID와 transform을 사용해야 rename과 partition evolution 뒤에도 올바르게 해석한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Sequence</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Data/delete sequence는 어떤 delete가 어떤 data에 적용되는지 판정한다. Path만 맞춘다고 delete correctness가 보장되지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Two-level index</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Manifest list summary가 manifest GET을, entry partition/metric이 data GET을 줄인다. 정보가 없으면 보수적으로 후보를 유지한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Failure window</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Upload 후 commit 전 실패는 unreferenced object를, commit 후 임의 삭제는 referenced 404를 만든다. 두 복구 절차는 반대다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">누가 어떤 상태를 소유하는가</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#123d49;color:#fff;text-align:left;width:28%;">소유자</th><th style="padding:10px;border:1px solid #dbe3e8;background:#123d49;color:#fff;text-align:left;">권위 있는 상태와 주의점</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;">Catalog</td><td style="padding:10px;border:1px solid #dbe3e8;">Table identity와 current metadata pointer. Cache는 복제본일 뿐이며 CAS/transaction 기능이 commit correctness의 핵심이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;">Object storage</td><td style="padding:10px;border:1px solid #dbe3e8;">Immutable metadata/data bytes와 durability. List 결과는 table membership을 소유하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;">Iceberg metadata</td><td style="padding:10px;border:1px solid #dbe3e8;">Schema/spec/snapshot/file graph. 직접 편집하면 hash나 DB constraint가 없어도 logical invariant가 깨진다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;">Engine/connector</td><td style="padding:10px;border:1px solid #dbe3e8;">Planning, serialization, validation과 retry. Format version, delete/DV, branch와 procedure 지원 범위가 엔진별로 다르다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>증거 bundle</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog location, metadata file, snapshot ID, manifest paths/entries, exact object HEAD, engine/version, 시간대를 한 묶음으로 보존한다. 나중의 commit과 cleanup이 증거를 바꿀 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Path 정규화</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Absolute URI, scheme, authority, case와 URL encoding을 보존한다. 보기 좋은 basename만 비교하면 다른 bucket/warehouse를 같은 file로 오인한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Snapshot pin</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">장애 재현은 snapshot ID 또는 timestamp를 고정한다. Current를 반복 조회하면 maintenance/writer commit 때문에 graph가 바뀐다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Multi-engine gate</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark/Flink/Trino의 format version, metadata-table schema, equality/position delete와 V3 DV 지원을 사전에 표로 관리한다. 알 수 없는 기능은 write하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Maintenance race</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Expire snapshot/orphan cleanup/rewrite와 장기 writer의 최대 시간을 수치화한다. Retention보다 오래된 in-flight commit은 유효 object를 GC 대상으로 오인시킬 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Object/catalog failure</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">404, 403, timeout, stale cache와 wrong catalog를 분리한다. Exact object HEAD, IAM audit와 catalog transaction log를 함께 봐야 한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> Warehouse를 재귀 list한 결과를 바탕으로 “안 보이는 metadata는 삭제”하거나 “보이는 Parquet는 모두 등록”하는 자동 복구다. Reachability와 retention을 무시해 현재/과거 snapshot을 동시에 훼손할 수 있다.</p>
+  <p><strong>Edge case:</strong> Manifest에 delete file이 없다고 delete가 없다고 단정하지 않는다. COW는 data rewrite로 표현되고, MOR은 position/equality delete, V3에서는 deletion vector가 사용될 수 있다. 실제 write mode와 engine/version 지원을 확인한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Query가 특정 data/delete file에서 404 또는 접근 오류로 실패한다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">특정 snapshot/query만 404·403, 엔진별 row count 차이, intermittent manifest GET 실패, maintenance 직후 오류 증가.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog metadata location과 transaction log, pin한 snapshot/manifest list, manifest entry status·sequence·file path, exact HEAD 결과와 object version/audit, IAM, reader/connector version·cache, cleanup/rewrite job 실행 구간.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Wrong catalog/warehouse, stale pointer/cache, referenced object 수동 삭제, lifecycle/expire/orphan cleanup race, credential 403을 404로 변환, partial replication, delete/DV 미지원 또는 sequence 해석 차이.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Cleanup과 관련 write를 멈추고 snapshot을 pin한다. Metadata와 audit를 복사 보존하고 manifest의 exact URI에 read-only HEAD를 수행한다. Known-good engine에서도 같은 snapshot을 확인한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Object versioning/backup에서 같은 bytes를 원래 URI에 복구하거나, 완전한 retained snapshot으로 catalog-supported rollback한다. Connector 회귀면 known-good version으로 되돌리고 새 commit 전에 검증한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON/manifest를 직접 편집하지 않는다. 빈 file을 같은 path에 만들지 않는다. 근거 없이 catalog pointer를 바꾸거나 전체 warehouse를 삭제·재등록하지 않는다. 같은 실패를 자동 retry하며 증거를 덮지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 40분 재현 실습</h2>
+  <p><strong>목표:</strong> Spark metadata table과 warehouse path를 사용해 current root에서 data/delete file까지 증거 사슬을 만들고, 존재하지만 참조되지 않는 rogue Parquet를 구분한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon이 실행 중이고 프로젝트 루트에서 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>Catalog의 <code>local</code> warehouse 위치와 Spark runtime이 이전 실습과 같아야 한다.</li>
+    <li>먼저 적어본다: DELETE가 MOR이면 어떤 content file이 생길까? Rogue Parquet를 복사하면 SQL count가 바뀔까?</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Version 2 table과 세 개의 commit 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day13;
+DROP TABLE IF EXISTS local.day13.tree_lab PURGE;
+CREATE TABLE local.day13.tree_lab (
+  id BIGINT, event_time TIMESTAMP, payload STRING
+) USING iceberg
+PARTITIONED BY (days(event_time))
+TBLPROPERTIES (
+  'format-version'='2',
+  'write.delete.mode'='merge-on-read',
+  'write.metadata.metrics.column.id'='full'
+);
+INSERT INTO local.day13.tree_lab VALUES
+  (1, TIMESTAMP '2026-08-13 01:00:00', 'a'),
+  (2, TIMESTAMP '2026-08-13 02:00:00', 'b'),
+  (3, TIMESTAMP '2026-08-14 01:00:00', 'c');
+INSERT INTO local.day13.tree_lab VALUES
+  (4, TIMESTAMP '2026-08-14 02:00:00', 'd');
+DELETE FROM local.day13.tree_lab WHERE id = 2;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> CREATE와 각 INSERT/DELETE가 metadata version과 snapshot을 만든다. Runtime이 MOR delete를 지원하면 delete file이, COW로 실행되면 교체 data file이 보인다. 둘 다 유효한 결과이며 mode와 engine plan을 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Root → snapshot → manifest 경로 출력</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT timestamp, file, latest_snapshot_id,
+       latest_schema_id, latest_sequence_number
+FROM local.day13.tree_lab.metadata_log_entries
+ORDER BY timestamp;
+
+SELECT committed_at, snapshot_id, parent_id,
+       operation, manifest_list
+FROM local.day13.tree_lab.snapshots
+ORDER BY committed_at;
+
+SELECT content, path, length, partition_spec_id,
+       added_snapshot_id, added_data_files_count,
+       added_delete_files_count, partition_summaries
+FROM local.day13.tree_lab.manifests
+ORDER BY path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Latest metadata entry가 current root 후보이고, current snapshot row의 <code>manifest_list</code>가 다음 hop이다. Manifest row는 그 snapshot에서 읽을 Avro manifest path와 data/delete content를 보여준다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Manifest entry에서 최종 file path 재구성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT status, snapshot_id, sequence_number,
+       file_sequence_number, data_file.content AS content,
+       data_file.file_path AS file_path,
+       data_file.partition AS partition,
+       data_file.record_count AS records
+FROM local.day13.tree_lab.entries
+ORDER BY file_path;
+
+SELECT content, file_path, partition, record_count,
+       readable_metrics['id'] AS id_metric
+FROM local.day13.tree_lab.files
+ORDER BY content, file_path;
+
+SELECT * FROM local.day13.tree_lab ORDER BY id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> <code>entries</code>는 ADDED/EXISTING/DELETED history를 포함할 수 있고, <code>files</code>는 current snapshot의 live data/delete 집합을 보여준다. 최종 row는 id 1, 3, 4다. Data path를 설명할 때 content, sequence, field-ID metric을 path와 함께 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Physical listing과 reachability 대조</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">find warehouse/day13/tree_lab -type f | sort
+
+SOURCE_FILE=$(find warehouse/day13/tree_lab/data -type f -name '*.parquet' | head -n 1)
+cp &quot;$SOURCE_FILE&quot; warehouse/day13/tree_lab/data/rogue-unreferenced.parquet
+find warehouse/day13/tree_lab/data -type f -name '*.parquet' | sort
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT file_path FROM local.day13.tree_lab.files ORDER BY file_path;
+SELECT count(*) AS table_rows FROM local.day13.tree_lab;
+&quot;</pre>
+  <p><strong>실패 주입과 예상 결과:</strong> <code>rogue-unreferenced.parquet</code>는 object listing에는 보이지만 metadata <code>files</code>에는 없고 count는 3이다. File existence는 membership의 충분조건이 아니라는 것을 직접 증명한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Warehouse path가 다름:</strong> <code>files.file_path</code>의 absolute URI와 catalog 설정으로 실제 root를 확인한다. 추측한 directory에서 작업하지 않는다.</li>
+    <li><strong>metadata_log_entries schema 차이:</strong> <code>DESCRIBE local.day13.tree_lab.metadata_log_entries</code>로 runtime column을 확인한다.</li>
+    <li><strong>entries의 nested field 문법 오류:</strong> <code>DESCRIBE local.day13.tree_lab.entries</code> 후 해당 connector가 노출한 struct field를 사용한다.</li>
+    <li><strong>DELETE가 COW로 보임:</strong> Table property와 engine/version의 row-level operation 지원을 기록한다. Data rewrite도 올바른 관찰이다.</li>
+    <li><strong>Permission denied/404:</strong> URI를 바꾸지 말고 exact path의 IAM과 mount mapping부터 확인한다.</li>
+    <li><strong>Source file이 비어 있음:</strong> INSERT 성공과 <code>files</code> 결과를 확인한 뒤 failure injection을 진행한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">rm warehouse/day13/tree_lab/data/rogue-unreferenced.parquet
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day13.tree_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day13;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Rogue file은 우리가 정확한 path로 만든 한 개만 지운다. 참조된 file은 개별 삭제하지 않고 table lifecycle에 정리를 맡긴다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>가장 최신 수정 시각의 JSON이 current다.</strong> Current 여부는 catalog pointer만 결정한다.</li>
+    <li><strong>Warehouse의 모든 Parquet가 table row다.</strong> Manifest reachability가 없는 object는 scan하지 않는다.</li>
+    <li><strong>Manifest에 path가 있으면 무조건 live다.</strong> Snapshot과 entry status를 함께 해석해야 한다.</li>
+    <li><strong>Column 이름으로 metric을 매핑한다.</strong> Rename 안전성을 위해 field ID가 identity다.</li>
+    <li><strong>Current partition spec으로 모든 manifest를 읽는다.</strong> 각 manifest의 spec ID를 사용해야 evolution 뒤에도 정확하다.</li>
+    <li><strong>Delete file path만 맞으면 적용된다.</strong> Content type, partition, data/file sequence와 referenced data file 규칙을 함께 본다.</li>
+    <li><strong>403/404는 object 삭제다.</strong> IAM, endpoint, credential, masking과 catalog/warehouse 불일치를 먼저 분리한다.</li>
+    <li><strong>Orphan cleanup은 listing diff면 충분하다.</strong> Retained snapshot, branch/tag, in-flight commit과 job age threshold를 고려해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. 10PB Iceberg table에서 특정 Parquet가 “table에 속한다”는 것을 어떻게 증명하겠는가?</h3>
+  <p><strong>좋은 답변 구조:</strong> Table 식별자·catalog를 먼저 고정 → snapshot/time requirement 확인 → catalog pointer부터 manifest entry까지 exact URI와 status를 추적 → field/spec/sequence와 delete pairing 설명 → listing은 보조 증거라고 구분 → O(metadata candidates) 비용과 retained refs까지 포함한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. Object upload는 성공했는데 client가 commit timeout을 받았다. 재시도와 복구를 설계하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> 성공 여부가 불확실한 failure window를 선언 → commit UUID/snapshot summary와 catalog current pointer로 outcome 조회 → 성공이면 idempotent 종료, 실패면 최신 base에서 conflict validation → blind overwrite 금지 → orphan은 충분한 age threshold 뒤 cleanup → catalog/object metrics와 audit를 제시한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. Spark는 정상인데 Trino가 MOR table에서 row를 더 많이 반환한다. 조사 순서는?</h3>
+  <p><strong>좋은 답변 구조:</strong> 같은 catalog·metadata location·snapshot 고정 → format version과 connector support matrix 확인 → manifest의 delete content, sequence, partition, field ID/equality IDs 또는 DV reference 추적 → explain/scan metrics 비교 → known-good canary → 안전한 reader rollback이나 COW 전환의 read/write 비용 trade-off를 설명한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Partition, manifest, file, Parquet pruning은 각각 무엇을 제거하는가?</li>
+    <li>Partition evolution 뒤 predicate를 current spec 한 번만 투영하면 안 되는 이유는?</li>
+    <li>Rewrite manifests와 rewrite data files가 개선하는 비용은 어떻게 다른가?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:15px 17px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Spec별 partition 후보 → manifest summary 후보 → entry metric의 file 후보 → row-group/page byte range 순서를 말하면 정답.</li>
+      <li>Old manifest는 작성 당시 spec ID/transform으로 해석해야 하며 후보를 spec별 투영 후 합쳐야 한다고 말하면 정답.</li>
+      <li>Manifest rewrite는 metadata locality/GET, data rewrite는 file size·clustering·delete merge와 data I/O를 바꾼다고 구분하면 정답.</li>
+    </ol>
+  </div>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer commit의 성공이 확정되는 시점은 언제인가?</li>
+    <li>Warehouse에 존재하는 object가 current table membership임을 보장하지 못하는 이유는?</li>
+    <li>Referenced file 404에서 가장 먼저 보존할 증거 사슬은?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #a8d8bd;padding:15px 17px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>새 object upload가 아니라 base를 검증한 catalog pointer의 atomic/conditional swap 성공 응답이라고 답하면 정답.</li>
+      <li>Membership은 current snapshot에서 manifest entry까지의 reachability로 정의되며 orphan은 object만 존재할 수 있다고 답하면 정답.</li>
+      <li>Catalog metadata location → snapshot/manifest list → manifest entry path/status/sequence → exact object HEAD/audit와 engine/version을 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#table-metadata" style="color:#087990;">Apache Iceberg Table Specification — Table Metadata</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#snapshots" style="color:#087990;">Apache Iceberg Table Specification — Snapshots</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#manifest-lists" style="color:#087990;">Apache Iceberg Table Specification — Manifest Lists</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/" style="color:#087990;">Apache Iceberg Docs — Spark Queries와 Metadata Tables</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">Metadata table의 column과 row-level operation, format V3 deletion vector 지원은 사용 중인 Iceberg connector와 engine 버전에 따라 다르다. 위 spec을 기준으로 실제 runtime 문서와 <code>DESCRIBE</code> 결과를 함께 확인한다.</p>
+
+  <div style="margin-top:30px;background:#073642;color:#ffffff;padding:20px;border-radius:10px;">
+    <strong style="color:#8ee7f6;">내일 예고 · Day 14</strong><br>
+    회상: O(n) listing 회피의 의미 — metadata tree가 object storage의 full listing을 어떤 index와 invariant로 대체하는지 설명합니다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

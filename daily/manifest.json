@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-12T09:22:59+09:00",
+  "updatedAt": "2026-08-14T09:11:10+09:00",
   "lessons": [
     {
       "day": 1,
@@ -113,6 +113,15 @@
       "path": "day-12.html",
       "kind": "lesson",
       "publishedAt": "2026-08-12T09:22:59+09:00"
+    },
+    {
+      "day": 13,
+      "week": 2,
+      "title": "랩: metadata tree를 file path로 재구성",
+      "summary": "Catalog pointer부터 metadata JSON·snapshot·manifest list·manifest를 따라 data/delete file membership을 재구성하고 장애 증거를 보존하는 통합 랩입니다.",
+      "path": "day-13.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-14T09:11:10+09:00"
     }
   ]
 }
