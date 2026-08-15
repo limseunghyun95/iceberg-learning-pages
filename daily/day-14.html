@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 14</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 2 / DAY 14 · 회상·복습</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">회상: O(n) listing 회피의 의미</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Metadata Tree와 Scan Planning · 예상 학습 25분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg는 warehouse의 n개 object를 매번 전수 listing하지 않고, catalog가 고정한 snapshot의 계층형 metadata index를 predicate로 pruning해 필요한 manifest와 data/delete file만 찾는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Big-O / O(n)</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">입력 크기 n이 커질 때 작업량의 증가 형태를 표현한다. O(n)은 object가 두 배면 검사할 항목도 대략 두 배가 되는 선형 비용이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Listing</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Object storage prefix 아래 key들을 페이지 단위로 열거하는 control-plane 요청이다. “어떤 file이 table에 속하는가”를 보장하지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Index</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">전체 대상을 직접 검사하지 않고 후보를 좁히는 요약 구조다. Manifest list는 manifest의 index, manifest는 content file의 index처럼 동작한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">n, M, F, K</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">n은 warehouse object 수, M은 snapshot의 manifest 수, F는 live content file 수, K는 predicate가 남긴 candidate file 수로 두자.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Pruning</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">요약 정보로 “답이 절대 없음”을 증명해 후보를 읽기 전에 제외하는 과정이다. 정보가 없으면 안전하게 유지한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Persistent graph</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Immutable node를 새 version이 재사용하는 자료구조다. Snapshot은 기존 manifest를 공유하면서 새 table state를 만든다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Fan-out</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">상위 node 하나가 가리키는 하위 node 수다. 너무 많은 작은 manifest/file은 fan-out과 GET 비용을 키운다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Control / data path</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Metadata를 따라 scan task를 만드는 경로가 control path, 선택된 data/delete bytes를 읽는 경로가 data path다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>1PB table에 1천만 개 file이 있을 때 query마다 prefix를 모두 list하고 각 footer를 읽으면, 실제 결과가 한 시간치 10개 file뿐이어도 planning이 n에 묶인다. Object-store listing은 페이지 요청, network latency, rate limit, 비용과 일관성·권한 오류까지 control path에 끌어온다.</p>
+  <p>Iceberg의 장점은 “metadata가 있으니 O(1)”이 아니다. Catalog root를 O(1)에 찾은 뒤 manifest list와 일부 manifest를 읽는 <strong>계층형 탐색</strong>으로 n과 scan planning 비용의 직접 결합을 끊는 것이다. Predicate selectivity, manifest layout, metric 품질이 나쁘면 M과 F에 가까운 작업이 남을 수 있다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>회상 문장:</strong> Iceberg는 object listing을 더 빠르게 하는 기술이 아니라, authoritative snapshot graph와 보수적 index를 사용해 listing을 정상 read path에서 제거하는 table protocol이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#fff0f2;border:1px solid #e8a6b1;text-align:center;padding:13px;border-radius:8px;"><strong>비교: warehouse LIST prefix → n개 key 분류 → footer/partition 추론</strong><br><span style="font-size:14px;">Membership 불명확 · O(n) page scan · orphan/old snapshot 혼입</span></td></tr>
+    <tr><td style="text-align:center;color:#9b3c4c;font-size:21px;">대신 ↓ authoritative root + hierarchy</td></tr>
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog pointer</strong><br><span style="font-size:14px;color:#cdebf0;">table name → current metadata JSON</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ snapshot / schema / spec를 고정</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② Metadata JSON → ③ Snapshot → ④ Manifest list</strong><br><span style="font-size:14px;">Manifest count · partition summaries로 M을 축소</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ matching manifest만 GET</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>⑤ Manifest entries</strong><br><span style="font-size:14px;">Spec별 partition + field-ID metrics로 F → K</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ sequence로 delete applicability 계산</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑥ Candidate data/delete files · DV</strong><br><span style="font-size:14px;color:#cdebf0;">K개 task와 byte range만 data path로 전달</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Reader 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Reader가 catalog에서 current metadata location을 얻는다. 이 mutable pointer가 table state의 유일한 entry point다.</li>
+    <li>Metadata JSON에서 current snapshot ID, schema field ID와 partition specs를 pin한다. Concurrent commit이 생겨도 이 scan의 root는 바뀌지 않는다.</li>
+    <li>Snapshot의 manifest-list path를 읽고 query predicate를 각 manifest의 spec으로 투영한다. Partition summary와 file count가 불가능한 manifest를 제외한다.</li>
+    <li>남은 manifest에서 live data/delete entry를 읽고 partition tuple, null/count/lower/upper metric을 field ID로 평가한다.</li>
+    <li>MOR이면 data/file sequence, partition, equality IDs 또는 referenced data file을 이용해 applicable delete/DV를 pairing한다. COW이면 rewritten data file이 후보다.</li>
+    <li>실행기는 K개 candidate의 Parquet row group/page를 추가 pruning하고 최종 predicate와 delete를 적용한다. Warehouse full list는 없다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Writer와 index 갱신</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer는 immutable data/delete file과 file metrics를 쓴다. 이때 object는 존재하지만 table membership은 아직 없다.</li>
+    <li>Manifest entry, manifest와 새 manifest list를 만들고 snapshot을 metadata JSON에 추가한다. Fast append는 기존 manifest를 재사용하고 작은 새 manifest를 붙일 수 있다.</li>
+    <li>Base pointer와 operation 범위를 optimistic conflict validation한 뒤 catalog pointer를 atomic swap한다. 성공 응답이 state transition의 linearization point다.</li>
+    <li>충돌 시 retry 가능한 append인지, overwrite/delete의 겹치는 file/partition인지 isolation 규칙으로 판정한다. 실패 upload는 orphan 후보이며 즉시 삭제하면 안 된다.</li>
+    <li>Commit이 누적되어 작은 manifest가 많아지면 rewrite manifests가 metadata fan-out을 줄인다. 이 maintenance도 새 snapshot commit이며 active writer와 race할 수 있다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">비용 모델을 정직하게 쓰기</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">접근</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">대략적 control-path 비용과 함정</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Raw listing</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">O(n) key 열거 + file/partition 해석. Old snapshot, orphan, 임시 file을 현재 membership과 구분할 protocol이 별도로 필요하다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Iceberg selective scan</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Root O(1) + manifest-list O(M)의 작은 summary + matching manifest entries + K tasks. Summary로 많은 manifest를 건너뛰면 n과 무관해진다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Iceberg full scan</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Current snapshot의 live F를 결국 읽으므로 O(F) task가 필요하다. 그래도 unrelated object와 expired/orphan file은 열거하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Degraded metadata</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">M이 크고 summaries가 겹치거나 metrics가 없으면 많은 manifest/entry가 후보로 남는다. Listing 회피가 곧 항상 작은 상수 비용이라는 뜻은 아니다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Indirection이 주는 세 가지 성질</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Consistency:</strong> Reader가 catalog pointer 하나를 pin하면 immutable graph 전체가 한 snapshot을 나타낸다. Directory listing의 페이지 사이에 concurrent write가 끼는 문제를 피한다.</li>
+    <li><strong>Indexability:</strong> Manifest list의 partition ranges가 manifest를, manifest의 partition/column metric이 content file을 필터링한다. False positive는 허용하고 false negative는 금지한다.</li>
+    <li><strong>Shareability:</strong> Snapshot이 slow-changing manifest를 재사용해 metadata rewrite 비용을 낮춘다. 대신 references와 retention을 고려한 reachability GC가 필요하다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Evolution과 delete가 비용 모델에 끼치는 영향</h3>
+  <p>Partition evolution 뒤 old/new spec이 공존하므로 reader는 manifest의 partition spec ID마다 predicate를 다르게 투영한다. Current spec만 적용하면 correctness를 해칠 수 있다. Rename 뒤 metric은 name이 아니라 field ID로 bind한다. V2 MOR에서는 equality/position delete, V3에서는 deletion vector가 candidate data와 함께 계획되므로 K는 단순 data file 수보다 클 수 있다. Engine이 기능을 모르면 “pruning이 덜 된다”가 아니라 잘못된 결과나 read failure가 될 수 있어 compatibility gate가 필요하다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>SLO 분해</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog latency, metadata GET, manifests considered/read, files considered/selected, planning p95와 data bytes를 분리한다. “Query가 느림”만으로는 병목 계층을 찾지 못한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Manifest 관리</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">M, entries/manifest, partition-range overlap과 average size를 관찰해 rewrite threshold를 잡는다. 무조건 매 commit rewrite하면 write latency와 conflict가 커진다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Metric / clustering</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">핵심 predicate column의 metric mode와 sort/clustering을 함께 설계한다. Partition만 늘리면 small file과 metadata가 증가할 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Listing 사용 경계</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">정상 read는 metadata graph, orphan audit는 충분히 오래된 object listing + 모든 retained refs reachability를 사용한다. 두 경로를 섞지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Multi-engine</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark/Flink/Trino별 metadata cache, pushdown, metadata tables, spec transform, delete/DV와 format version 지원을 동일 snapshot canary로 검증한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Failure budget</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog outage는 새 root 획득과 commit을 막고, object-store metadata 404는 pin한 scan을 깨뜨린다. Cache TTL과 retry는 성공 불명확성·staleness를 감춘다는 점을 반영한다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> “Listing이 없으니 maintenance도 필요 없다.” Snapshot/manifest/small file이 무제한 누적되면 metadata GET, planning CPU, commit retry와 GC 비용이 커진다.</p>
+  <p><strong>Edge case:</strong> Full table scan은 current live file을 모두 읽어야 하므로 O(F)를 없앨 수 없다. Iceberg가 제거하는 것은 warehouse의 모든 unrelated object n을 찾는 비용과 current membership을 추론하는 불확실성이다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Data file 수는 비슷한데 scan planning p95와 object-store metadata 요청이 급증했다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Planning p95/GET/CPU 증가, manifests read 비율 상승, selective query candidate file 폭증, engine별 latency 차이, cleanup/rewrite 뒤 404 또는 commit conflict 증가.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog latency·metadata location·snapshot ID, M/manifest size/entries와 partition summaries, F/K와 readable metrics, explain/scan report, cache hit/TTL, connector version, object GET/LIST/403/404, streaming commit·rewrite·expire/orphan job 시간.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Fast append로 작은 manifest 폭증, range overlap, metric none, non-sargable predicate, partition evolution/field-ID 해석 차이, delete/DV amplification, stale cache, connector regression, maintenance/writer race, catalog/object throttling.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">문제 snapshot과 query를 pin하고 read-only metadata tables로 M→matching manifests→K를 계산한다. Maintenance와 write 설정 변경을 멈추고 known-good engine의 같은 snapshot과 비교한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Connector 회귀는 known-good으로 rollback한다. Canary rewrite manifests/data files로 효과·conflict를 검증한 후 새 snapshot을 publish한다. Bad commit은 retained snapshot으로 catalog-supported rollback한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Warehouse full listing을 query path에 붙이지 않는다. Manifest/metadata를 직접 삭제·편집하지 않는다. Active writer 중 대규모 rewrite/expire를 동시에 시작하지 않는다. 403을 missing object로 단정하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 작은 append를 반복해 manifest fan-out을 의도적으로 키우고, metadata graph로 file을 찾는 과정과 rewrite manifests 전후 planning 구조를 비교한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트의 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>12번의 작은 append 뒤 data file F, manifest M, SQL row count가 어떻게 변할지 먼저 적는다.</li>
+    <li>Rewrite manifests 뒤 M과 row count 중 무엇이 바뀌는지, catalog commit이 왜 필요한지 예측한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 작은 manifest를 의도적으로 누적</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day14;
+DROP TABLE IF EXISTS local.day14.listing_lab PURGE;
+CREATE TABLE local.day14.listing_lab (
+  id BIGINT, event_time TIMESTAMP, payload STRING
+) USING iceberg
+PARTITIONED BY (days(event_time))
+TBLPROPERTIES (
+  'commit.manifest-merge.enabled'='false',
+  'write.metadata.metrics.column.id'='full'
+);
+
+INSERT INTO local.day14.listing_lab VALUES (1, TIMESTAMP '2026-08-01 01:00:00', 'a');
+INSERT INTO local.day14.listing_lab VALUES (2, TIMESTAMP '2026-08-02 01:00:00', 'b');
+INSERT INTO local.day14.listing_lab VALUES (3, TIMESTAMP '2026-08-03 01:00:00', 'c');
+INSERT INTO local.day14.listing_lab VALUES (4, TIMESTAMP '2026-08-04 01:00:00', 'd');
+INSERT INTO local.day14.listing_lab VALUES (5, TIMESTAMP '2026-08-05 01:00:00', 'e');
+INSERT INTO local.day14.listing_lab VALUES (6, TIMESTAMP '2026-08-06 01:00:00', 'f');
+INSERT INTO local.day14.listing_lab VALUES (7, TIMESTAMP '2026-08-07 01:00:00', 'g');
+INSERT INTO local.day14.listing_lab VALUES (8, TIMESTAMP '2026-08-08 01:00:00', 'h');
+INSERT INTO local.day14.listing_lab VALUES (9, TIMESTAMP '2026-08-09 01:00:00', 'i');
+INSERT INTO local.day14.listing_lab VALUES (10, TIMESTAMP '2026-08-10 01:00:00', 'j');
+INSERT INTO local.day14.listing_lab VALUES (11, TIMESTAMP '2026-08-11 01:00:00', 'k');
+INSERT INTO local.day14.listing_lab VALUES (12, TIMESTAMP '2026-08-12 01:00:00', 'l');
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 12개 data file과 여러 snapshot/manifest가 생긴다. Writer/runtime에 따라 정확한 M은 다를 수 있으므로 “12여야 한다”가 아니라 property와 실제 manifests table을 증거로 삼는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · n을 list하지 않고 M→F→K 관찰</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS snapshots FROM local.day14.listing_lab.snapshots;
+SELECT count(*) AS manifests,
+       sum(added_data_files_count + existing_data_files_count) AS indexed_entries
+FROM local.day14.listing_lab.manifests;
+SELECT count(*) AS live_files FROM local.day14.listing_lab.files;
+
+SELECT path, partition_spec_id, partition_summaries,
+       added_data_files_count, existing_data_files_count
+FROM local.day14.listing_lab.manifests ORDER BY path;
+
+EXPLAIN EXTENDED
+SELECT * FROM local.day14.listing_lab
+WHERE event_time &gt;= TIMESTAMP '2026-08-07 00:00:00'
+  AND event_time &lt; TIMESTAMP '2026-08-08 00:00:00'
+  AND id = 7;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Manifest list의 day range가 많은 manifest를 배제하고, manifest entry의 id bounds가 K를 더 줄일 수 있다. Metadata table query도 authoritative graph를 읽으며 warehouse 전체 listing은 필요하지 않다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · 실패 주입 결과를 maintenance로 복구</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS rows_before FROM local.day14.listing_lab;
+CALL local.system.rewrite_manifests(
+  table =&gt; 'day14.listing_lab'
+);
+SELECT count(*) AS manifests_after
+FROM local.day14.listing_lab.manifests;
+SELECT count(*) AS rows_after FROM local.day14.listing_lab;
+SELECT committed_at, snapshot_id, operation, summary
+FROM local.day14.listing_lab.snapshots ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Rewrite는 data row를 바꾸지 않고 manifest 배치를 재구성하는 새 commit이다. M은 줄거나 partition locality가 개선되고 row count는 12로 유지된다. Runtime 설정 때문에 변화가 작다면 manifest size/summary와 procedure 결과를 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Listing과 membership의 차이 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">find warehouse/day14/listing_lab -type f | wc -l
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS current_live_files
+FROM local.day14.listing_lab.files;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Physical object 수에는 old metadata, old manifests와 data file이 섞여 current live file 수보다 많다. Listing count는 table membership이나 query task 수가 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Property가 무시됨:</strong> Connector 버전의 table property와 <code>SHOW TBLPROPERTIES</code>를 확인한다. 정확한 M은 구현별 merge 동작에 따라 달라진다.</li>
+    <li><strong>Procedure 이름/인자 오류:</strong> Catalog system procedure 지원과 Spark extensions 설정을 확인한다. 지원하지 않으면 before 상태만 보존하고 임의 file rewrite를 하지 않는다.</li>
+    <li><strong>Manifest 수가 그대로:</strong> 이미 적절히 묶였거나 target size 정책 때문이다. Path, size, partition summaries와 procedure output을 비교한다.</li>
+    <li><strong>Explain에 candidate 수 없음:</strong> Engine scan report와 metadata bounds로 K를 수동 계산한다.</li>
+    <li><strong>Warehouse path가 다름:</strong> <code>files.file_path</code>의 absolute URI와 catalog config로 실제 root를 확인한다.</li>
+    <li><strong>Commit conflict:</strong> Active writer를 멈추고 현재 snapshot과 procedure 결과를 확인한다. Blind retry로 같은 maintenance를 중복 실행하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day14.listing_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day14;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Table lifecycle로 정리한다. Listing 결과를 보고 metadata/data file을 개별 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Iceberg scan planning은 O(1)이다.</strong> Root lookup 뒤 M, matching entries와 K에 비례하는 작업이 남는다.</li>
+    <li><strong>Listing을 안 하면 orphan을 찾을 수 없다.</strong> 정상 read와 별도의 안전한 orphan audit에서는 listing을 쓰되 retained refs와 age threshold를 대조한다.</li>
+    <li><strong>Manifest list는 file path 목록뿐이다.</strong> Partition summaries와 counts가 manifest-level pruning index 역할을 한다.</li>
+    <li><strong>Partition pruning만 있으면 충분하다.</strong> Field-ID metrics, sort/clustering, Parquet index와 delete applicability가 다음 계층을 담당한다.</li>
+    <li><strong>Current spec으로 old manifest도 해석한다.</strong> Manifest를 쓴 partition spec ID별 inclusive projection이 필요하다.</li>
+    <li><strong>Missing metric이면 file에 값이 없다.</strong> Unknown이므로 candidate를 유지해야 correctness가 보존된다.</li>
+    <li><strong>Rewrite manifests는 data file을 compact한다.</strong> Metadata layout만 바꾸며 rewrite data files와 비용·race가 다르다.</li>
+    <li><strong>모든 engine이 같은 index를 사용한다.</strong> Pushdown, cache, metadata table, V2/V3 delete/DV 지원 차이를 실제 snapshot으로 검증한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. “Iceberg는 O(n) listing을 피한다”를 비용 모델과 정확성 관점에서 설명하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> n/M/F/K 정의 → catalog root와 snapshot pin → manifest-list/manifest 2-level index → selective/full scan의 다른 복잡도 → listing membership 불명확성 → metadata degradation과 maintenance trade-off까지 방어한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. Streaming append로 planning p95가 10배 늘었다. 설계와 복구안을 제시하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> Commit rate·file size·M/entries/overlap·K 수치 가정 → fast append 경로 → catalog/object/engine 지표 분리 → canary rewrite manifests와 data compaction의 책임 구분 → active writer conflict, rollback, threshold와 SLO를 포함한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. Object store outage와 catalog outage가 reader/writer에 미치는 차이는?</h3>
+  <p><strong>좋은 답변 구조:</strong> State owner와 control/data path 분리 → cached root의 staleness 한계 → catalog가 없으면 refresh/commit 불가, object가 없으면 metadata/data GET 실패 → commit 성공 불명확성·idempotency → cache/retry/DR의 correctness와 availability trade-off를 제시한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Current data file membership을 증명하는 pointer chain은?</li>
+    <li>Object는 존재하지만 table에 속하지 않는 failure window는?</li>
+    <li>Referenced file 404에서 안전한 첫 조치는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:15px 17px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Catalog pointer → metadata JSON → current snapshot → manifest list → manifest live entry → data/delete path를 말하면 정답.</li>
+      <li>Immutable object upload 뒤 catalog pointer swap 전 commit 실패/충돌이라고 답하면 정답.</li>
+      <li>Cleanup/write를 멈추고 snapshot·metadata·manifest·exact HEAD/IAM audit를 보존한다고 답하면 정답.</li>
+    </ol>
+  </div>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Iceberg가 listing O(n)을 회피한다고 해서 scan planning이 O(1)이 아닌 이유는?</li>
+    <li>Manifest list와 manifest가 각각 무엇을 pruning하는가?</li>
+    <li>Full scan에서도 Iceberg metadata graph가 주는 이점은?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #a8d8bd;padding:15px 17px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>M, matching manifest entries와 K를 읽는 비용이 남고 metadata 품질에 따라 커질 수 있다고 답하면 정답.</li>
+      <li>Manifest list summary는 manifest, manifest partition/field metric은 data/delete file 후보를 줄인다고 답하면 정답.</li>
+      <li>Current snapshot의 authoritative F만 읽어 unrelated old/orphan object를 열거하지 않고 일관된 membership을 얻는다고 답하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/performance/" style="color:#087990;">Apache Iceberg Docs — Performance와 Scan Planning</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#manifest-lists" style="color:#087990;">Apache Iceberg Table Specification — Manifest Lists</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#087990;">Apache Iceberg Table Specification — Scan Planning</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-structured-streaming/" style="color:#087990;">Apache Iceberg Docs — Streaming Maintenance</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">공식 최신 문서는 Iceberg 1.11.0 페이지를 기준으로 확인했다. 실제 procedure, metadata cache, scan metric과 format V2/V3 기능은 사용하는 engine·connector 버전에서 별도 검증한다.</p>
+
+  <div style="margin-top:30px;background:#073642;color:#ffffff;padding:20px;border-radius:10px;">
+    <strong style="color:#8ee7f6;">내일 예고 · Day 15 / Week 3</strong><br>
+    field ID와 name mapping — rename·drop·add 뒤에도 column identity를 보존하는 원리와 name 기반 reader의 silent corruption 위험을 추적합니다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

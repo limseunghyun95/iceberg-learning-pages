@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-14T09:11:10+09:00",
+  "updatedAt": "2026-08-15T09:11:16+09:00",
   "lessons": [
     {
       "day": 1,
@@ -122,6 +122,15 @@
       "path": "day-13.html",
       "kind": "lab",
       "publishedAt": "2026-08-14T09:11:10+09:00"
+    },
+    {
+      "day": 14,
+      "week": 2,
+      "title": "회상: O(n) listing 회피의 의미",
+      "summary": "Object 전체 listing과 metadata index traversal의 비용 모델을 비교하고 manifest pruning·maintenance·장애 경계를 회상합니다.",
+      "path": "day-14.html",
+      "kind": "review",
+      "publishedAt": "2026-08-15T09:11:16+09:00"
     }
   ]
 }
