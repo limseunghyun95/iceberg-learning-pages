@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-15T09:11:16+09:00",
+  "updatedAt": "2026-08-16T09:18:56+09:00",
   "lessons": [
     {
       "day": 1,
@@ -131,6 +131,15 @@
       "path": "day-14.html",
       "kind": "review",
       "publishedAt": "2026-08-15T09:11:16+09:00"
+    },
+    {
+      "day": 15,
+      "week": 3,
+      "title": "field ID와 name mapping",
+      "summary": "Column 이름·순서와 분리된 field ID identity, ID 기반 projection, name mapping fallback과 진화·호환 장애 경계를 추적합니다.",
+      "path": "day-15.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-16T09:18:56+09:00"
     }
   ]
 }

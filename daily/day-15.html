@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 15</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 3 / DAY 15</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">field ID와 name mapping</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Schema·Partition·Sort Evolution · 예상 학습 30분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg에서 column의 정체성은 바뀔 수 있는 이름·순서가 아니라 재사용하지 않는 field ID이며, name mapping은 ID가 없는 이관 file을 위한 명시적 fallback이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Identity</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">이름이나 위치가 바뀌어도 같은 대상을 가리키는 안정적인 정체성이다. 주민등록번호와 표시 이름의 차이를 떠올리면 된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Field ID</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Schema의 struct field, list element, map key/value에 부여하는 정수 ID다. Table 안에서 재사용하지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Projection</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Query가 요구한 field ID를 data file의 같은 ID에 연결하고, 원하는 순서와 이름으로 결과 schema를 만드는 과정이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Name mapping</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;"><code>schema.name-mapping.default</code>에 저장하는 이름→field ID fallback이다. Field ID가 없는 이관 file을 읽을 때만 필요하다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Writer / reader schema</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">File을 쓸 때의 schema와 현재 query가 요청하는 schema다. Schema evolution 뒤 둘은 이름·순서·field 수가 다를 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Nested field</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Struct 내부 field, list element, map key/value다. 각각 독립적인 ID를 가지며 dotted name만으로 식별하지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Silent corruption</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Query가 실패하지 않고 다른 column의 값을 그럴듯하게 반환하는 오류다. 위치 기반 projection의 가장 위험한 결과다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Initial default</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Old file에 새 field ID가 없을 때 적용할 수 있는 schema default다. 없으면 partition identity fallback 등을 제외하고 보통 null이다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>이름 기반 시스템에서 <code>amount</code>를 <code>gross_amount</code>로 rename하면 old file에는 여전히 <code>amount</code>가 남는다. 다시 <code>amount</code>라는 새 column을 추가하면 문자열 이름만 보는 reader는 old 금액을 새 column으로 잘못 연결할 수 있다. Query는 성공하지만 의미가 바뀌는 silent corruption이다.</p>
+  <p>Iceberg는 old <code>amount</code>와 renamed <code>gross_amount</code>를 같은 field ID로 연결하고, 새 <code>amount</code>에는 새 ID를 부여한다. 이 identity는 data file projection뿐 아니라 manifest metrics, partition source ID, sort order, equality delete IDs까지 table 전체에 전파된다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> 같은 field ID는 같은 논리 field를 뜻하고, 한 번 삭제한 ID는 다른 의미에 재사용하지 않는다. 이름은 사람이 쓰는 label이고 ID가 protocol identity다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog pointer → metadata JSON</strong><br><span style="font-size:14px;color:#cdebf0;">current schema ID · schemas · last-column-id</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ query name을 current field ID에 bind</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② Snapshot → manifest list → manifest</strong><br><span style="font-size:14px;">spec source-id · field-ID metrics · equality_ids</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ candidate data/delete file + projected IDs</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>③ File schema에 field ID가 있음</strong><br><span style="font-size:14px;">ID로 physical column을 선택 · 이름/순서 무관</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">또는 ↓ ID가 없는 imported file</td></tr>
+    <tr><td style="background:#fff0f2;text-align:center;padding:13px;border:1px solid #e8a6b1;border-radius:8px;"><strong>④ schema.name-mapping.default</strong><br><span style="font-size:14px;">명시된 old names → Iceberg field ID fallback</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ missing ID는 partition/default/null 규칙</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Reader result schema</strong><br><span style="font-size:14px;color:#cdebf0;">현재 이름·현재 순서로 값 materialization</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Read 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>SQL analyzer가 현재 schema에서 <code>gross_amount</code>라는 이름을 field ID 2처럼 안정적인 ID에 bind한다. 이후 계획은 이름 문자열이 아니라 ID를 운반한다.</li>
+    <li>Catalog pointer가 가리키는 metadata JSON과 snapshot을 pin하고 manifest list/manifest를 읽는다. Partition source ID와 metrics key도 동일 ID 공간을 사용한다.</li>
+    <li>Reader는 file schema에서 ID 2를 찾는다. Old file의 physical name이 <code>amount</code>여도 ID 2라면 현재 결과의 <code>gross_amount</code>로 읽는다.</li>
+    <li>File에 field ID가 없을 때만 default name mapping에서 file path의 이름을 찾아 ID를 부여한다. Mapping에 없다고 current name을 임의 추측하지 않는다.</li>
+    <li>Requested ID가 file에 없으면 identity partition 값, name mapping, initial default, null 순서의 spec 규칙으로 해결한다. 새 <code>amount</code> ID 4는 old file에서 null이다.</li>
+    <li>MOR에서는 equality delete의 field IDs도 같은 identity로 해석한다. Rename이 delete semantics를 바꾸지 않아야 한다. V3 DV는 position 기반이지만 엔진 지원 경계를 확인한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Rename commit의 write path</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer가 base metadata와 current schema를 읽고 <code>amount</code> 이름을 가진 ID 2를 선택한다.</li>
+    <li>새 schema version에서 ID 2의 이름만 <code>gross_amount</code>로 바꾼다. Old data file, manifest, snapshot은 rewrite하지 않는다.</li>
+    <li>새 metadata JSON을 쓰고 base pointer가 그대로인지 optimistic validation한다. Concurrent schema update가 있으면 ID/name conflict를 병합하거나 실패한다.</li>
+    <li>Catalog pointer의 atomic swap 성공이 rename의 linearization point다. 이후 새 reader는 current name을 사용하지만 old/new file 모두 ID 2로 읽는다.</li>
+    <li>다시 <code>amount</code>를 추가하면 <code>last-column-id</code>보다 큰 새 ID를 할당한다. 삭제된 ID나 rename 전 이름을 재사용하는 것이 아니다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">관점</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">상태 · 불변식 · 비용</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Surrogate key</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Field ID는 mutable name 대신 쓰는 protocol key다. Name과 position을 자유롭게 진화시키는 indirection 비용을 작은 integer metadata로 지불한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Type safety</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">동일 ID의 type change는 허용된 promotion 규칙을 따라야 한다. 이름이 같아도 새 ID면 별개 field이므로 old bytes를 읽지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Nested identity</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Struct child, list element, map key/value도 ID를 가진다. <code>a.b</code> 문자열 하나로 nested path를 평탄화하면 literal dot 이름과 충돌할 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Index coherence</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Manifest lower/upper/count map은 field ID로 keyed된다. Rename 뒤에도 pruning synopsis가 같은 logical field에 적용된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Transaction</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Schema는 metadata state 일부다. Pointer swap 전 reader는 old schema, 성공 후 reader는 new schema를 보고 중간 조합은 보지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Fallback risk</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Name mapping은 ID 없는 file의 migration debt다. Ambiguous alias, case sensitivity, nested mapping과 엔진 지원을 계속 검증해야 한다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Column projection 예제</h3>
+  <p>File schema가 <code>1:a int, 2:b string, 3:c double</code>이고 current projection이 <code>3:measurement, 2:name, 4:a</code>라면 결과는 file의 <code>c</code>, file의 <code>b</code>, 그리고 ID 4가 없으므로 null/default다. 이름 <code>a</code>가 old ID 1과 같아도 ID 4를 ID 1의 값으로 채우면 안 된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Name mapping은 alias registry가 아니다</h3>
+  <p>Mapping object는 <code>names</code>, optional <code>field-id</code>, nested <code>fields</code>를 가진다. 여러 old name을 한 ID에 연결할 수 있지만, 정상 Iceberg writer가 ID를 기록한 file에는 ID가 우선한다. Migration을 끝낸 뒤에도 current name을 자동으로 추정하거나 모든 engine이 동일 fallback을 구현한다고 가정하면 안 된다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Evolution contract</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">DDL 전 old/new name, field ID, type, required/default, downstream contract를 표로 남긴다. Metadata-safe와 business-semantic-safe를 구분한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Migration inventory</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Imported file format별 field-ID 존재 여부, casing, nested paths와 writer version을 샘플링한다. Name mapping은 증거로 생성하고 추측하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Name reuse</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Drop/rename 후 같은 이름을 새 의미로 쓸 때 새 ID와 null/default 동작을 canary에서 검증한다. Raw Parquet 소비자는 별도 migration이 필요하다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Multi-engine gate</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark/Flink/Trino별 rename, nested evolution, case sensitivity, Parquet/Avro/ORC field ID와 name mapping 지원을 old/new file 혼합 table로 테스트한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Write serialization</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Schema change와 대규모 writer/maintenance를 겹치지 않게 운영하거나 conflict를 명시적으로 처리한다. 실패 commit의 metadata file은 current state가 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Observability</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Schema ID/field-ID diff, writer/reader version, file schema ID presence, projection plan, null-rate와 metric pruning 변화를 deploy gate에 둔다.</td></tr>
+  </table>
+  <p><strong>Anti-pattern:</strong> 모든 file을 rewrite했으니 field ID가 필요 없다고 생각하거나, current column order와 Parquet physical order가 같다고 가정하는 reader를 운영하는 것이다.</p>
+  <p><strong>Edge case:</strong> Name mapping의 <code>a.b</code>는 nested path가 아니라 점을 포함한 literal name일 수 있다. Struct/list/map child는 mapping의 <code>fields</code> 계층으로 표현해야 하며 case-insensitive fallback은 충돌을 만들 수 있다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Rename/column 추가 후 일부 엔진에서 값이 서로 바뀌거나 null-rate가 급증했다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">엔진별 row/value 차이, rename 전 file만 null 또는 다른 값, position reorder 뒤 type mismatch, pruning candidate 급증, equality delete 누락.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog metadata location·snapshot/schema ID, metadata JSON schemas/last-column-id/name mapping, old/new file physical schema와 IDs, manifest field-ID metrics, spec/sort/equality IDs, query plan, engine/connector version·case mode, null/value distribution.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Name/position 기반 reader, ID 없는 imported file과 누락·오류 mapping, same-name new ID 오인, nested/case collision, stale metadata cache, unsupported type/evolution, equality delete ID 해석 차이, partial writer rollout.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Write와 schema change를 멈추고 문제 snapshot을 pin한다. Old/new file 하나씩 schema·ID를 보존하고 known-good Iceberg reader 결과를 raw-file reader와 비교한다. Catalog cache를 증거 보존 후 refresh한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Bad schema commit이면 retained snapshot/metadata로 catalog-supported rollback한다. ID 없는 file은 검증된 name mapping 또는 controlled rewrite로 보정하고, reader 회귀는 known-good version으로 되돌린다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON의 field ID를 수동 편집·재번호화하지 않는다. Null을 0/빈 문자열로 일괄 채우지 않는다. Raw Parquet name merge를 정답으로 삼지 않는다. 증거 없이 전체 file을 rewrite하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 같은 field ID가 rename 뒤 old/new file을 연결하고, 같은 이름의 새 column은 새 ID로 분리되는 것을 metadata JSON과 query 결과로 증명한다. Raw Parquet name merge의 위험도 비교한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>Old <code>amount</code>를 <code>gross_amount</code>로 rename한 뒤 새 <code>amount STRING</code>을 추가하면 old row의 두 결과가 무엇인지 적는다.</li>
+    <li>Iceberg table read와 raw Parquet mergeSchema read 중 어느 쪽이 logical identity를 보존하는지 이유를 적는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Old file과 최초 field ID 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day15;
+DROP TABLE IF EXISTS local.day15.id_lab PURGE;
+CREATE TABLE local.day15.id_lab (
+  id BIGINT,
+  amount DECIMAL(10,2),
+  note STRING
+) USING iceberg
+TBLPROPERTIES ('write.metadata.metrics.column.amount'='full');
+
+INSERT INTO local.day15.id_lab VALUES
+  (1, CAST(10.50 AS DECIMAL(10,2)), 'old-a'),
+  (2, CAST(20.00 AS DECIMAL(10,2)), 'old-b');
+SELECT * FROM local.day15.id_lab ORDER BY id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 첫 schema에서 id, amount, note는 서로 다른 ID를 갖고 첫 data file에 그 ID가 기록된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Rename 후 같은 old name을 새 ID로 추가</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day15.id_lab RENAME COLUMN amount TO gross_amount;
+ALTER TABLE local.day15.id_lab ADD COLUMN amount STRING;
+
+INSERT INTO local.day15.id_lab (id, gross_amount, note, amount)
+VALUES (3, CAST(30.25 AS DECIMAL(10,2)), 'new', 'promo');
+
+DESCRIBE TABLE local.day15.id_lab;
+SELECT id, gross_amount, amount, note
+FROM local.day15.id_lab ORDER BY id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Old row 1·2의 <code>gross_amount</code>는 10.50/20.00으로 유지되고 새 <code>amount</code>는 null이다. Row 3은 30.25와 <code>promo</code>를 함께 가진다. 이름이 같아졌다는 이유로 old bytes가 새 field에 들어가지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Metadata JSON에서 ID 불변식 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">LATEST_METADATA=$(find warehouse/day15/id_lab/metadata \
+  -type f -name '*.metadata.json' | sort | tail -n 1)
+
+jq '{
+  current_schema_id: .&quot;current-schema-id&quot;,
+  last_column_id: .&quot;last-column-id&quot;,
+  schemas: [.schemas[] | {
+    schema_id: .&quot;schema-id&quot;,
+    fields: [.fields[] | {id, name, type}]
+  }]
+}' &quot;$LATEST_METADATA&quot;
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT file_path, readable_metrics
+FROM local.day15.id_lab.files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Schema history에서 old <code>amount</code>와 <code>gross_amount</code>의 ID는 같고, 새 <code>amount</code>는 더 큰 새 ID다. Metrics도 이름이 아니라 해당 field ID에 연결된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · Iceberg를 우회해 raw Parquet 이름 merge</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE OR REPLACE TEMP VIEW raw_name_view
+USING parquet
+OPTIONS (
+  path 'warehouse/day15/id_lab/data',
+  mergeSchema 'true'
+);
+
+DESCRIBE raw_name_view;
+SELECT * FROM raw_name_view ORDER BY id;
+SELECT id, gross_amount, amount
+FROM local.day15.id_lab ORDER BY id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Raw view는 file physical names를 merge하므로 old <code>amount</code>, new <code>gross_amount</code>, 새 <code>amount</code>의 의미를 정확히 복원하지 못하거나 schema conflict를 낼 수 있다. 실패 형태는 Spark/Parquet schema merge 동작에 따라 다르지만 Iceberg 결과가 기준이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Warehouse path가 다름:</strong> <code>files.file_path</code>와 catalog config로 실제 location을 확인한다. 추측한 path를 수정하지 않는다.</li>
+    <li><strong>Metadata filename sort가 맞지 않음:</strong> <code>metadata_log_entries</code>의 latest row에서 exact file path를 얻어 jq에 넘긴다.</li>
+    <li><strong>Raw view path가 container에서 안 보임:</strong> Docker Compose volume의 container-side warehouse path로 바꾸되 Iceberg table은 건드리지 않는다.</li>
+    <li><strong>Raw Parquet schema conflict:</strong> 이것 자체가 name 기반 merge의 실패 증거다. Type coercion으로 억지 성공시키지 않는다.</li>
+    <li><strong>Rename/Add 문법 차이:</strong> 사용 중인 engine의 Iceberg DDL 지원을 확인하고 같은 logical transition을 별도 명령으로 수행한다.</li>
+    <li><strong>Stale DESCRIBE:</strong> Catalog/engine cache를 refresh한 뒤 metadata location과 snapshot을 다시 고정한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day15.id_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day15;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Metadata JSON이나 data file을 개별 삭제하지 않고 table lifecycle로 정리한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Field ID는 schema version마다 다시 1부터다.</strong> Table 전체에서 identity를 유지하고 재사용하지 않는다.</li>
+    <li><strong>Rename은 old file column name도 바꾼다.</strong> Metadata만 바뀌며 reader가 ID로 old bytes를 연결한다.</li>
+    <li><strong>같은 이름이면 같은 field다.</strong> Drop/rename 후 새로 추가한 같은 이름은 새 ID일 수 있다.</li>
+    <li><strong>Name mapping은 모든 file에 적용한다.</strong> File ID가 있으면 그것이 우선이며 mapping은 ID 없는 file의 fallback이다.</li>
+    <li><strong>Column order로 projection해도 type이 같으면 안전하다.</strong> 값이 조용히 바뀌는 silent corruption이 더 위험하다.</li>
+    <li><strong>Nested field는 dotted string 하나면 된다.</strong> List/map/struct child mapping과 literal dot 이름을 구분해야 한다.</li>
+    <li><strong>Rename은 항상 downstream-safe다.</strong> Raw Parquet consumer, BI semantic layer, CDC schema registry와 SQL text는 별도 계약이다.</li>
+    <li><strong>모든 엔진의 mapping 지원이 같다.</strong> Format/file type/connector 버전별 old/new 혼합 canary가 필요하다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 수준 질문</h2>
+  <h3 style="font-size:18px;color:#07566a;">Q1. Field ID가 왜 필요한지 rename과 drop/add 시나리오로 증명하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> 이름·순서의 가변성 → ID 불변식/재사용 금지 → writer/current projection 예제 → old file과 새 same-name field 분리 → metrics/spec/delete에 전파 → name/position 방식의 silent corruption과 migration 대안을 설명한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q2. 5PB Hive Parquet를 rewrite 없이 Iceberg로 이관할 때 name mapping을 어떻게 설계하겠는가?</h3>
+  <p><strong>좋은 답변 구조:</strong> File format·기간·writer별 ID/case/nested inventory → canonical field IDs와 aliases → ambiguity 검출/차단 → sampled old/new canary와 engine matrix → null/value checksum → rollback, gradual rewrite와 mapping debt 제거 기준을 수치로 제시한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Q3. Schema rename과 streaming writer commit이 동시에 발생할 때 correctness를 설명하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> Base metadata/schema ID → writer가 file에 기록한 IDs → optimistic pointer swap·conflict validation → retry 때 current schema 재bind → old/new snapshot reader isolation → 실패 object/orphan과 idempotency → compatibility rollout 방안을 방어한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Iceberg가 O(n) listing을 피한다고 해서 planning이 O(1)은 아닌 이유는?</li>
+    <li>Manifest list와 manifest는 각각 어떤 후보를 줄이는가?</li>
+    <li>Rewrite manifests와 rewrite data files의 책임 차이는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:15px 17px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Root 뒤 M, matching entries, candidate K 비용이 남고 metadata 품질에 따라 커진다고 답하면 정답.</li>
+      <li>Manifest list summary는 manifest를, manifest partition/field metric은 data/delete file을 줄인다고 답하면 정답.</li>
+      <li>전자는 metadata fan-out/locality, 후자는 data file size·clustering/delete merge를 바꾼다고 구분하면 정답.</li>
+    </ol>
+  </div>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Rename 뒤 old file의 값을 새 이름으로 안전하게 읽을 수 있는 이유는?</li>
+    <li>Name mapping은 언제 사용하며 언제 사용하지 않는가?</li>
+    <li>Old 이름과 같은 새 column을 추가했을 때 old row의 값은 어떻게 되는가?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #a8d8bd;padding:15px 17px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Old/current schema의 이름은 달라도 같은 field ID로 file column을 projection한다고 답하면 정답.</li>
+      <li>ID 없는 imported file에서 명시적 이름→ID fallback으로 쓰며, ID가 있는 file에는 file ID가 우선이라고 답하면 정답.</li>
+      <li>새 column은 새 ID라 old file에 없으므로 initial default가 없으면 null이며 old bytes를 재사용하지 않는다고 답하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/schemas/" style="color:#087990;">Apache Iceberg Docs — Schemas</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#schemas-and-data-types" style="color:#087990;">Apache Iceberg Table Specification — Schemas and Data Types</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#column-projection" style="color:#087990;">Apache Iceberg Table Specification — Column Projection</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#name-mapping-serialization" style="color:#087990;">Apache Iceberg Table Specification — Name Mapping</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">공식 최신 문서와 spec을 기준으로 확인했다. DDL, nested evolution, file-format ID annotation과 name mapping 지원은 사용하는 Spark/Flink/Trino connector 버전에서 별도 검증한다.</p>
+
+  <div style="margin-top:30px;background:#073642;color:#ffffff;padding:20px;border-radius:10px;">
+    <strong style="color:#8ee7f6;">내일 예고 · Day 16</strong><br>
+    add/drop/rename/reorder/type promotion — metadata-only evolution의 허용 범위와 downstream 의미 호환성의 경계를 구분합니다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
