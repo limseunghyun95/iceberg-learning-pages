@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-16T09:18:56+09:00",
+  "updatedAt": "2026-08-17T09:05:49+09:00",
   "lessons": [
     {
       "day": 1,
@@ -140,6 +140,15 @@
       "path": "day-15.html",
       "kind": "lesson",
       "publishedAt": "2026-08-16T09:18:56+09:00"
+    },
+    {
+      "day": 16,
+      "week": 3,
+      "title": "add/drop/rename/reorder/type promotion",
+      "summary": "Field ID 불변식을 보존하는 다섯 schema evolution의 metadata state transition, type promotion 경계와 multi-engine 장애 대응을 추적합니다.",
+      "path": "day-16.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-17T09:05:49+09:00"
     }
   ]
 }
