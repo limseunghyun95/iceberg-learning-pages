@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-17T09:05:49+09:00",
+  "updatedAt": "2026-08-18T09:01:25+09:00",
   "lessons": [
     {
       "day": 1,
@@ -149,6 +149,15 @@
       "path": "day-16.html",
       "kind": "lesson",
       "publishedAt": "2026-08-17T09:05:49+09:00"
+    },
+    {
+      "day": 17,
+      "week": 3,
+      "title": "hidden partitioning과 transform",
+      "summary": "Logical predicate가 partition transform으로 안전하게 투영되는 read/write path와 pruning, multi-engine transform 불변식 및 장애 대응을 추적합니다.",
+      "path": "day-17.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-18T09:01:25+09:00"
     }
   ]
 }
