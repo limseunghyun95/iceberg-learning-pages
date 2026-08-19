@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-18T09:01:25+09:00",
+  "updatedAt": "2026-08-19T23:06:16+09:00",
   "lessons": [
     {
       "day": 1,
@@ -158,6 +158,15 @@
       "path": "day-17.html",
       "kind": "lesson",
       "publishedAt": "2026-08-18T09:01:25+09:00"
+    },
+    {
+      "day": 18,
+      "week": 3,
+      "title": "partition spec ID와 spec coexistence",
+      "summary": "Partition spec/field ID의 소유권과 old/new spec manifest coexistence, split planning·overwrite·maintenance 장애 경계를 추적합니다.",
+      "path": "day-18.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-19T23:06:16+09:00"
     }
   ]
 }
