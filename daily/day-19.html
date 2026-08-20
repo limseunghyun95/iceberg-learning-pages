@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 19</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 3 / DAY 19</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">sort order와 write distribution</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Schema·Partition·Sort Evolution · 예상 학습 40분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Sort order는 새 파일 안에서 row를 어떻게 가까이 둘지 선언하는 metadata 계약이고, write distribution은 그 row를 어느 task로 보낼지 정하는 실행 전략이다. 둘은 pruning·압축·파일 크기를 함께 좌우하지만 query 결과 순서는 보장하지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Sort order</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">파일을 쓸 때 row를 정렬할 field의 순서, transform, ASC/DESC, null 순서를 모은 metadata 객체다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Sort field</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Source field ID와 transform, 방향, null ordering으로 이루어진 한 정렬 key다. Column name이 아니라 ID를 따른다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Order ID</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Sort order version을 식별하는 정수다. ID 0은 reserved <em>unsorted</em>다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Distribution</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Shuffle을 통해 어느 row가 어느 write task로 갈지 배치하는 실행 계획이다. Spark의 none/hash/range가 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Clustering</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">비슷한 partition/key 값을 가진 row가 같은 task·file 주변에 모인 상태다. 전체 결과 정렬과는 다르다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">AQE</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Adaptive Query Execution. Spark가 runtime 통계를 보고 shuffle partition을 합치거나 나누는 기능이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Target file size</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Writer가 file roll을 시도하는 목표값이다. Task가 가진 data보다 큰 file을 만들 수 없고 압축 전 task bytes와도 다르다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Fanout writer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">입력이 partition별로 모이지 않아도 task가 여러 partition file handle을 동시에 열어 쓰는 방식이다. Memory와 file descriptor 비용이 든다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Partitioning은 “어느 큰 서랍에 넣을지” 정한다. Sort order는 그 서랍 안에서 비슷한 값을 서로 가까이 둔다. 예를 들어 날짜 partition 안을 <code>user_id</code>로 정렬하면 특정 user 범위는 적은 file·row group만 읽을 가능성이 커지고, 반복되는 값이 가까워 압축률도 좋아질 수 있다.</p>
+  <p>하지만 선언만으로 충분하지 않다. 분산 writer가 같은 key의 row를 여러 task에 흩뜨리면 작은 file이 늘고 각 file의 min/max 범위가 겹친다. Distribution은 row를 task에 모으는 control path이고 sort order는 task 안의 layout 의도다. 잘 조합해야 shuffle 비용과 scan 절감의 균형이 맞는다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> <code>default-sort-order-id</code>는 새 writer를 위한 기본 의도다. 각 data file은 실제 <code>sort_order_id</code>를 선언할 수 있으며 old·unsorted file도 같은 snapshot에 공존한다. Reader는 table 전체가 정렬됐다고 가정하거나 SQL 결과의 순서를 생략해서는 안 된다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog pointer → metadata JSON</strong><br><span style="font-size:14px;color:#cdebf0;">partition spec · sort-orders/default ID · write properties</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ writer가 base metadata와 input을 읽음</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② Distribution exchange</strong><br><span style="font-size:14px;">none: 그대로 · hash: partition hash · range: sample 후 범위 shuffle</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ task별 partition/key cluster</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>③ Local ordering + file writer</strong><br><span style="font-size:14px;">partition 경계 · sort key · target size · compression</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ immutable data files + metrics + sort_order_id</td></tr>
+    <tr><td style="background:#f7fafb;text-align:center;padding:13px;border:1px solid #cbd7dc;border-radius:8px;"><strong>④ Manifest → manifest list → snapshot</strong><br><span style="font-size:14px;">file membership · lower/upper bounds · counts · sequence</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ catalog compare-and-swap 성공</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Reader planning</strong><br><span style="font-size:14px;color:#cdebf0;">partition/metrics pruning → data/delete read → SQL ORDER BY는 별도</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">Write path: 요청·응답·상태</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer가 catalog pointer의 base metadata를 pin하고 current partition spec, default sort order와 operation별 distribution property를 읽는다.</li>
+    <li><code>none</code>은 shuffle을 요청하지 않는다. <code>hash</code>는 partition value hash로, <code>range</code>는 sample로 경계를 계산한 뒤 partition/sort key 범위로 row를 재배치한다.</li>
+    <li>각 task는 Iceberg partition 경계를 넘지 않는 data file을 쓴다. 입력이 clustered되지 않은 <code>none</code>에서는 writer failure 또는 fanout의 많은 open handle 비용이 생길 수 있다.</li>
+    <li>Writer는 target size에서 roll을 시도하지만 한 file은 task가 가진 data보다 클 수 없다. Spark task bytes는 memory 기준이고 Parquet는 압축되므로 실제 file은 더 작을 수 있다.</li>
+    <li>Manifest entry가 file path, partition, record/size metrics, column bounds와 <code>sort_order_id</code>를 기록한다. 이 ID가 실제 file layout의 증거다.</li>
+    <li>새 snapshot과 metadata를 준비한 뒤 catalog pointer CAS가 성공해야 row가 공개된다. Concurrent sort-order/property 변경 시 validation·retry를 거치며, 실패한 시도의 staged file은 table membership이 아니다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Read path와 pruning</h3>
+  <ol style="padding-left:22px;">
+    <li>Reader는 catalog pointer → metadata JSON → snapshot → manifest list → manifest 순서로 membership을 고정한다.</li>
+    <li>Partition summary와 file-level lower/upper bounds로 후보 file을 줄인다. Sort key가 잘 clustered되면 file bounds의 겹침이 줄어든다.</li>
+    <li>Parquet row-group/page statistics를 지원하는 engine은 data file 내부에서 추가 pruning을 할 수 있다. 효과는 engine과 connector version에 따라 다르다.</li>
+    <li>Position/equality delete, MOR delete file 또는 지원되는 DV를 sequence와 target 관계에 맞춰 적용한다. 정렬은 이 correctness path를 대체하지 않는다.</li>
+    <li>최종 row 순서는 분산 scan이 정한다. 사용자 요구가 ordered result라면 반드시 query에 <code>ORDER BY</code>를 쓴다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">상태/단계</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">소유자 · 불변식 · 비용</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Sort order ID</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Metadata JSON이 order definition을 소유하고 manifest의 file entry가 ID를 참조한다. ID 0은 unsorted이며 old/new order file은 함께 읽을 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Hash exchange</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Partition value가 같은 row를 같은 shuffle group에 모은다. Sampling 비용은 없지만 hot partition은 task skew를 만든다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Range exchange</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">먼저 sample을 수집해 range boundary를 만들고 다시 shuffle한다. 더 비싸지만 partition과 sort key를 함께 cluster해 bounds 품질을 높일 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>None</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Iceberg가 distribution을 요구하지 않는다. Upstream이 이미 정확히 clustered되었다는 전제가 없으면 여러 partition handle, 작은 file 또는 writer rejection 위험을 떠안는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>AQE/task size</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Spark가 shuffle partition 크기를 runtime에 조절한다. Advisory partition size는 압축 전 memory bytes 기준이라 512MB task가 512MB Parquet file을 뜻하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Commit</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Object storage write는 준비 단계다. Catalog CAS 후의 snapshot만 visible state이며 commit conflict에서는 최신 metadata로 validation한 뒤 재시도한다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Sort evolution과 mixed files</h3>
+  <p><code>sort-orders</code>는 history를 가진 list이고 <code>default-sort-order-id</code>는 새 write의 기본을 고른다. Order를 바꾸어도 old file은 rewrite되지 않는다. Manifest의 <code>sort_order_id</code>가 0 또는 old ID인 file도 유효하다. 그래서 reader가 current order를 이용해 binary search처럼 row를 생략하는 것은 안전하지 않고, 표준 metrics와 file format index만 보수적으로 사용해야 한다.</p>
+  <p>Table Spec은 default order를 writer에게 유용한 hint로 제공하지만 streaming처럼 비용이 과도하면 writer가 정렬을 생략할 수 있는 경계를 둔다. 운영에서는 metadata 선언과 실제 file ID·bounds를 함께 측정해야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Transform과 null</h3>
+  <p>Sort field는 source field ID, transform, ASC/DESC, NULLS FIRST/LAST를 가진다. Source name rename 뒤에도 ID identity는 유지된다. 새 transform을 모르는 V3 reader는 안전한 read를 위해 그 order를 optimization에 사용하지 않아야 하며, 모르는 writer가 그 transform으로 file을 썼다고 선언해서도 안 된다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단 기준</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Hash 선택</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Partitioned append의 기본 후보다. 같은 partition row를 모아 file 수를 제어한다. 단, partition skew가 크면 hot task를 따로 측정한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Range 선택</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Sort-key range pruning과 compression 이익이 반복 shuffle·sampling 비용보다 큰 대용량 batch에 사용한다. Query scan bytes 전후로 판단한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>None 선택</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Upstream clustering을 계획으로 증명하거나 fanout의 memory/FD 한계를 부하 시험한 경우에만 사용한다. “Shuffle이 비싸다”만으로 켜지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>File size</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Target property와 AQE advisory size를 함께 조절하고 median/p95 file bytes, files/partition, task input bytes와 compression ratio를 같이 본다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Sort key</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Frequent selective predicate, join/locality, cardinality와 skew를 수치화한다. Bounds overlap·scanned files 감소가 없으면 비싼 order를 유지하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Operation 분리</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Insert뿐 아니라 delete/update/merge distribution property를 따로 검토한다. MOR delete file layout과 COW rewrite 비용은 append와 다르다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>관측</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Shuffle bytes/time, skewed tasks, open handles, files/partition, file-size p50/p95, bounds overlap, scan bytes, sort_order_id 분포와 commit retry를 dashboard에 둔다.</td></tr>
+  </table>
+  <p><strong>Engine/version 차이:</strong> Apache Iceberg Spark 문서 기준으로 1.2.0부터 Spark write는 기본적으로 <code>hash</code> distribution을 요청한다. Spark 3.5.0 이전 CTAS/RTAS는 distribution mode를 지키지 않았다. 현재 Spark DDL은 <code>WRITE ORDERED BY</code>, <code>WRITE LOCALLY ORDERED BY</code>, <code>WRITE UNORDERED</code>와 partition distribution을 제공하지만 다른 engine의 DDL·writer 지원은 별도로 검증한다.</p>
+  <p><strong>설정 우선순위:</strong> Spark에서는 write DataSource option이 session config보다, session config가 table property보다 우선한다. Table property만 보고 실제 plan을 단정하지 말고 job option과 runtime config를 함께 수집한다.</p>
+  <p><strong>Anti-pattern:</strong> Default sort order가 있으니 모든 file과 query output이 정렬됐다고 가정하거나, target file size만 크게 올리면 small file이 해결된다고 믿는 것이다.</p>
+  <p><strong>Edge case:</strong> Streaming writer가 expensive range sort를 생략하거나 old order ID로 계속 쓸 수 있다. Correctness는 유지될 수 있지만 bounds 품질은 악화되므로 scheduled rewrite와 writer refresh 기준이 필요하다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Sort order 또는 distribution 변경 뒤 작은 file, write OOM/skew, query scan 회귀가 발생했다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Files/partition 급증, p50 file size 급락, fanout OOM·too many open files, 한 task만 지연, shuffle 폭증, bounds overlap·scan bytes 증가, engine별 layout 차이, sort_order_id 0/old ID 비율 증가.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata location·snapshot, sort-orders/default ID, files의 partition·size·record count·sort_order_id·bounds, manifest/sequence, physical write plan, shuffle/AQE/task bytes, compression ratio, open FD·memory, engine/connector version, job/session/table과 operation별 properties.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Unclustered input에 none, fanout handle 폭증, hot partition의 hash skew, range sample 부정확, AQE advisory가 너무 작음, target-size 오해, CTAS/connector가 order를 무시, streaming old order, mixed files 미정리, maintenance와 concurrent write race.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Affected writer/rewrite를 멈추고 snapshot과 plan·file sample을 보존한다. Known-good mode로 작은 canary batch를 쓰고 commit 전후 metrics를 비교한다. Uncommitted file은 직접 지우지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Distribution property와 default order를 이전 값으로 되돌리고 known-good connector를 사용한다. 잘못 배치됐지만 유효한 file은 검증된 rewrite로 일부 group씩 교체한다. Membership가 잘못된 경우에만 catalog-supported snapshot rollback을 쓴다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON·sort order ID·manifest bounds를 수동 수정하지 않는다. Raw file을 이동·삭제하지 않는다. 증거 없이 전체 rewrite, snapshot expiration, orphan cleanup이나 무제한 fanout을 실행하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> Range+sort write와 none+unordered write를 같은 table에서 만들고 file의 order ID·크기·bounds와 query plan을 비교한다. 작은 로컬 data라 성능 수치보다 metadata state transition과 실패 경계를 관찰한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>Range+<code>user_id</code> order에서 file bounds overlap이 unordered보다 작을지 먼저 적는다.</li>
+    <li><code>write.target-file-size-bytes=134217728</code>이면 작은 input도 128MiB file이 되는지 예측한다.</li>
+    <li>Sort order를 제거해도 기존 sorted file의 <code>sort_order_id</code>가 바뀌는지 예측한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Range+sort write</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day19;
+DROP TABLE IF EXISTS local.day19.sort_lab PURGE;
+CREATE TABLE local.day19.sort_lab (
+  id BIGINT,
+  user_id BIGINT,
+  event_time TIMESTAMP,
+  payload STRING
+) USING iceberg
+PARTITIONED BY (days(event_time));
+
+ALTER TABLE local.day19.sort_lab
+  WRITE ORDERED BY user_id ASC NULLS LAST, event_time ASC;
+ALTER TABLE local.day19.sort_lab SET TBLPROPERTIES (
+  'write.distribution-mode'='range',
+  'write.target-file-size-bytes'='134217728'
+);
+
+INSERT INTO local.day19.sort_lab
+SELECT id,
+       CASE WHEN id % 10 &lt; 8 THEN 1 ELSE id % 100 END,
+       CAST(from_unixtime(
+         unix_timestamp('2026-08-20 00:00:00') + (id % 259200)
+       ) AS TIMESTAMP),
+       repeat('x', 50)
+FROM range(0, 20000);
+
+SELECT file_path, partition, record_count,
+       file_size_in_bytes, sort_order_id
+FROM local.day19.sort_lab.files
+ORDER BY partition, file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Data files는 non-zero order ID를 선언한다. 작은 input과 task 크기 때문에 실제 file은 128MiB보다 훨씬 작다. 한 file은 Iceberg partition 경계를 넘지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Metadata와 plan 읽기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DESCRIBE TABLE EXTENDED local.day19.sort_lab;
+
+SELECT file_path, sort_order_id, readable_metrics
+FROM local.day19.sort_lab.files
+ORDER BY file_path;
+
+EXPLAIN EXTENDED
+SELECT count(*) FROM local.day19.sort_lab
+WHERE user_id BETWEEN 20 AND 30
+  AND event_time &gt;= TIMESTAMP '2026-08-20 00:00:00'
+  AND event_time &lt; TIMESTAMP '2026-08-21 00:00:00';
+&quot;
+
+# metadata_log_entries의 마지막 committed metadata URI를 사용해 확인한다.
+LATEST_METADATA=$(find warehouse/day19/sort_lab/metadata \
+  -type f -name '*.metadata.json' | sort | tail -n 1)
+jq '{
+  default_sort_order_id: .&quot;default-sort-order-id&quot;,
+  sort_orders: .&quot;sort-orders&quot;,
+  properties: .properties
+}' &quot;$LATEST_METADATA&quot;</pre>
+  <p><strong>예상 관찰:</strong> Metadata JSON의 default order와 file의 order ID가 연결된다. <code>readable_metrics</code>에서 user_id lower/upper bound를 비교한다. Metadata filename lexicographic 정렬은 실무에서 신뢰하지 말고 committed log URI를 우선한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · None+unordered</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day19.sort_lab
+  SET TBLPROPERTIES ('write.distribution-mode'='none');
+ALTER TABLE local.day19.sort_lab WRITE UNORDERED;
+
+INSERT INTO local.day19.sort_lab
+SELECT 20000 + id,
+       CASE WHEN id % 10 &lt; 8 THEN 1 ELSE id % 100 END,
+       CAST(from_unixtime(
+         unix_timestamp('2026-08-20 00:00:00') + ((id * 7919) % 259200)
+       ) AS TIMESTAMP),
+       repeat('y', 50)
+FROM range(0, 20000)
+ORDER BY rand(42);
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Engine/writer 설정에 따라 unclustered partition sequence를 거부하거나, fanout이 켜져 있으면 더 많은 작은 file/open handle을 만들 수 있다. Commit이 성공해도 새 file은 order ID 0이며 query correctness는 유지된다. Commit이 실패하면 catalog pointer와 row count는 이전 snapshot 그대로여야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · 비교와 복구</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT sort_order_id,
+       count(*) AS files,
+       min(file_size_in_bytes) AS min_bytes,
+       CAST(avg(file_size_in_bytes) AS BIGINT) AS avg_bytes,
+       max(file_size_in_bytes) AS max_bytes
+FROM local.day19.sort_lab.files
+GROUP BY sort_order_id ORDER BY sort_order_id;
+
+SELECT committed_at, snapshot_id, operation, summary
+FROM local.day19.sort_lab.snapshots ORDER BY committed_at;
+
+ALTER TABLE local.day19.sort_lab
+  WRITE ORDERED BY user_id ASC NULLS LAST, event_time ASC;
+ALTER TABLE local.day19.sort_lab
+  SET TBLPROPERTIES ('write.distribution-mode'='range');
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 기존 non-zero order file은 metadata default를 다시 바꾸어도 그대로 남고, 성공한 unordered batch만 ID 0으로 공존한다. 복구는 future writes의 policy를 되돌릴 뿐 old file을 자동 rewrite하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>WRITE ORDERED BY parse 오류:</strong> Iceberg Spark SQL extensions와 catalog 설정을 <code>make smoke</code>로 확인한다.</li>
+    <li><strong><code>readable_metrics</code>가 없음:</strong> <code>DESCRIBE local.day19.sort_lab.files</code>로 connector version의 metadata table schema를 확인하고 lower/upper bounds field를 사용한다.</li>
+    <li><strong>None insert가 실패:</strong> 의도한 실패 경계다. Error·physical plan과 pointer snapshot을 보존하고 range로 복구한다. Fanout을 무작정 켜지 않는다.</li>
+    <li><strong>File이 너무 작음:</strong> 작은 lab input과 task size가 원인이다. Target만 올리지 말고 AQE/task input/compression을 함께 본다.</li>
+    <li><strong>File 수가 실행마다 다름:</strong> Spark AQE와 core 수가 영향을 준다. 절대값 대신 order ID, bounds overlap, p50/p95를 비교한다.</li>
+    <li><strong>Query 결과가 정렬되지 않음:</strong> 정상이다. 결과 순서가 필요하면 query에 <code>ORDER BY</code>를 쓴다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day19.sort_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day19;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Staged/unreferenced file을 raw storage에서 직접 지우지 않고 catalog table lifecycle로 정리한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Table sort order는 query output order다.</strong> 물리 write layout hint이며 SQL 결과에는 별도 <code>ORDER BY</code>가 필요하다.</li>
+    <li><strong>Default order가 모든 file에 적용된다.</strong> Old·streaming·unsorted file은 다른 ID로 공존할 수 있다.</li>
+    <li><strong>Range와 sort는 같은 개념이다.</strong> Range는 task 배치, sort order는 file layout 계약이다.</li>
+    <li><strong>Hash면 skew가 사라진다.</strong> Hot partition은 한쪽으로 몰릴 수 있다.</li>
+    <li><strong>None은 shuffle을 없애므로 항상 싸다.</strong> Small files, fanout memory/FD, writer failure로 비용이 이동한다.</li>
+    <li><strong>Target file size가 결과 file size다.</strong> Task input과 compression이 상한을 결정한다.</li>
+    <li><strong>Sort order 변경은 old file을 재정렬한다.</strong> Metadata-only이며 rewrite는 별도 commit이다.</li>
+    <li><strong>Table property가 실제 설정이다.</strong> Job option과 session config가 override할 수 있다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문 3개</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>일 20TB event table의 sort key와 distribution mode를 설계하라.</strong><br>좋은 답변 구조: Query/ingest SLO와 selectivity 수치 → partition·sort 역할 분리 → hash/range 비용 모델 → skew·AQE·target size → COW/MOR 영향 → canary 지표 → rollback·대안.</li>
+    <li><strong>Target 512MB인데 p50 file이 90MB인 원인을 설명하라.</strong><br>좋은 답변 구조: File≤task≤partition 경계 → in-memory task bytes와 compressed bytes → AQE advisory → distribution/skew → evidence 수집 → 안전한 tuning 순서 → compaction trade-off.</li>
+    <li><strong>Sort order 변경 후 query가 느려졌지만 결과는 맞다. 어떻게 진단할까?</strong><br>좋은 답변 구조: Metadata default와 per-file ID 구분 → bounds overlap/scan bytes → mixed/streaming files → engine pruning 지원 → shuffle/write 비용 → targeted rewrite와 rollback → SQL ORDER BY와의 차이.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Partition evolution 뒤 reader가 current default spec 하나만 사용하면 왜 old row를 누락할 수 있는가?</li>
+    <li>Manifest 하나가 여러 partition spec의 file을 섞을 수 없는 이유는?</li>
+    <li>Spec update와 data rewrite가 별도 state transition이어야 하는 이유는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Manifest의 spec ID마다 transform·tuple schema가 달라 default로 오해하면 pruning false negative가 난다. <strong>Spec별 projection+residual</strong>을 말하면 정답.</li>
+      <li>Manifest partition tuple struct와 summary schema가 한 spec에서 유도되기 때문이다. <strong>Spec ID/tuple schema</strong>를 함께 말하면 정답.</li>
+      <li>Metadata-only evolution으로 old file을 보존해 atomic rollout하고, rewrite는 별도 snapshot/CAS로 비용·failure window를 격리한다. <strong>공개 시점과 비용 분리</strong>를 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>Sort order와 write distribution은 각각 어떤 상태를 소유하는가?</li>
+    <li>Target file size를 올렸는데 file이 커지지 않을 수 있는 두 이유는?</li>
+    <li><code>none</code> mode의 안전한 전제와 대표 failure mode는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Sort order는 metadata의 file layout 의도와 order ID, distribution은 engine의 row→task exchange plan이다. <strong>Data/control path 분리</strong>가 핵심.</li>
+      <li>Task input이 target보다 작고, AQE memory bytes가 Parquet 압축 후 더 작아진다. Partition 경계·skew도 인정. <strong>File≤task와 compression</strong>을 말하면 정답.</li>
+      <li>Upstream clustering이 증명되거나 fanout 한계를 검증해야 한다. Unclustered input은 writer rejection, small files, OOM/FD 고갈을 낳을 수 있다. <strong>전제+실패 하나</strong>를 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#sorting" style="color:#0b6f85;">Apache Iceberg Table Spec · Sorting</a> — order ID, sort field, unsorted와 file-level ID.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-writes/#writing-distribution-modes" style="color:#0b6f85;">Apache Iceberg Spark Writes · Distribution Modes</a> — none/hash/range, AQE와 file size.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-ddl/#alter-table-write-order" style="color:#0b6f85;">Apache Iceberg Spark DDL · Write Order</a> — ordered/local/unordered와 distribution DDL.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/configuration/#write-properties" style="color:#0b6f85;">Apache Iceberg Configuration · Write Properties</a> — distribution과 target file size properties.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:9px;">
+    <strong style="color:#8ee7f6;">Day 20 · 랩: old/new spec query planning</strong><br>
+    여러 partition spec과 sort order가 공존하는 snapshot에서 planner가 predicate를 spec별로 투영하고 candidate file을 합치는 과정을 metadata table과 실행 계획으로 끝까지 추적한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
