@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 20</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 3 / DAY 20 · 통합 랩</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">랩: old/new spec query planning</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Schema·Partition·Sort Evolution · 예상 학습 30분 + 실습 40분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Mixed-spec scan은 하나의 logical predicate를 manifest의 spec ID마다 안전한 partition predicate로 따로 투영하고, 후보 file을 합친 뒤 metrics·residual·delete applicability를 적용한다. Current spec 하나로 old file을 해석하면 빠른 오답이 된다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Logical predicate</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">사용자가 원본 column에 작성한 조건이다. 예: <code>event_time &gt;= 12:00 AND event_time &lt; 13:00</code>.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Predicate projection</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">원본 조건을 partition transform의 값 조건으로 바꾸는 과정이다. Day spec과 hour spec은 서로 다른 결과를 만든다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Inclusive projection</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">정답일 가능성이 있는 partition을 모두 포함하는 보수적 투영이다. False positive는 허용하지만 false negative는 금지한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Split planning</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Spec별로 manifest와 file 후보를 고른 뒤 실제 scan task로 묶는 control-path 작업이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Manifest summary</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Manifest list에 있는 partition field의 lower/upper bound와 null 정보다. Manifest를 열기 전에 건너뛸 근거다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Residual</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Partition pruning만으로 확정하지 못한 원본 조건이다. Data path에서 row 또는 file-format index에 다시 적용한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Pinned snapshot</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Reader가 scan 시작 때 고정한 immutable table state다. Concurrent commit은 refresh하기 전 이 scan에 섞이지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Unified partition struct</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Metadata table이 모든 spec의 partition field를 ID 순으로 합친 관찰용 struct다. 특정 spec에 없는 field는 null일 수 있다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Day partition에서 hour partition으로 바꾸면 old data는 day layout, new data는 hour layout으로 남는다. 사용자는 계속 <code>event_time</code>만 filter한다. 이 추상화가 안전하려면 planner가 물리 partition column을 current layout 하나로 단정하지 않아야 한다.</p>
+  <p>12시 한 시간을 찾는 조건은 old day spec에서는 “그 날짜 전체”라는 넓은 후보를, new hour spec에서는 “정확히 12시”라는 좁은 후보를 만든다. Old spec은 더 많이 읽을 수 있지만 row를 놓치지 않는다. 반대로 current hour field가 null인 old file을 제외하면 빠르지만 id 1 같은 정답 row를 영원히 잃는다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>Planner의 correctness 불변식:</strong> 후보 집합은 실제 정답 file 집합의 superset이어야 한다. Partition·manifest·file pruning 단계 어느 곳에서도 false negative를 만들면 안 되며, 불확실하거나 transform을 모르면 그 단계의 pruning을 포기한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog pointer → metadata JSON</strong><br><span style="font-size:14px;color:#cdebf0;">snapshot 102 pin · specs [0=day, 1=hour] · default=1</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ snapshot 102의 manifest list</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② Manifest A · spec 0</strong><br><span style="font-size:14px;">12:00–13:00 → day=2026-08-21 · coarse candidate</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↘ summary → manifest entries → file metrics</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>③ Manifest B · spec 1</strong><br><span style="font-size:14px;">12:00–13:00 → hour=2026-08-21 12 · precise candidate</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↗ summary → manifest entries → file metrics</td></tr>
+    <tr><td style="background:#f7fafb;text-align:center;padding:13px;border:1px solid #cbd7dc;border-radius:8px;"><strong>④ Spec별 candidate union</strong><br><span style="font-size:14px;">sort-order bounds · sequence · COW/MOR delete/DV applicability</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ data/delete file read + residual</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Logical result</strong><br><span style="font-size:14px;color:#cdebf0;">old hit + new hit · snapshot 102 기준 일관된 결과</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li>Reader가 catalog에서 metadata location을 받아 immutable metadata JSON을 읽고 current snapshot 102를 pin한다. 이 순간 scan의 table membership root가 정해진다.</li>
+    <li>Metadata의 <code>partition-specs</code> 전체와 snapshot의 manifest list를 읽는다. 각 manifest entry의 <code>partition_spec_id</code>는 반드시 그 목록의 spec을 가리킨다.</li>
+    <li>Logical time predicate를 spec 0의 <code>day(event_time)</code>, spec 1의 <code>hour(event_time)</code>에 각각 inclusive projection한다. Current <code>default-spec-id</code>를 old manifest 해석에 재사용하지 않는다.</li>
+    <li>각 spec의 transform type으로 manifest partition summary를 decode해 manifest를 줄이고, surviving manifest만 열어 partition tuple과 field metrics로 file을 줄인다.</li>
+    <li>Day projection은 12시 밖의 old row가 든 file을 포함할 수 있다. 이것은 안전한 false positive이며 원본 <code>event_time</code> residual이 data read에서 제거한다.</li>
+    <li>Spec별 candidate를 union하고 data/delete file의 partition, path, sequence를 비교해 equality/position delete 또는 지원되는 DV를 연결한다.</li>
+    <li>Query 중 writer가 snapshot 103을 commit해도 pinned snapshot 102 scan에는 섞이지 않는다. 다음 refresh부터 새 pointer와 manifest list를 읽는다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Writer와 maintenance가 동시에 움직일 때</h3>
+  <ol style="padding-left:22px;">
+    <li>Writer는 base metadata를 읽고 current default spec으로 data file과 새 manifest를 준비한다.</li>
+    <li>Rewrite는 old spec file을 new spec layout으로 다시 쓸 수 있지만, 새 snapshot CAS 전 old file은 여전히 current membership이다.</li>
+    <li>Commit conflict가 나면 최신 metadata에서 file/partition conflict를 validation한 뒤 새 manifest list로 재시도한다. Prepared object의 존재는 성공 증거가 아니다.</li>
+    <li>CAS 성공이 새 state의 linearization point다. Old snapshot reader가 끝나기 전에 expiration/orphan cleanup으로 old file을 지우면 isolation을 storage layer에서 깨므로 retention safety window가 필요하다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">계층</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">소유 상태 · 불변식 · 실패 경계</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Catalog</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Current metadata pointer와 atomic replace를 소유한다. Read 시작 뒤 outage가 나도 이미 pin한 object가 있으면 진행할 수 있지만 refresh/commit은 막힐 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Metadata JSON</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Schema/spec/sort history와 snapshot refs를 소유한다. Default spec은 새 write의 기본이지 모든 file의 physical schema가 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Manifest list</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot의 manifest membership, spec ID, counts, partition summaries와 sequence를 소유한다. Summary가 불충분하면 manifest를 읽어야 한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Manifest</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">한 spec의 data 또는 delete file entry만 저장한다. Tuple schema가 spec에서 유도되므로 서로 다른 spec file을 섞을 수 없다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>File metrics</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Field ID별 bounds/count를 소유한다. Sort order가 좋으면 bounds overlap이 줄지만 missing/truncated metrics에서는 보수적으로 포함한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Data/delete path</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Residual과 delete applicability가 최종 row correctness를 만든다. Data sequence·file path·spec/partition 관계를 current default로 덮어쓰지 않는다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">왜 coarse projection이 안전한가</h3>
+  <p>Hour 범위를 day transform에 투영하면 날짜 하나가 선택된다. 그 날짜의 old file에는 11시·13시 row도 섞일 수 있으므로 더 읽지만 12시 정답은 모두 포함한다. Partition pruning은 증명 가능한 “없음”만 제거하고, 원본 predicate residual이 마지막 정확성을 담당한다. 이 두 단계 분리는 approximate index와 exact verification을 결합하는 전형적인 CS 패턴이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Unknown transform과 version 경계</h3>
+  <p>Reader가 partition transform을 모르면 그 field를 file filtering에 사용하지 않는 것이 안전하다. Table Spec은 v1/v2에서 이를 권고하고 v3에서는 요구한다. Writer는 모르는 transform이 든 spec으로 data를 commit해서는 안 된다. 즉 multi-engine 호환성의 최소값은 “table을 열 수 있음”이 아니라 “모든 active spec을 안전하게 project하고 residual을 유지함”이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Planning 비용</h3>
+  <p>Metadata-only evolution은 즉시 rewrite 비용을 피하지만 active spec과 manifest 수가 늘어 projection·summary decode·manifest open 비용이 커질 수 있다. Planning latency는 대략 “spec별 projection + 읽은 manifest 수 + candidate file 수”에 비례한다. Manifest rewrite와 data rewrite는 correctness가 아니라 이 fan-out을 줄이는 후속 최적화다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:30%;">판단 기준</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Best practice와 이유</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Reader gate</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Evolution 전 production engine별 old/new spec fixture와 expected row set을 실행한다. DDL 지원보다 spec-aware read correctness를 먼저 검증한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Planner 관측</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot/spec별 manifest 수, skipped/read manifests, candidate/scanned files, planning latency p95, residual과 scan bytes를 남긴다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Evolution rollout</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Compatibility canary → metadata-only default 전환 → writer spec ID 분포 → mixed scan comparison → 필요한 범위만 rewrite 순서로 진행한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Rewrite 기준</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Old-spec scan bytes·manifest fan-out이 SLO를 넘을 때만 targeted rewrite한다. “Spec이 두 개”라는 이유만으로 full rewrite하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Cache</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Metadata location/snapshot ID를 cache key에 포함하고 refresh 경계를 명시한다. Current spec만 갱신하고 manifest cache를 재사용하는 partial refresh를 피한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Storage/catalog</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Pointer와 object read failure를 구분한다. Retry는 immutable object GET에 한정하고, pointer가 바뀌었다고 pinned scan 중간에 snapshot을 섞지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Maintenance race</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Long reader·streaming writer 최대 수명보다 긴 retention을 두고 snapshot expiration과 orphan cleanup을 분리한다.</td></tr>
+  </table>
+  <p><strong>Engine/version 차이:</strong> Apache Iceberg 1.11.0 Spark 문서는 <code>files</code>, <code>manifests</code>, <code>all_manifests</code> 등 metadata table을 제공한다. Column 노출과 <code>EXPLAIN</code> 표현은 Spark/connector 버전에 따라 달라질 수 있다. V1의 historical partition field-ID 할당은 multi-spec unified struct에서 type 충돌 위험이 있어 v2/v3보다 보수적으로 검증한다.</p>
+  <p><strong>Anti-pattern:</strong> Warehouse directory를 listing해 path 이름으로 day/hour를 추측하거나, metadata table의 current hour field가 null인 row를 “old garbage”로 제거하는 custom planner다.</p>
+  <p><strong>Edge case:</strong> Rewrite가 old spec file을 new spec file로 교체하는 동안 pinned reader는 old manifest를 계속 읽는다. 새 file이 보인다는 이유로 old object를 조기 삭제하면 metadata isolation은 맞아도 실제 read가 실패한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Partition evolution 후 특정 시간대 row가 누락되거나 planning latency가 급증했다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Old 구간만 누락, engine별 count 불일치, 특정 predicate에서 0건, manifest/file read 수·planning p95 증가, object 404, rewrite 중 intermittent failure, delete 후 old row 재출현.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog metadata location, pinned/current snapshot ID, partition-specs/default ID, manifest list의 spec ID·summaries·counts·sequence, manifest tuple/entry status, files spec_id·partition·bounds·sort_order_id, residual/physical plan, engine version/cache age, object GET error, rewrite/expire/orphan commit 전후.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Default spec만 적용, unified struct null을 제외, transform/bound decode 오류, stale partial cache, overly strict projection, unknown transform 오처리, deleted manifest entry 포함, delete sequence/spec 적용 오류, manifest fan-out, object 조기 삭제, catalog/object storage 일시 장애.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Affected rewrite/cleanup과 spec 변경을 멈추고 snapshot을 pin한다. Spec별 manifest/file sample과 plan을 보존한다. 문제 pruning을 보수적으로 끈 full scan 결과를 known-good reader와 비교하고 immutable object GET만 제한 재시도한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Known-good connector와 이전 default spec으로 future writes를 복구한다. Missing object는 versioned backup/replica에서 같은 URI로 복원하고, 잘못된 membership은 catalog-supported retained snapshot rollback 또는 compensating commit으로 고친다. 검증된 group만 rewrite한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON의 spec ID·manifest path·bounds를 수동 편집하지 않는다. Raw file 이동/삭제, pointer 강제 교체, snapshot expiration/orphan cleanup, 증거 없는 전체 rewrite나 blind commit retry를 실행하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 40분 재현 실습</h2>
+  <p><strong>목표:</strong> Day와 hour spec file을 한 snapshot에 공존시키고, 12시·user 42 query가 old/new hit를 모두 반환함을 metadata tree와 plan으로 증명한다. Current hour field만 보는 잘못된 planner의 false negative도 안전하게 재현한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>Hour query가 old day file과 new hour file 중 몇 개를 후보로 잡을지 먼저 그린다.</li>
+    <li>Actual row 결과가 id 1과 4를 모두 포함하는지 예측한다.</li>
+    <li><code>partition.event_time_hour IS NOT NULL</code>만 사용한 naive candidate가 어느 file을 놓치는지 적는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Old day-spec file과 기준 snapshot</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day20;
+DROP TABLE IF EXISTS local.day20.plan_lab PURGE;
+CREATE TABLE local.day20.plan_lab (
+  id BIGINT,
+  user_id BIGINT,
+  event_time TIMESTAMP,
+  note STRING
+) USING iceberg
+PARTITIONED BY (days(event_time));
+
+INSERT INTO local.day20.plan_lab VALUES
+  (1, 42, TIMESTAMP '2026-08-21 12:05:00', 'old-hit'),
+  (2,  7, TIMESTAMP '2026-08-21 12:15:00', 'old-other-user'),
+  (3, 42, TIMESTAMP '2026-08-21 13:05:00', 'old-outside');
+
+SELECT committed_at, snapshot_id, operation
+FROM local.day20.plan_lab.snapshots ORDER BY committed_at;
+SELECT spec_id, partition, sort_order_id, file_path, record_count
+FROM local.day20.plan_lab.files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Old file은 spec 0, day partition, sort order 0을 가진다. 기준 snapshot ID를 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Hour spec과 sorted new file</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;"># 먼저 DESCRIBE에서 auto-generated partition field name을 확인한다.
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DESCRIBE TABLE EXTENDED local.day20.plan_lab;
+ALTER TABLE local.day20.plan_lab
+  REPLACE PARTITION FIELD event_time_day
+  WITH hours(event_time) AS event_time_hour;
+ALTER TABLE local.day20.plan_lab
+  WRITE ORDERED BY user_id ASC NULLS LAST, event_time ASC;
+
+INSERT INTO local.day20.plan_lab VALUES
+  (4, 42, TIMESTAMP '2026-08-21 12:25:00', 'new-hit'),
+  (5,  7, TIMESTAMP '2026-08-21 12:35:00', 'new-other-user'),
+  (6, 42, TIMESTAMP '2026-08-21 13:25:00', 'new-outside');
+&quot;
+
+# event_time_day가 실제 이름과 다르면 metadata에 기록된 정확한 이름을 쓴다.</pre>
+  <p><strong>예상 관찰:</strong> Spec update 자체는 data snapshot을 만들거나 old file을 rewrite하지 않는다. New insert 뒤 current snapshot은 spec 0/order 0 file과 spec 1/non-zero order file을 함께 참조한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Metadata tree와 mixed-spec query</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT partition_spec_id, path,
+       added_data_files_count, existing_data_files_count,
+       partition_summaries
+FROM local.day20.plan_lab.all_manifests
+ORDER BY partition_spec_id, path;
+
+SELECT spec_id, partition, sort_order_id,
+       file_path, record_count, readable_metrics
+FROM local.day20.plan_lab.files
+ORDER BY spec_id, file_path;
+
+EXPLAIN EXTENDED
+SELECT id, user_id, event_time, note
+FROM local.day20.plan_lab
+WHERE event_time &gt;= TIMESTAMP '2026-08-21 12:00:00'
+  AND event_time &lt;  TIMESTAMP '2026-08-21 13:00:00'
+  AND user_id = 42;
+
+SELECT id, user_id, event_time, note
+FROM local.day20.plan_lab
+WHERE event_time &gt;= TIMESTAMP '2026-08-21 12:00:00'
+  AND event_time &lt;  TIMESTAMP '2026-08-21 13:00:00'
+  AND user_id = 42
+ORDER BY id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> <code>all_manifests</code>에서 spec 0/1이 보이고 files의 partition struct에는 day/hour field가 공존한다. Data query는 반드시 id 1(<code>old-hit</code>)과 id 4(<code>new-hit</code>)를 반환한다. <code>EXPLAIN</code>의 세부 표현은 버전별로 달라도 pushed data filter와 mixed file 증거를 함께 보관한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Metadata JSON으로 control path 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT latest_snapshot_id, latest_schema_id, latest_sequence_number,
+       file
+FROM local.day20.plan_lab.metadata_log_entries
+ORDER BY timestamp DESC LIMIT 3;
+&quot;
+
+# 위 query의 최신 committed file URI를 LOCAL path로 바꿔 지정한다.
+LATEST_METADATA='warehouse/day20/plan_lab/metadata/00000-example.metadata.json'
+jq '{
+  current_snapshot_id: .&quot;current-snapshot-id&quot;,
+  default_spec_id: .&quot;default-spec-id&quot;,
+  partition_specs: .&quot;partition-specs&quot;,
+  default_sort_order_id: .&quot;default-sort-order-id&quot;,
+  sort_orders: .&quot;sort-orders&quot;
+}' &quot;$LATEST_METADATA&quot;</pre>
+  <p><strong>예상 관찰:</strong> Metadata에는 old/new spec과 sort order history가 보이고 default는 future write 기준이다. Filename 정렬로 최신 JSON을 추측하지 말고 catalog 또는 <code>metadata_log_entries</code>의 committed URI를 사용한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · Current hour field만 보는 naive planner</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;"># 실제 Iceberg scan을 망가뜨리지 않고 metadata table에서 잘못된 후보 선정을 모사한다.
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT spec_id, partition, file_path
+FROM local.day20.plan_lab.files
+WHERE partition.event_time_hour IS NOT NULL
+ORDER BY spec_id, file_path;
+
+SELECT spec_id, partition, file_path
+FROM local.day20.plan_lab.files
+ORDER BY spec_id, file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 첫 query는 current hour field가 없는 spec 0 file을 제외한다. 이를 actual scan candidate로 쓰면 id 1이 누락된다. 두 번째 query처럼 먼저 spec별로 group하고 각 transform에 맞는 predicate를 적용해야 한다. Field name이 다르면 <code>DESCRIBE local.day20.plan_lab.files</code>에서 unified struct field를 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>REPLACE field 이름 오류:</strong> <code>DESCRIBE TABLE EXTENDED</code>와 metadata JSON의 exact partition field name을 사용한다.</li>
+    <li><strong><code>all_manifests</code> column 차이:</strong> Connector version의 metadata table schema를 <code>DESCRIBE</code>하고 동일 의미 field로 바꾼다.</li>
+    <li><strong>Unified struct field가 없음:</strong> Query engine이 old/new field union을 어떻게 노출하는지 확인한다. Raw tuple position을 직접 비교하지 않는다.</li>
+    <li><strong>EXPLAIN에 두 branch가 안 보임:</strong> Planner 내부 projection이 항상 text plan에 모두 노출되지는 않는다. Manifest spec ID, file set, 결과 row를 함께 증거로 쓴다.</li>
+    <li><strong>id 1 또는 4 누락:</strong> Snapshot/spec ID, manifest summary, candidate files와 residual을 보존하고 pruning을 끈 known-good reader와 비교한다.</li>
+    <li><strong>Metadata URI 404:</strong> Catalog pointer와 object URI를 먼저 기록하고 retry budget 안에서 immutable GET만 재시도한다. 다른 JSON을 임의로 current로 선택하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day20.plan_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day20;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Manifest나 data file을 개별 삭제하지 않고 catalog table lifecycle로 정리한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Default spec은 read schema다.</strong> 새 writer의 기본이며 manifest는 자기 spec ID로 읽는다.</li>
+    <li><strong>Projection은 exact filter여야 한다.</strong> Coarse transform에서는 safe superset과 residual 조합이 정답이다.</li>
+    <li><strong>Unified partition struct의 null은 file 무효다.</strong> 해당 spec에 그 field가 없다는 뜻일 수 있다.</li>
+    <li><strong>Manifest summary만 읽으면 항상 충분하다.</strong> Summary가 match 가능하면 manifest entry까지 내려가야 한다.</li>
+    <li><strong>Sort order가 query correctness를 보장한다.</strong> Bounds pruning을 돕지만 residual·delete path를 대체하지 않는다.</li>
+    <li><strong>Unknown transform은 오류로 file을 버린다.</strong> 안전한 read는 그 field의 pruning을 무시한다.</li>
+    <li><strong>Concurrent commit을 scan 중간에 refresh한다.</strong> Pinned snapshot을 끝까지 사용해야 isolation이 유지된다.</li>
+    <li><strong>Rewrite commit 후 old object를 즉시 지운다.</strong> Old snapshot reader와 retention race를 먼저 해소해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문 3개</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Day→hour evolution 중 12시 query planner를 설계하라.</strong><br>좋은 답변 구조: Query/SLO 수치 → catalog·snapshot pin → manifest spec ID → spec별 inclusive projection → summary/file metrics → candidate union·residual → delete sequence → failure window·rollback.</li>
+    <li><strong>Current spec field가 null인 old file을 제외해도 되는가?</strong><br>좋은 답변 구조: Unified struct의 의미 → old spec tuple schema → concrete false-negative row → default/write vs read 책임 → conservative fallback → multi-engine test gate.</li>
+    <li><strong>Evolution 뒤 planning p95가 4배가 됐다. 무엇을 측정하고 바꿀까?</strong><br>좋은 답변 구조: Spec/manifest/file 수와 selectivity → summary/bounds overlap → cache/object GET → small manifest·mixed layout → targeted manifest/data rewrite → concurrent reader safety → 비용·rollback 대안.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Sort order와 write distribution은 각각 어떤 상태를 소유하는가?</li>
+    <li><code>write.target-file-size-bytes</code>를 올려도 file이 커지지 않는 이유 두 가지는?</li>
+    <li><code>none</code> distribution의 안전한 전제와 대표 failure mode는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Sort order는 metadata/file layout 의도와 order ID, distribution은 engine의 row→task exchange plan이다. <strong>Data/control path 분리</strong>를 말하면 정답.</li>
+      <li>Task input이 target보다 작고 AQE memory bytes가 압축 후 더 작아진다. Partition 경계·skew도 인정. <strong>File≤task와 compression</strong>이 핵심.</li>
+      <li>Upstream clustering이 증명되거나 fanout 한계를 검증해야 한다. 위반 시 writer rejection, small files, OOM/FD 고갈이 가능하다. <strong>전제+실패</strong>를 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>12시 한 시간 predicate가 day spec과 hour spec에서 각각 어떤 후보를 만드는가?</li>
+    <li>Manifest 하나가 여러 partition spec의 file을 섞을 수 없는 이유는?</li>
+    <li>Planning 중 unknown transform을 만났을 때 안전한 reader 동작은?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Day spec은 그 날짜 전체라는 coarse superset, hour spec은 12시 hour라는 precise candidate를 만든다. <strong>Spec별 projection+residual</strong>을 말하면 정답.</li>
+      <li>Manifest partition tuple struct와 summary schema가 한 spec에서 유도되기 때문이다. <strong>Spec ID와 tuple schema</strong>가 핵심.</li>
+      <li>그 field를 pruning에 사용하지 않고 file을 보수적으로 포함해 residual에서 검증한다. <strong>False negative 금지</strong>를 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/evolution/#partition-evolution" style="color:#0b6f85;">Apache Iceberg · Partition evolution</a> — old/new layout coexistence와 split planning.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/#metadata-tables" style="color:#0b6f85;">Apache Iceberg Spark Queries · Metadata tables</a> — files, manifests, all_manifests 관찰.</li>
+    <li><a href="https://iceberg.apache.org/spec/#partitioning" style="color:#0b6f85;">Apache Iceberg Table Spec · Partitioning</a> — transform과 logical→partition predicate.</li>
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#0b6f85;">Apache Iceberg Table Spec · Scan Planning</a> — manifest summary, file selection과 delete planning.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:9px;">
+    <strong style="color:#8ee7f6;">Day 21 · 회상: rewrite 없이 evolution 가능한 범위</strong><br>
+    Schema·partition·sort evolution 가운데 metadata-only로 안전한 변화와 downstream 의미 검증이 필요한 경계를 compatibility matrix와 장애 시나리오로 회상한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
