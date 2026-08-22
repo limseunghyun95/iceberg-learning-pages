@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 21</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 3 / DAY 21 · 회상·복습</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">회상: rewrite 없이 evolution 가능한 범위</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Schema·Partition·Sort Evolution · 예상 학습 30분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg의 schema·partition·sort evolution은 새 metadata state를 atomic하게 공개해 기존 data file rewrite를 피하지만, “물리 파일을 안 바꿔도 됨”은 downstream 의미·모든 engine 지원·성능까지 자동으로 안전하다는 뜻이 아니다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Metadata-only</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">기존 data file byte를 다시 쓰지 않고 새 metadata JSON과 catalog pointer 교체로 table 계약을 바꾸는 방식이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Physical compatibility</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Old file을 그대로 두어도 field ID, spec ID, sort order ID로 새 reader가 안전하게 해석할 수 있는 성질이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Semantic compatibility</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">업무 의미, null 처리, 집계·join·SLA와 downstream 계약이 변화 후에도 기대와 맞는지 여부다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Identity</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Schema field ID, partition spec/field ID, sort order ID처럼 이름·순서와 분리된 객체의 정체성이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Default state</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">새 writer가 사용할 current schema/default spec/default sort order다. Old file의 실제 ID를 덮어쓰는 read schema가 아니다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rewrite</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">기존 row를 새 schema/layout/order의 data file로 다시 materialize하고 새 snapshot으로 교체하는 별도 작업이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Compatibility matrix</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">변경별 file rewrite 필요성, reader/writer 지원, downstream 영향, rollback과 검증 증거를 표로 고정한 운영 계약이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Backfill</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">새 column 값이나 새 layout을 과거 row에도 실제로 채우기 위해 data를 다시 쓰는 작업이다. Metadata evolution과 목적이 다르다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>“Iceberg는 rewrite 없이 schema를 바꾼다”는 문장은 절반만 맞다. Column rename은 Iceberg-aware reader가 field ID로 old file을 읽게 해주지만, raw Parquet reader나 name 기반 ETL은 깨질 수 있다. Optional column 추가는 old row를 null/default로 보이게 할 수 있지만 실제 historical business value를 채워 주지는 않는다.</p>
+  <p>Partition evolution도 old/new layout을 함께 읽어 correctness를 지키지만, old day file을 hour query가 더 넓게 읽는 scan 비용은 남는다. Sort order 변경은 future file의 layout 의도만 바꾸며 old file과 streaming unsorted file은 그대로다. 따라서 rewrite 여부는 correctness, semantic migration, performance remediation을 나누어 결정해야 한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 판단:</strong> “Spec이 metadata-only를 허용하는가?”와 “우리 조직의 모든 reader·writer·downstream이 안전한가?”는 서로 다른 질문이다. 첫 질문은 Table Spec, 둘째는 compatibility matrix와 canary가 답한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① 변경 요청 + 호환성 matrix</strong><br><span style="font-size:14px;color:#cdebf0;">schema/spec/order · engines · downstream · SLO</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ base metadata와 current IDs 고정</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② 새 metadata JSON 준비</strong><br><span style="font-size:14px;">new schema/spec/order ID · old history 보존 · data file 불변</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ catalog compare-and-swap</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>③ 성공 확정: pointer → new metadata</strong><br><span style="font-size:14px;">future writer는 new default · pinned reader는 old snapshot 계속 사용</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ old/new state를 ID로 reconcile</td></tr>
+    <tr><td style="background:#f7fafb;text-align:center;padding:13px;border:1px solid #cbd7dc;border-radius:8px;"><strong>④ Read path</strong><br><span style="font-size:14px;">field ID projection · spec별 pruning · file sort ID · delete sequence</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ metrics·semantic canary·cost 관측</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ 유지 또는 별도 migration</strong><br><span style="font-size:14px;color:#cdebf0;">metadata-only 유지 · targeted backfill/rewrite · compensating rollback</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">State transition과 성공 시점</h3>
+  <ol style="padding-left:22px;">
+    <li>Planner가 catalog pointer의 base metadata를 읽고 current schema/spec/order ID와 current snapshot을 기록한다.</li>
+    <li>Schema update는 기존 field ID를 유지하고 새 field에 fresh ID를 준 새 schema를 만든다. Partition/sort update도 unique ID를 가진 정의를 history에 추가한다.</li>
+    <li>새 metadata JSON을 object storage에 쓰는 것은 준비 단계다. Catalog가 expected old pointer에서 new pointer로 atomic하게 바뀐 순간에만 evolution이 성공한다.</li>
+    <li>Old snapshot을 pin한 reader는 old metadata graph를 끝까지 읽고, refresh한 reader와 future writer는 new default를 본다. 두 state가 한 query에 반쯤 섞이면 안 된다.</li>
+    <li>New writer는 새 schema/spec/order로 file을 만들지만, manifest entry는 실제 file의 schema/spec/sort ID와 sequence를 보존한다. Default ID만 보고 old file을 재해석하지 않는다.</li>
+    <li>Canary가 semantic mismatch나 scan 회귀를 찾으면 future default를 compensating metadata commit으로 되돌릴 수 있다. 이미 쓴 new file은 그 ID로 계속 해석 가능해야 한다.</li>
+    <li>Historical 값을 채우거나 old layout 비용을 줄여야 할 때만 backfill/rewrite를 별도 snapshot으로 수행한다. 그 commit 역시 optimistic validation과 CAS를 통과해야 한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Read path: evolution을 숨기는 ID 연결</h3>
+  <p>Reader는 catalog pointer → metadata JSON → snapshot → manifest list → manifest → data/delete file 순서로 간다. Schema rename/reorder는 field ID projection으로, partition evolution은 manifest의 spec ID별 predicate projection으로, sort evolution은 file의 sort order ID와 bounds로 해석한다. 그 뒤 sequence number로 COW/MOR delete file 또는 지원되는 DV의 적용 대상을 정하고 residual을 평가한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:28%;">Evolution</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Metadata-only 불변식 · 남는 비용/위험</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Schema</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Field ID가 identity이므로 add/drop/rename/reorder와 허용된 promotion에서 old bytes를 유지한다. Name/position 기반 consumer, defaults, business meaning과 metric bound decode는 별도 검증한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Partition</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Old/new spec과 manifest가 공존하고 reader가 spec별 split planning한다. Planning fan-out, coarse old pruning, overwrite 단위 변화와 v1 field-ID history가 남는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Sort</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Default order를 새 ID로 바꾸어도 old file ID/unsorted state는 그대로다. Bounds overlap·compression·query scan은 즉시 개선되지 않으며 result ordering도 보장하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Rewrite</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">새 immutable file과 snapshot으로 membership을 교체한다. Shuffle/I/O/commit conflict·delete sequence·concurrent writer race와 old reader retention 비용을 지불한다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Schema evolution 허용선</h3>
+  <p>Add/drop/rename/reorder는 field ID identity를 보존하면 metadata-only다. Primitive promotion은 v1/v2에서 <code>int→long</code>, <code>float→double</code>, 같은 scale을 유지한 decimal precision 확장이 대표 안전선이다. V3+에는 <code>unknown→구체 type</code>, <code>date→timestamp/timestamp_ns</code>가 추가되지만 timezone timestamp로의 promotion은 허용되지 않고 range failure와 partition transform 제약을 함께 확인해야 한다.</p>
+  <p>Nullable column을 required로 강화하는 것은 old null 존재를 metadata만으로 증명할 수 없어 Spark DDL에서 허용되지 않는다. Struct 계층 자체를 접거나 펴는 변화, primitive↔struct, equality를 바꾸는 map key field add/drop도 단순 evolution이 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Control path와 data path 분리</h3>
+  <p>Evolution commit은 schema/spec/order 정의와 default pointer를 바꾸는 control-path 전이다. Data path의 Parquet/ORC/Avro bytes는 그대로다. 이 indirection이 O(data) migration을 O(metadata) transition으로 바꾸지만, old/new encoding을 연결하는 reader correctness와 version-aware metric decode가 전제다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <h3 style="font-size:18px;color:#07566a;">Evolution compatibility matrix</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:25%;">변경</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:24%;">Rewrite</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Guardrail</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Add optional</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">대개 불필요</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Old row의 null/initial default 의미와 downstream null 처리 검증. Historical value가 필요하면 backfill.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Drop/rename/reorder</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Iceberg read에는 불필요</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Field ID 유지·재사용 금지. Raw/name/position consumer와 HMS positional validation canary.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Safe widen</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">불필요</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Format version별 허용선, old bounds decode, partition transform 결과 불변과 downstream type mapping 검증.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Nullable→required</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Metadata-only 금지</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Null 전수 검증·정제 후 engine 지원 경로를 설계. Spark는 SET NOT NULL을 허용하지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Partition change</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Correctness에는 불필요</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Spec-aware readers, split planning, dynamic overwrite semantics와 planning/scan SLO. 비용 때문에 targeted rewrite 가능.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Sort change</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Correctness에는 불필요</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Per-file order ID, writer/distribution 지원, bounds overlap. Query output order와 혼동 금지.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Meaning change</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">대개 backfill 필요</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Unit·timezone·enum·PII policy를 column rename으로 숨기지 말고 새 field+dual write+validation으로 migration.</td></tr>
+  </table>
+
+  <p><strong>Best practice:</strong> Producer/consumer inventory → version별 read/write/DDL matrix → sample old/new file canary → metadata-only commit → field/spec/order ID와 result diff 관측 → 필요 시 작은 targeted rewrite 순서로 진행한다.</p>
+  <p><strong>Engine/version 차이:</strong> Apache Iceberg 1.11.0 Spark 문서는 Spark 3 ALTER TABLE로 add/drop/rename/reorder/widen/required→optional을 지원한다. Hive Catalog는 position이 이동하는 schema 변경을 HMS가 거절할 수 있고, validation을 끄면 Hive engine의 직접 read가 틀릴 수 있다. V3의 date promotion과 defaults 같은 기능은 모든 engine이 같은 시점에 지원한다고 단정하지 말고 capability test를 둔다.</p>
+  <p><strong>Anti-pattern:</strong> “DDL 성공=조직 전체 호환”으로 간주하거나, unit가 bytes에서 KiB로 바뀌는데 comment/rename만 고쳐 old/new value를 섞는 것이다.</p>
+  <p><strong>Edge case:</strong> Partition source field를 type promotion할 때 transform 결과가 달라지면 promotion할 수 없다. Date→timestamp처럼 spec 자체는 허용해도 active partition transform과 multi-engine hash/transform 구현을 함께 검사해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Metadata-only evolution 후 old row가 null/누락되거나 engine별 결과와 비용이 갈라졌다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Raw reader에서 renamed column null/없음, old 구간 누락, engine별 schema/count 차이, dynamic overwrite 범위 변화, file scan·planning p95 증가, writer가 old spec/order로 계속 commit, catalog success 후 object 404.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog metadata location·snapshot ID, schemas/current schema와 field IDs/defaults, partition-specs/default/field IDs, sort-orders/default와 per-file sort_order_id, manifest spec/sequence, file physical schema·bounds, query plan/residual, engine/connector/catalog version, downstream query, commit/rewrite/cleanup timeline.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Name/position 기반 reader, field ID 재사용/mapping 오류, unsupported promotion/default, current spec만 적용, stale writer/cache, sort declaration만 믿은 pruning, HMS positional schema, semantic unit/timezone mismatch, rewrite conflict, old object 조기 삭제, catalog/object storage partial failure.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Affected DDL/writer/rewrite/cleanup을 멈추고 snapshot을 pin한다. Metadata·manifest·old/new file schema와 query result sample을 보존한다. Known-good Iceberg reader로 spec/ID-aware full scan을 비교하고 raw reader를 production path에서 격리한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Compensating schema/spec/order metadata commit으로 future default를 되돌리고 known-good engine을 사용한다. Missing historical value는 validated backfill, layout 비용은 targeted rewrite로 새 snapshot에 교체한다. Missing object는 versioned backup/replica에서 같은 URI로 복원한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON/field·spec·order ID를 수동 편집하거나 ID를 재사용하지 않는다. Raw file rename/delete, pointer 강제 교체, snapshot expiration/orphan cleanup, 증거 없는 full rewrite와 blind retry를 실행하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> Schema·partition·sort metadata를 연속 변경해 old data file path가 그대로임을 증명하고, Iceberg field-ID read는 성공하지만 raw Parquet name-based read가 rename을 따라오지 못하는 실패를 관찰한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>네 번의 ALTER 뒤 data file path와 snapshot 수가 바뀌는지 먼저 적는다.</li>
+    <li><code>data→payload</code> rename 뒤 Iceberg query와 raw Parquet query의 차이를 예측한다.</li>
+    <li>New insert 뒤 old/new file의 spec_id·sort_order_id가 같은지 예측한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Old file과 기준 증거</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day21;
+DROP TABLE IF EXISTS local.day21.evolution_lab PURGE;
+CREATE TABLE local.day21.evolution_lab (
+  id BIGINT,
+  user_id BIGINT,
+  event_time TIMESTAMP,
+  data STRING,
+  score INT
+) USING iceberg
+PARTITIONED BY (days(event_time));
+
+INSERT INTO local.day21.evolution_lab VALUES
+  (1, 42, TIMESTAMP '2026-08-22 12:05:00', 'old-a', 10),
+  (2,  7, TIMESTAMP '2026-08-22 13:05:00', 'old-b', 20);
+
+SELECT file_path, spec_id, sort_order_id, record_count
+FROM local.day21.evolution_lab.files ORDER BY file_path;
+SELECT committed_at, snapshot_id, operation
+FROM local.day21.evolution_lab.snapshots ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Old file은 spec 0, sort order 0이다. File path와 snapshot ID를 복사해 기준 증거로 보관한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Metadata-only evolution 묶음</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;"># 먼저 DESCRIBE에서 auto-generated partition field name을 확인한다.
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day21.evolution_lab RENAME COLUMN data TO payload;
+ALTER TABLE local.day21.evolution_lab ADD COLUMN source STRING;
+ALTER TABLE local.day21.evolution_lab ALTER COLUMN score TYPE BIGINT;
+ALTER TABLE local.day21.evolution_lab ALTER COLUMN payload FIRST;
+ALTER TABLE local.day21.evolution_lab
+  REPLACE PARTITION FIELD event_time_day
+  WITH hours(event_time) AS event_time_hour;
+ALTER TABLE local.day21.evolution_lab
+  WRITE ORDERED BY user_id ASC NULLS LAST, event_time ASC;
+
+DESCRIBE TABLE EXTENDED local.day21.evolution_lab;
+SELECT file_path, spec_id, sort_order_id, record_count
+FROM local.day21.evolution_lab.files ORDER BY file_path;
+SELECT committed_at, snapshot_id, operation
+FROM local.day21.evolution_lab.snapshots ORDER BY committed_at;
+&quot;
+
+# event_time_day가 실제 이름과 다르면 metadata의 exact field name으로 바꾼다.</pre>
+  <p><strong>예상 관찰:</strong> Metadata log는 늘지만 old data file path와 data snapshot은 그대로다. Old rows는 <code>payload</code>로 읽히고 <code>source</code>는 null이며 <code>score</code>는 BIGINT로 projection된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Old/new state 공존</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day21.evolution_lab
+  (id, user_id, event_time, payload, score, source)
+VALUES
+  (3, 42, TIMESTAMP '2026-08-22 12:35:00', 'new-c', 30, 'api');
+
+SELECT id, user_id, event_time, payload, score, source
+FROM local.day21.evolution_lab ORDER BY id;
+
+SELECT spec_id, sort_order_id, partition,
+       file_path, record_count, readable_metrics
+FROM local.day21.evolution_lab.files
+ORDER BY spec_id, sort_order_id, file_path;
+
+SELECT timestamp, latest_snapshot_id, latest_schema_id, file
+FROM local.day21.evolution_lab.metadata_log_entries
+ORDER BY timestamp;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Id 1·2는 old file에서 새 logical schema로 읽히고 id 3은 new spec/order file에 있다. Old/new file의 schema/spec/order state가 달라도 one logical result를 만든다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 · Raw Parquet name-based read</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;"># files metadata table에서 old file_path를 복사해 OLD_FILE에 넣는다.
+OLD_FILE='warehouse/day21/evolution_lab/data/old-file.parquet'
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT payload
+FROM parquet.\`$OLD_FILE\`;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Raw Parquet schema에는 old physical name <code>data</code>가 있으므로 <code>payload</code>를 resolve하지 못하거나 null/분리된 column처럼 보일 수 있다. 같은 file을 Iceberg table로 읽으면 field ID 덕분에 <code>payload='old-a/old-b'</code>가 나온다. 이 실패는 file을 고치는 신호가 아니라 raw bypass를 격리하고 consumer를 Iceberg-aware path로 옮길 증거다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Partition field 이름 오류:</strong> <code>DESCRIBE TABLE EXTENDED</code>와 metadata JSON의 exact name을 쓴다.</li>
+    <li><strong>ALTER COLUMN FIRST 실패:</strong> Hive Catalog positional validation 또는 connector 지원을 확인하고 canary catalog에서 검증한다.</li>
+    <li><strong>INSERT column list 미지원:</strong> <code>DESCRIBE</code>의 current logical order에 맞춘 explicit SELECT를 사용하고 결과를 재확인한다.</li>
+    <li><strong>Raw path 불일치:</strong> Warehouse를 추측하지 말고 <code>files.file_path</code>의 정확한 URI를 사용한다.</li>
+    <li><strong>Old row source가 null:</strong> Optional add의 정상 결과다. Historical business value가 필요하면 검증된 backfill을 별도 설계한다.</li>
+    <li><strong>File path가 ALTER 중 바뀜:</strong> 자동 maintenance나 외부 writer가 동시에 동작했는지 snapshot/commit timeline을 확인한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day21.evolution_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day21;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Old/new file을 개별 삭제하지 않고 catalog table lifecycle로 정리한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Metadata-only면 downstream도 무중단이다.</strong> Raw/name/position consumer와 business semantics는 별도다.</li>
+    <li><strong>Rename은 새 column을 만든다.</strong> Field ID를 유지하는 같은 identity이며 old physical name과 연결된다.</li>
+    <li><strong>Drop 후 같은 이름을 재사용해도 된다.</strong> 새 field는 fresh ID여야 하며 old value를 부활시키면 안 된다.</li>
+    <li><strong>모든 type widen은 안전하다.</strong> Spec/version의 promotion 목록과 partition transform 불변을 확인한다.</li>
+    <li><strong>Partition evolution은 old file을 새 layout으로 옮긴다.</strong> Old/new spec은 공존하고 split planning이 필요하다.</li>
+    <li><strong>Sort evolution은 table 전체를 정렬한다.</strong> New default일 뿐 old/streaming file은 다른 order ID일 수 있다.</li>
+    <li><strong>DDL 성공은 모든 engine 지원 증거다.</strong> Read/write/DDL/metadata table capability를 따로 검증한다.</li>
+    <li><strong>Rewrite가 끝나면 old object를 즉시 지운다.</strong> Pinned reader와 retained snapshot 안전 창을 먼저 보장한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문 3개</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Petabyte table의 schema·partition·sort를 무중단으로 바꾸는 rollout을 설계하라.</strong><br>좋은 답변 구조: Workload/SLO와 engine inventory → ID/state transition → catalog CAS → old/new read path → semantic canary → metrics → targeted rewrite 기준 → rollback·retention.</li>
+    <li><strong>“Rename은 metadata-only인데 장애가 났다”를 설명하라.</strong><br>좋은 답변 구조: Field ID vs physical name → Iceberg-aware/raw reader 경로 → old/new file schema → concrete failure → safe first action → consumer migration·name mapping 대안 → file rewrite trade-off.</li>
+    <li><strong>어떤 evolution에서 rewrite가 필요한가?</strong><br>좋은 답변 구조: Correctness/semantic/performance 목적 분리 → 허용 promotion·required/null 경계 → partition/sort coexistence 비용 → 수치 threshold → maintenance race·sequence → backfill/rewrite/새 column 대안.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>12시 predicate가 day spec과 hour spec에서 각각 어떤 후보 partition을 만드는가?</li>
+    <li>Unified partition struct에서 current hour field가 null인 old file을 제외하면 왜 틀리는가?</li>
+    <li>Mixed-spec scan 중 concurrent commit이 발생해도 결과가 섞이지 않는 이유는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Day는 날짜 전체의 coarse superset, hour는 12시의 precise candidate다. <strong>Spec별 projection+residual</strong>을 말하면 정답.</li>
+      <li>Null은 old spec에 그 field가 없다는 뜻이며 old file에도 정답 row가 있을 수 있다. <strong>Default spec으로 old tuple을 해석하면 false negative</strong>가 핵심.</li>
+      <li>Reader가 시작 때 immutable snapshot/manifest graph를 pin하고 refresh 전까지 같은 root를 쓰기 때문이다. <strong>Snapshot isolation</strong>을 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>Metadata-only evolution과 semantic migration의 차이는?</li>
+    <li>Schema rename이 Iceberg read에는 안전하지만 raw Parquet read에는 위험한 이유는?</li>
+    <li>Partition/sort evolution 뒤 rewrite를 선택할 수치 기준 두 가지는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>전자는 ID와 metadata로 old bytes를 새 logical state에 연결하고, 후자는 historical value/meaning을 실제로 바꾼다. <strong>Physical vs business meaning</strong>이 핵심.</li>
+      <li>Iceberg는 field ID로 projection하지만 raw reader는 physical name/position을 사용한다. <strong>Identity source 차이</strong>를 말하면 정답.</li>
+      <li>예: planning p95·manifest fan-out, scanned bytes/file 수, bounds overlap, compression, query SLO. <strong>측정 가능한 비용 두 개</strong>와 targeted rewrite를 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/evolution/" style="color:#0b6f85;">Apache Iceberg · Evolution</a> — schema·partition·sort metadata evolution과 correctness.</li>
+    <li><a href="https://iceberg.apache.org/spec/#schema-evolution" style="color:#0b6f85;">Apache Iceberg Table Spec · Schema Evolution</a> — field ID, promotion, defaults와 projection.</li>
+    <li><a href="https://iceberg.apache.org/spec/#partition-evolution" style="color:#0b6f85;">Apache Iceberg Table Spec · Partition Evolution</a> — spec/field ID와 v1/v2 경계.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-ddl/#alter-table" style="color:#0b6f85;">Apache Iceberg Spark DDL · ALTER TABLE</a> — Spark 지원 범위와 HMS 제약.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:9px;">
+    <strong style="color:#8ee7f6;">Day 22 · immutable write와 atomic metadata swap</strong><br>
+    Week 4에서 writer가 data/manifest/metadata를 먼저 준비하고 catalog pointer CAS를 linearization point로 삼아 partial visibility를 막는 commit state machine을 시작한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

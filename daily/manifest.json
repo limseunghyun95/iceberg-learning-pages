@@ -185,6 +185,15 @@
       "path": "day-20.html",
       "kind": "lab",
       "publishedAt": "2026-08-21T09:12:38+09:00"
+    },
+    {
+      "day": 21,
+      "week": 3,
+      "title": "회상: rewrite 없이 evolution 가능한 범위",
+      "summary": "Schema·partition·sort의 metadata-only 안전선과 semantic·multi-engine·performance migration 경계를 compatibility matrix로 회상합니다.",
+      "path": "day-21.html",
+      "kind": "review",
+      "publishedAt": "2026-08-22T09:12:32+09:00"
     }
   ]
 }
