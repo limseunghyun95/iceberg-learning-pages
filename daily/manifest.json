@@ -194,6 +194,15 @@
       "path": "day-21.html",
       "kind": "review",
       "publishedAt": "2026-08-22T09:12:32+09:00"
+    },
+    {
+      "day": 22,
+      "week": 4,
+      "title": "immutable write와 atomic metadata swap",
+      "summary": "Immutable data·metadata 준비와 catalog pointer CAS의 linearization point, unknown commit state와 orphan file 경계를 추적합니다.",
+      "path": "day-22.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-23T13:56:21+09:00"
     }
   ]
 }

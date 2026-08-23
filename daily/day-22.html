@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 22</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 4 / DAY 22</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">immutable write와 atomic metadata swap</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Commit·Isolation·Concurrency · 예상 학습 35분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg writer는 data·delete·manifest·metadata file을 먼저 immutable하게 준비하고, catalog가 가리키는 metadata pointer를 old에서 new로 원자적으로 교체하는 한 순간에만 table state 전체를 공개한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:31%;font-weight:700;vertical-align:top;">Immutable file</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">한번 완성한 뒤 제자리 수정하지 않는 file이다. 변경은 새 unique path의 file을 쓰고 metadata가 참조 대상을 바꾸는 방식으로 표현한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Catalog pointer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Table 이름을 현재 metadata JSON 위치에 연결하는 작은 권위 상태다. Object storage의 최신 파일 목록이 table state를 결정하지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Atomic</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">관찰자가 old state 전체 또는 new state 전체만 보고 중간 상태는 볼 수 없다는 성질이다. 여러 물리 file을 한꺼번에 rename한다는 뜻이 아니다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">CAS / check-and-put</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Compare-and-swap. Pointer가 내가 읽은 expected old value일 때만 new value로 바꾸는 조건부 원자 연산이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Linearization point</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">분산된 여러 단계의 작업이 논리적으로 한 순간에 성공했다고 볼 수 있는 지점이다. Iceberg metastore table에서는 pointer CAS 성공 순간이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Base metadata</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Writer가 계획을 시작할 때 고정한 metadata version과 snapshot이다. Commit은 이 base가 여전히 유효한지 검증한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Orphan file</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">물리 저장소에는 존재하지만 어떤 유효 snapshot metadata에서도 참조되지 않는 file이다. 실패한 시도의 정상 부산물일 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Unknown commit state</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Catalog가 CAS를 처리했는지 알기 전에 client 연결이 끊겨 성공·실패를 확정할 수 없는 상태다. 실패로 단정하고 batch를 다시 쓰면 중복될 수 있다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>한 번의 INSERT도 실제로는 executor가 여러 data file을 쓰고, driver가 manifest와 manifest list를 만들고, 새 snapshot을 포함한 metadata JSON을 쓰는 분산 작업이다. 이 file들이 생성되는 순서는 제각각이고 일부 task는 재시도될 수 있다. 물리 file 존재만으로 table membership을 정하면 독자는 반쪽 결과, 중복, partial upload를 보게 된다.</p>
+  <p>Iceberg는 data plane의 큰 immutable object와 control plane의 작은 pointer를 분리한다. 새 object는 미리 준비하되 catalog pointer가 바뀌기 전에는 독자에게 보이지 않는다. Pointer swap 한 번으로 수천 개 file의 logical membership을 원자적으로 바꾸므로 object store에서 directory rename이나 consistent listing에 의존하지 않는다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 질문:</strong> “새 Parquet가 저장소에 있는가?”가 아니라 “현재 catalog pointer에서 시작한 metadata graph가 그 file을 참조하는가?”를 묻는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Base load</strong><br><span style="font-size:14px;color:#cdebf0;">catalog pointer P0 → metadata M0 → snapshot S0 고정</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ plan · unique output identity</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② Immutable file write</strong><br><span style="font-size:14px;">data/delete file 완전 close · 아직 table에는 안 보임</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ collect path · metrics · partition · sequence intent</td></tr>
+    <tr><td style="background:#f7fafb;text-align:center;padding:13px;border:1px solid #cbd7dc;border-radius:8px;"><strong>③ Metadata tree 준비</strong><br><span style="font-size:14px;">manifest → manifest list → snapshot S1 → metadata M1</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ operation별 conflict validation</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>④ Catalog CAS: P0 → M1</strong><br><span style="font-size:14px;">expected=M0 일 때만 swap · linearization point</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ success / conflict / response lost</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ 결과 확정</strong><br><span style="font-size:14px;color:#cdebf0;">success: S1 공개 · conflict: 재검증 · unknown: status check</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Base load:</strong> Writer는 table 이름을 catalog에서 resolve하고 M0와 S0를 읽는다. Schema/spec/sort와 쓰기 operation의 가정을 함께 고정한다.</li>
+    <li><strong>File write:</strong> Task마다 충돌하지 않는 path에 Parquet/ORC/Avro data file 또는 v2/v3 delete file·DV를 쓴다. 성공한 task의 file만 driver가 수집한다. 이때 object storage가 file을 durable하게 저장해도 table membership은 아직 0이다.</li>
+    <li><strong>Metadata prepare:</strong> Driver는 file path·partition tuple·bounds·counts를 manifest에 쓰고, manifest list와 snapshot을 만든 뒤 self-contained M1을 새 path에 쓴다. 기존 M0와 S0는 수정하지 않는다.</li>
+    <li><strong>Validation:</strong> Append, overwrite, delete, rewrite마다 필요한 가정을 현재 state에서 다시 검사한다. 오늘은 swap 구조에 집중하고 상세 conflict 규칙은 Day 24에서 다룬다.</li>
+    <li><strong>CAS:</strong> Catalog가 현재 pointer가 M0인지 비교하고 M1로 바꾼다. 성공 전 reader는 S0 전체, 성공 후 refresh한 reader는 S1 전체를 본다. Metadata tree 내부 file 생성 시각은 공개 순서를 결정하지 않는다.</li>
+    <li><strong>Result:</strong> 명시적 conflict면 새 current state에 재적용 가능한지 검증한다. Network timeout이면 CAS가 이미 성공했을 수 있으므로 M1/snapshot/operation identity가 current history에 있는지 status check한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Reader의 data path</h3>
+  <p>Reader는 catalog pointer → metadata JSON → 선택한 snapshot → manifest list → manifest → data/delete file 순서로만 membership을 찾는다. Field ID로 column을 projection하고 spec ID별 partition pruning, file metric pruning을 수행한 뒤 sequence number로 equality/position delete 또는 지원되는 deletion vector 적용 범위를 정한다. Warehouse listing은 이 authoritative path에 포함되지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">개념</th><th style="padding:10px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Iceberg에서의 의미</th></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Persistent data structure</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">새 snapshot은 변한 manifest만 추가하고 불변인 old manifest를 재사용한다. Full table copy 없이 새 logical version을 만든다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>MVCC</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Multi-Version Concurrency Control. Reader는 시작 시 고른 committed snapshot version을 계속 읽고 writer는 별도 version을 준비한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Linearizability</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog pointer update가 한 순서로 관찰돼 concurrent commit 중 하나만 같은 base에서 성공한다. Table Spec은 이 atomic operation의 구체 구현을 catalog에 위임한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Failure atomicity</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">CAS 전 실패는 old state를 유지하고 prepared file을 orphan으로 남긴다. CAS 후 성공은 new graph 전체를 공개한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Idempotency boundary</strong></td><td style="padding:10px;border:1px solid #dbe3e8;vertical-align:top;">Catalog status check와 batch identity로 이미 성공한 operation을 구분한다. 단순 SQL 재실행 자체가 자동으로 idempotent하다고 가정하면 안 된다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">상태의 소유자와 불변식</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Object storage:</strong> Byte durability와 object identity를 소유한다. Table membership이나 current version은 소유하지 않는다.</li>
+    <li><strong>Manifest:</strong> Data/delete file의 membership, partition, metric, sequence 정보를 소유한다. Warehouse directory name은 이 계약을 대체하지 못한다.</li>
+    <li><strong>Snapshot/metadata JSON:</strong> Manifest graph와 schema/spec/order, snapshot history를 묶은 immutable table version이다.</li>
+    <li><strong>Catalog:</strong> Table name의 current metadata pointer와 conditional update를 소유한다. Commit 성공을 확정하는 authoritative control plane이다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Failure window별 상태</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:29%;">실패 시점</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Table 상태 · 후속 처리</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Data file 쓰기 전/중</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Old snapshot 유지. Partial/failed-task object는 참조되지 않으며 충분한 safety window 뒤 orphan 후보가 된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Manifest/M1 준비 후 CAS 전</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Reader에는 여전히 S0만 보인다. Prepared metadata와 data는 uncommitted이며 즉시 삭제하면 장기 retry와 다른 writer를 해칠 수 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">CAS conflict</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">다른 writer가 먼저 current를 바꿨다. Operation 가정을 재검증해 safe retry하거나 실패한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">CAS 성공, 응답 유실</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">실제로 S1이 current일 수 있다. Unknown state로 분류하고 status check 후에만 재시도한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">CAS 성공 후 object 404</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Valid snapshot 불변식 위반이다. 조기 cleanup, 잘못된 URI, upload durability 문제를 조사하고 같은 URI 복원을 우선한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · publish-last:</strong> Data/delete file을 완전히 close하고 checksum·size·metrics를 얻은 뒤 manifest, manifest list, metadata JSON을 쓰고 마지막에만 pointer를 교체한다. Catalog에 먼저 빈 snapshot을 공개하고 file을 나중에 채우지 않는다.</p>
+  <p><strong>Best practice 2 · unique path와 operation identity:</strong> Task attempt가 같은 object를 덮어쓰지 않도록 unique path를 쓰고, streaming checkpoint/batch ID·application ID·snapshot summary 같은 재현 가능한 증거로 unknown success를 판별한다. 어떤 key가 자동 제공되는지는 engine/version별로 확인한다.</p>
+  <p><strong>Best practice 3 · 두 종류의 retry 분리:</strong> 명시적 CAS conflict의 rebase/revalidation retry와 network 단절 뒤 status-check retry를 구분한다. Apache Iceberg 1.11.0 문서의 기본 table property는 commit retry 4회, unknown state status check 3회지만 workload·catalog SLA에 맞춰 total timeout과 backoff를 설계한다.</p>
+  <p><strong>Catalog/버전 차이:</strong> Metastore/DB catalog는 expected metadata location을 검사하는 check-and-put으로 pointer를 바꾼다. HadoopTableOperations의 file-system version/rename 방식은 Table Spec에서 deprecated이며 object store와 local file system에 안전하지 않고 v4에서 제거 예정이라고 명시돼 있다. REST catalog도 protocol과 구현이 실제 atomicity·status-check 동작을 제공해야 하므로 capability와 failure test가 필요하다.</p>
+  <p><strong>Anti-pattern:</strong> Object 생성 시각이 최신인 metadata JSON을 current로 추측하거나, catalog timeout을 곧바로 실패로 기록해 같은 append를 다시 실행하거나, job 실패 직후 warehouse의 최근 file을 일괄 삭제하는 것이다.</p>
+  <p><strong>Edge case:</strong> COW rewrite는 새 data file, MOR는 data와 equality/position delete file, v3 지원 경로는 deletion vector를 준비할 수 있지만 어느 경우든 current snapshot이 참조하기 전에는 logical effect가 없다. Commit 후에는 sequence number와 file membership을 보존한 채 읽어야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Writer가 timeout됐고 warehouse에는 새 file이 있지만 table 반영 여부가 불명확하다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Driver에 timeout/unknown commit state, 새 data·manifest·metadata object 존재, row가 보이거나 안 보임, duplicate batch 가능성, catalog pointer와 job 로그 불일치, committed snapshot에서 object 404.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog current metadata location과 ETag/version, M0/M1 table UUID·current snapshot·metadata log, snapshots/summary/parent, manifest list와 manifest file paths, added data/delete file paths·sizes, batch/checkpoint/application ID, CAS request/response·retry/status-check 로그, object PUT/GET audit와 cleanup timeline.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">CAS 성공 뒤 응답 유실, CAS conflict 후 prepared orphan, stale catalog/client cache, duplicate blind retry, partial upload, task retry duplicate output, wrong table/branch/catalog, cleanup race, object storage durability·IAM·KMS 문제.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">동일 batch 재실행과 orphan cleanup을 멈춘다. Catalog를 강제 refresh해 current pointer에서 metadata graph를 추적하고 operation identity·added file이 committed snapshot에 있는지 확인한다. Reader는 known-good snapshot을 pin한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">성공 확인 시 batch를 완료 처리하고 downstream offset을 맞춘다. 실패 확인 시 가정을 재검증해 재시도한다. Duplicate는 새 compensating delete/overwrite transaction으로 정정하고, missing committed object는 versioned backup/replica에서 같은 URI로 복원한 뒤 snapshot rollback 여부를 판단한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Timeout을 실패로 단정한 blind append, metadata JSON·version hint·catalog pointer 수동 편집, warehouse 최신 file 일괄 삭제, committed file rename, 증거 전 snapshot expiration/orphan cleanup, raw listing으로 current state 추정은 금지한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> INSERT 전후 metadata graph를 비교하고, committed Parquet를 복사해 “물리 file은 있지만 catalog graph에 없으므로 table에서 안 보이는” pre-commit/orphan 상태를 안전하게 모사한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>Parquet를 warehouse에 하나 더 복사하면 Iceberg table count가 2에서 4로 늘어날지 먼저 적는다.</li>
+    <li>INSERT 뒤 data file, snapshot, manifest list, metadata JSON 중 무엇이 linearization point인지 적는다.</li>
+    <li>이 프로젝트의 <code>local</code>은 학습용 Hadoop catalog다. Production object store의 metastore CAS와 동일하다고 간주하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Base와 첫 commit 관찰</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day22;
+DROP TABLE IF EXISTS local.day22.commit_lab PURGE;
+CREATE TABLE local.day22.commit_lab (
+  id BIGINT,
+  batch_id STRING,
+  payload STRING
+) USING iceberg;
+
+INSERT INTO local.day22.commit_lab VALUES
+  (1, 'batch-001', 'a'),
+  (2, 'batch-001', 'b');
+
+SELECT count(*) AS table_rows FROM local.day22.commit_lab;
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day22.commit_lab.snapshots ORDER BY committed_at;
+SELECT file_path, record_count, file_size_in_bytes
+FROM local.day22.commit_lab.files ORDER BY file_path;
+SELECT timestamp, latest_snapshot_id, latest_schema_id, file
+FROM local.day22.commit_lab.metadata_log_entries ORDER BY timestamp;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> CREATE metadata와 INSERT snapshot이 생기고 current graph가 record 2개인 data file을 참조한다. <code>files</code>의 exact path를 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · 물리 file만 복사해 pre-commit 실패 모사</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;"># Host에서 학습 table의 committed Parquet 하나를 찾고 unique orphan path로 복사한다.
+SOURCE_FILE=$(find warehouse/day22/commit_lab/data -type f -name '*.parquet' | head -1)
+cp &quot;$SOURCE_FILE&quot; warehouse/day22/commit_lab/data/manual-orphan.parquet
+
+# 물리 file은 두 개지만 Iceberg table membership과 snapshot은 변하지 않는다.
+find warehouse/day22/commit_lab/data -type f -name '*.parquet' | sort
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS iceberg_rows FROM local.day22.commit_lab;
+SELECT file_path, record_count FROM local.day22.commit_lab.files ORDER BY file_path;
+SELECT count(*) AS raw_orphan_rows
+FROM parquet.\`/workspace/warehouse/day22/commit_lab/data/manual-orphan.parquet\`;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Raw Parquet query는 복사본의 2 rows를 읽지만 Iceberg count는 2이고 <code>files</code> metadata table에도 원본 한 개만 있다. Object 존재는 membership이 아니며 warehouse listing을 합치면 중복된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · 정상 두 번째 commit과 graph diff</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day22.commit_lab VALUES
+  (3, 'batch-002', 'c');
+
+SELECT id, batch_id, payload FROM local.day22.commit_lab ORDER BY id;
+SELECT made_current_at, snapshot_id, parent_id, is_current_ancestor
+FROM local.day22.commit_lab.history ORDER BY made_current_at;
+SELECT committed_at, snapshot_id, parent_id, operation, manifest_list, summary
+FROM local.day22.commit_lab.snapshots ORDER BY committed_at;
+SELECT content, file_path, spec_id, record_count
+FROM local.day22.commit_lab.all_files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 새 snapshot은 parent로 이전 snapshot을 가리키며 정상 data file을 추가한다. Manual orphan은 여전히 raw object일 뿐 <code>all_files</code>에도 없다. Reader는 current snapshot이 고정한 3 rows만 본다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입의 채점 기준</h3>
+  <ul style="padding-left:22px;">
+    <li>“File copy가 INSERT와 같은 효과”라고 답하면 오답이다. Manifest/snapshot/metadata와 catalog publish가 없다.</li>
+    <li>“Metadata JSON 생성이 commit 성공”도 오답이다. Catalog가 그 metadata를 current로 원자 교체해야 한다.</li>
+    <li>“Manual orphan을 즉시 production에서 지운다”도 오답이다. 실제 환경에서는 active writer·retry·branch와 age threshold 증거가 필요하다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Find 결과가 없음:</strong> 먼저 INSERT 성공과 <code>warehouse/day22/commit_lab/data</code> 경로를 확인한다.</li>
+    <li><strong>Permission denied:</strong> Host workspace 소유권을 확인하고 container 내부 root 권한으로 임의 변경하지 않는다.</li>
+    <li><strong>Raw Parquet path 오류:</strong> Container에서 보이는 절대 경로는 <code>/workspace/warehouse/...</code>다.</li>
+    <li><strong>Metadata table column 차이:</strong> Connector/version에 따라 column projection이 다를 수 있으므로 <code>DESCRIBE local.day22.commit_lab.files</code>로 확인한다.</li>
+    <li><strong>Manual orphan이 table에 보임:</strong> Raw Parquet 결과와 Iceberg table 결과를 혼동했는지, 잘못된 table/catalog를 조회했는지 확인한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;"># 이 파일은 우리가 직접 만든 미참조 복사본임을 확인한 뒤에만 제거한다.
+rm warehouse/day22/commit_lab/data/manual-orphan.parquet
+
+docker compose run --rm spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day22.commit_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day22;
+&quot;</pre>
+  <p style="font-size:14px;color:#52636d;">Production에서는 개별 file을 손으로 지우지 말고 충분한 safety window와 dry-run을 갖춘 orphan cleanup 절차를 사용한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Parquet upload 성공이 commit 성공이다.</strong> CAS 전에는 table effect가 없다.</li>
+    <li><strong>Metadata JSON이 가장 최신 timestamp면 current다.</strong> Catalog pointer만 current를 정한다.</li>
+    <li><strong>Atomic commit은 모든 file의 atomic rename이다.</strong> 큰 file은 미리 쓰고 작은 pointer 하나를 atomic swap한다.</li>
+    <li><strong>Timeout은 실패다.</strong> CAS 후 응답만 유실됐을 수 있어 status check가 먼저다.</li>
+    <li><strong>모든 retry는 같은 SQL을 다시 실행하면 된다.</strong> Revalidation과 idempotency 없이 append하면 중복될 수 있다.</li>
+    <li><strong>Orphan은 발견 즉시 삭제한다.</strong> Active writer와 장기 retry가 아직 쓸 file일 수 있다.</li>
+    <li><strong>Object store listing consistency가 table correctness를 결정한다.</strong> Reader는 catalog에서 시작한 explicit graph를 따른다.</li>
+    <li><strong>모든 catalog의 atomic 구현이 같다.</strong> Spec은 메커니즘을 위임하며 Hadoop file scheme과 metastore CAS의 경계가 다르다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문 3개</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Object store 위 Iceberg INSERT의 성공 시점을 설계 수준으로 설명하라.</strong><br>좋은 답변 구조: State owners → immutable data/metadata prepare → base validation → catalog CAS linearization point → reader old/new visibility → failure windows → object store listing을 쓰지 않는 이유.</li>
+    <li><strong>Commit API가 timeout됐는데 file은 생성됐다. 중복 없이 복구하라.</strong><br>좋은 답변 구조: Unknown state 선언 → 증거와 operation identity → current metadata/snapshot/manifest 추적 → success/failure 분기 → status-check/backoff → duplicate compensating transaction → 금지 조치.</li>
+    <li><strong>초당 50개 streaming commit과 batch compaction이 같은 table을 쓴다. Control plane을 설계하라.</strong><br>좋은 답변 구조: Commit rate·catalog SLA 수치 → CAS contention → checkpoint/idempotency → retry/status-check budget → maintenance scope → metrics/alerts → branch/WAP·commit coalescing 대안과 비용.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Metadata-only evolution과 semantic migration은 무엇이 다른가?</li>
+    <li>Column rename 후 Iceberg read는 되지만 raw Parquet read가 깨질 수 있는 이유는?</li>
+    <li>Partition/sort evolution 후 correctness에는 rewrite가 불필요해도 targeted rewrite를 선택할 수 있는 기준은?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>전자는 ID와 metadata로 old bytes를 새 logical state에 연결하고, 후자는 historical business value/meaning을 실제 변경한다. <strong>Physical vs semantic</strong>을 말하면 정답.</li>
+      <li>Iceberg는 field ID, raw reader는 physical name/position을 identity로 쓰기 때문이다. <strong>Identity source 차이</strong>가 핵심.</li>
+      <li>Planning p95, scanned bytes/file 수, manifest fan-out, bounds overlap, compression·query SLO 같은 측정치다. <strong>수치 threshold와 비용</strong>을 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>Data file·metadata JSON 생성이 아니라 catalog pointer CAS가 commit 성공 시점인 이유는?</li>
+    <li>CAS 응답을 받기 전에 network가 끊기면 왜 blind retry하면 안 되는가?</li>
+    <li>Object storage와 catalog가 각각 소유하는 상태는 무엇인가?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Pointer 교체 전 artifact는 current graph에서 도달할 수 없고 교체 후 전체 graph가 한꺼번에 reachable해지기 때문이다. <strong>Reachability+linearization</strong>이 핵심.</li>
+      <li>CAS는 성공했지만 응답만 유실됐을 수 있어 같은 append를 다시 하면 중복된다. <strong>Unknown state→status check</strong>를 말하면 정답.</li>
+      <li>Object storage는 immutable bytes/durability, catalog는 table name의 current metadata pointer와 conditional update를 소유한다. <strong>Data plane/control plane</strong>을 구분하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#optimistic-concurrency" style="color:#0b6f85;">Apache Iceberg Table Spec · Optimistic Concurrency</a> — atomic metadata swap과 reader/writer visibility.</li>
+    <li><a href="https://iceberg.apache.org/spec/#commit-conflict-resolution-and-retry" style="color:#0b6f85;">Apache Iceberg Table Spec · Commit Conflict Resolution and Retry</a> — metastore check-and-put와 file-system scheme 경계.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/reliability/" style="color:#0b6f85;">Apache Iceberg · Reliability</a> — persistent metadata tree, retry reuse와 validation.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/configuration/#table-behavior-properties" style="color:#0b6f85;">Apache Iceberg · Table Behavior Properties</a> — commit retry와 unknown-state status-check 설정.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:9px;">
+    <strong style="color:#8ee7f6;">Day 23 · optimistic concurrency와 retry</strong><br>
+    두 writer가 같은 base에서 출발했을 때 한쪽 CAS가 실패한 뒤, 비싼 data file을 재사용하면서 operation의 가정을 새 current state에 안전하게 재적용하는 state machine을 파고든다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
