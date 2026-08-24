@@ -203,6 +203,15 @@
       "path": "day-22.html",
       "kind": "lesson",
       "publishedAt": "2026-08-23T13:56:21+09:00"
+    },
+    {
+      "day": 23,
+      "week": 4,
+      "title": "optimistic concurrency와 retry",
+      "summary": "CAS conflict 뒤 assumption validation과 immutable work 재사용, metadata rebase·backoff·retry budget의 안전 경계를 추적합니다.",
+      "path": "day-23.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-24T09:18:54+09:00"
     }
   ]
 }
