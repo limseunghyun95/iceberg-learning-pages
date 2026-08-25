@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 24</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 4 / DAY 24</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">append/overwrite/delete conflict validation</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Commit·Isolation·Concurrency · 예상 학습 40분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg의 conflict validation은 “table version이 바뀌었는가”만 묻지 않고, operation이 읽고 제거하려던 file·predicate 범위가 concurrent commit 뒤에도 유효한지 검사해 append는 합치고 안전하지 않은 overwrite/delete는 중단하는 의미 기반 transaction gate다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Read set</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Operation이 결과를 계산하며 의존한 table state다. Row-level SQL에서는 matching predicate로 scan한 data/delete file 집합이 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Write set</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">새로 추가하거나 제거할 data/delete file과 이를 가리키는 manifest·snapshot 변화다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Validation predicate</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Base snapshot 이후에도 참이어야 하는 안전 조건이다. 예: 제거 대상 file이 여전히 live이고, 조건 범위에 충돌하는 새 file이 없다는 조건.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Append</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">기존 file을 제거하지 않고 새 data file membership을 더하는 operation이다. Table Spec의 retry 분류에서는 요구 조건 없이 새 current에 재적용할 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Overwrite / replace</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">기존 file 일부를 제거하고 새 file로 바꾸는 변화다. Compaction, dynamic overwrite, COW update/delete가 이 패턴을 쓸 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">File delete / expression delete</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">전자는 특정 file identity를 제거하고, 후자는 <code>event_time &lt; X</code> 같은 조건을 current state에 적용한다. Retry 규칙이 서로 다르다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">COW / MOR</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Copy-on-write는 영향받은 data file을 다시 쓰고, merge-on-read는 delete file을 추가해 read 시 합친다. 같은 SQL도 write set과 검증 대상이 달라진다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Isolation level</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Concurrent 변화 중 무엇을 conflict로 볼지 정한 계약이다. Iceberg는 row-level operation에 serializable과 snapshot isolation을 지원하며 Day 25에서 비교한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Writer A와 B가 같은 base snapshot에서 출발해도 모든 동시 실행이 충돌하는 것은 아니다. 서로 독립적인 append라면 둘 다 보존하는 것이 옳다. 반대로 A가 file F의 row를 읽어 새 F′를 만들었는데 B가 F를 먼저 삭제·재작성했다면 A의 stale F′를 publish하면 B의 변경을 잃거나 삭제된 row를 되살릴 수 있다.</p>
+  <p>따라서 CAS 실패는 1차 신호일 뿐이다. 최신 metadata tree를 읽은 뒤 operation별 read/write set과 concurrent changes의 교집합을 검사해야 “재적용 가능한 경쟁”과 “업무 의미가 깨진 충돌”을 구분할 수 있다. 이 구분이 잘못되면 lost update, write skew, duplicate ingestion, delete 누락, maintenance race가 발생한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>두 층을 구분하자:</strong> Table Spec의 commit retry 규칙은 metadata update를 새 current에 적용할 수 있는지 말한다. Spark의 row-level isolation 검사는 UPDATE/DELETE/MERGE predicate와 concurrent file 추가·삭제까지 검사한다. “Expression delete는 재적용 가능”만 보고 row-level semantic conflict를 무시하면 안 된다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Base S0 계획</strong><br><span style="font-size:14px;color:#cdebf0;">catalog pointer → metadata JSON → snapshot → manifest list → manifest</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ predicate projection·file pruning</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② Read set R / write set W 고정</strong><br><span style="font-size:14px;">Append: add only · Overwrite/Delete: remove/replace 또는 delete file add</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ immutable output 준비</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>③ W1 CAS 성공, current=S1</strong><br><span style="font-size:14px;">Concurrent file add/remove/delete-file change가 먼저 linearize</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ W2 CAS 실패 → refresh</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>④ S0→S1 conflict validation</strong><br><span style="font-size:14px;">R/W, 대상 file 존재, predicate와 concurrent change 교집합 검사</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ compatible: rebase / incompatible: abort·replan</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ 새 snapshot S2 CAS</strong><br><span style="font-size:14px;color:#cdebf0;">CAS 성공 시에만 새 membership이 모든 reader에 보임</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Plan:</strong> Engine은 S0의 schema/spec/sequence와 manifest metric으로 matching data/delete file을 찾는다. Hidden partition transform은 predicate를 spec별로 투영한다.</li>
+    <li><strong>Prepare:</strong> Append는 새 data file을, COW overwrite/delete는 replacement data file을, MOR delete는 equality/position delete file을 unique path에 쓴다. 아직 current graph에는 연결되지 않는다.</li>
+    <li><strong>Concurrent commit:</strong> W1이 catalog CAS로 S1을 publish한다. S1에는 W2가 읽지 못한 data file, 제거된 source file, 새 delete file이 포함될 수 있다.</li>
+    <li><strong>Validate:</strong> W2는 S0 이후 snapshot lineage와 manifest entry를 비교한다. Append는 prepared add를 S1에 더할 수 있다. Replace는 제거하려던 source가 모두 live인지 확인한다. Predicate overwrite/delete는 isolation 수준에 따라 범위 안 concurrent add/delete를 검사한다.</li>
+    <li><strong>Commit or fail:</strong> Compatible하면 S1을 parent로 한 manifest list·snapshot·metadata JSON을 재생성하고 CAS한다. Incompatible하면 prepared bytes가 온전해도 operation을 실패시키고 latest state에서 다시 계획한다.</li>
+    <li><strong>Read visibility:</strong> Reader는 current pointer에서 도달 가능한 data/delete file만 읽고 sequence 규칙으로 delete applicability를 판단한다. Validation 실패 artifact는 orphan 후보일 뿐 committed row가 아니다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">Operation별 validation matrix</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:22%;">Operation</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:37%;">새 current에서 확인</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">판정</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Append</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Spec retry 분류상 기존 file 제거 요구 조건이 없다.</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">새 manifest를 current snapshot에 합쳐 retry 가능. 단, batch dedupe·PK uniqueness는 별도 문제다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Replace</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">제거할 source file이 모두 live인가?</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">모두 존재하면 remove+add 재적용. 하나라도 사라졌으면 abort·replan.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Specific file delete</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">지정한 file이 아직 table에 있는가?</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">있으면 삭제 재적용, 없으면 stale intent이므로 실패.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Expression delete</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Spec 수준에서는 current에 expression을 다시 적용할 수 있다.</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Engine row-level command는 isolation 계약에 따라 concurrent matching file을 추가 검사한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;"><strong>Predicate overwrite</strong></td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">대상 file 존재 + base 이후 destination predicate 안의 add/delete.</td><td style="padding:9px;border:1px solid #dbe3e8;vertical-align:top;">Serializability와 idempotency 요구에 따라 conflict 또는 재적용.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">불변식과 성공 시점</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Membership invariant:</strong> 새 snapshot의 live file 집합은 parent의 live set에 검증된 add/remove를 적용한 결과여야 한다. Concurrent commit의 file을 조용히 잃으면 안 된다.</li>
+    <li><strong>No resurrection:</strong> Base 이후 제거·재작성된 source를 stale replacement로 되살리면 안 된다.</li>
+    <li><strong>Predicate invariant:</strong> Row-level operation이 “조건에 맞는 모든 row”를 바꾼다고 약속했다면 isolation 계약이 허용하지 않는 concurrent matching add를 놓치면 안 된다.</li>
+    <li><strong>Delete applicability:</strong> MOR/equality·position delete와 v3 deletion vector는 data file identity와 sequence semantics를 보존해야 한다. Validation은 byte 존재만이 아니라 적용 관계를 지킨다.</li>
+    <li><strong>Linearization point:</strong> Validation 통과도 성공이 아니다. 새 metadata location의 conditional catalog swap이 성공한 순간에만 state transition이 확정된다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Control path와 data path</h3>
+  <p><strong>Data path</strong>는 executor가 row를 읽고 shuffle하며 data/delete file을 쓰는 경로다. <strong>Control path</strong>는 driver가 base snapshot, read/write set, manifest, validation과 catalog CAS를 관리하는 경로다. Conflict validation이 control path에 있다고 해서 값싼 것은 아니다. Predicate 범위가 넓고 snapshot 사이 manifest가 많으면 validation planning 비용과 catalog stale window가 함께 커진다.</p>
+  <p>Object storage가 성공한 PUT을 보장해도 catalog commit이 실패하면 logical write는 실패다. 반대로 CAS 성공 응답이 유실되면 unknown commit state다. 이때 validation failure와 네트워크 timeout을 같은 retry로 취급하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · operation identity:</strong> Pipeline은 batch ID, source offset 범위, target predicate와 base snapshot ID를 남긴다. Append의 metadata retry 가능성은 end-to-end idempotency를 대신하지 않으므로 duplicate batch를 별도로 차단한다.</p>
+  <p><strong>Best practice 2 · scope 최소화:</strong> Full-table overwrite 대신 명시적 filter나 dynamic overwrite, row-level MERGE를 사용해 read/write set을 줄인다. 단, partition evolution 뒤 dynamic overwrite가 대체하는 partition 의미가 바뀔 수 있어 MERGE가 더 명확할 때가 있다.</p>
+  <p><strong>Best practice 3 · conflict telemetry:</strong> Operation, base/current snapshot, validation type, matching concurrent file 수, predicate, source file 수, isolation property, retry attempt, maintenance job ID를 한 event로 기록한다.</p>
+  <p><strong>Best practice 4 · maintenance coordination:</strong> Compaction은 replace validation을 통과해야 한다. Hot partition의 ingestion·COW delete·rewrite_data_files를 동시에 돌리지 말고 시간 또는 branch/WAP로 scope를 분리한다.</p>
+  <p><strong>Spark 1.11.0 기준:</strong> Table property <code>write.delete.isolation-level</code>, <code>write.update.isolation-level</code>, <code>write.merge.isolation-level</code>의 문서 기본값은 <code>serializable</code>이다. DataFrame V2 overwrite의 write option <code>isolation-level</code>은 <code>null</code>이면 idempotent write용 no checks, <code>serializable</code>이면 destination partition의 concurrent insert/delete, <code>snapshot</code>이면 concurrent delete를 검사한다고 문서화되어 있다. 정확한 지원과 exception은 사용 중인 Spark/Iceberg connector 버전에서 검증한다.</p>
+  <p><strong>Engine 차이:</strong> Table Spec이 append/replace/delete retry 불변식을 정의해도 Spark·Flink·Trino의 SQL surface, COW/MOR default, predicate projection, conflict exception과 지원 format version은 같지 않다. Multi-engine write 전에는 같은 table property와 concurrent test를 CI gate로 둔다.</p>
+  <p><strong>Anti-pattern:</strong> Validation 실패를 transient CAS conflict로 보고 무한 retry하거나, <code>isolation-level=null</code>을 일반 overwrite 성능 옵션처럼 쓰거나, static overwrite에서 PARTITION 절 누락으로 table 전체를 교체하는 것이다.</p>
+  <p><strong>Edge case:</strong> Snapshot expiration이 validation에 필요한 base lineage를 너무 일찍 없애거나, rewrite가 delete file/sequence를 고려하지 않거나, object store에 output만 남은 failed attempt를 즉시 orphan cleanup하면 안전한 복구가 어려워진다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Overwrite/delete job이 validation conflict로 반복 실패하거나 성공했는데 기대한 row가 남거나 사라졌다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">ValidationException/CommitFailed 급증, “required files are missing”, conflicting data/delete file, COW rewrite 반복, 같은 predicate 일부 row 잔존, duplicate append, orphan 증가, maintenance·ingestion 동시 실패.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Engine/connector/catalog/version, operation·COW/MOR·isolation, base/current snapshot과 lineage, predicate·partition spec ID, read/source file 및 concurrent added/removed data/delete file, sequence number, attempt별 log, snapshot summary, catalog latency/status, maintenance timeline, batch ID/offset.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">같은 hot partition overwrite, delete predicate와 late data append 중첩, compaction이 source file 선점, partition evolution 후 overwrite scope 변화, snapshot/serializable 설정 오해, scheduler duplicate, stale table cache, sequence/delete applicability mismatch, catalog timeout의 unknown state.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">동일 predicate의 새 writer·maintenance를 잠시 멈추고 current snapshot을 refresh한다. 실패 attempt의 base, target file/predicate, concurrent diff를 보존하고 operation identity로 성공 여부를 먼저 확정한다. Latest state에서 canary 한 건을 재계획한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Invalid operation은 latest state에서 source set을 다시 읽어 새 output을 만든다. 잘못 성공한 overwrite는 검증된 이전 snapshot/backup source로 compensating write하고, duplicate append는 batch identity로 dedupe한다. Failed artifacts는 safety window 뒤 orphan cleanup한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Validation 비활성화, metadata JSON/manifest 수동 편집, stale file 강제 remove, 같은 SQL의 무한 blind retry, unknown state에서 duplicate append, 증거 전 snapshot expiration·orphan cleanup, isolation을 낮춰 장애를 숨기는 조치는 금지한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> Concurrent append는 합쳐질 수 있지만 같은 범위의 DELETE/INSERT는 isolation validation 대상이 되는 차이를 snapshot·log·metadata table로 관찰한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트의 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>같은 날 partition에 DELETE와 INSERT가 겹칠 때 가능한 결과를 먼저 적는다: 한쪽 validation 실패, 또는 실행이 직렬화되어 둘 다 성공.</li>
+    <li>둘 다 성공하면 최종 row가 어떤 commit 순서를 반영할지 예측한다.</li>
+    <li>학습용 <code>local</code> Hadoop catalog의 timing은 production REST/Glue/Hive catalog를 대표하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Table과 baseline 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+docker compose up -d spark
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day24;
+DROP TABLE IF EXISTS local.day24.conflict_lab PURGE;
+CREATE TABLE local.day24.conflict_lab (
+  id BIGINT,
+  event_time TIMESTAMP,
+  payload STRING
+) USING iceberg
+PARTITIONED BY (days(event_time))
+TBLPROPERTIES (
+  'format-version'='2',
+  'write.delete.mode'='copy-on-write',
+  'write.delete.isolation-level'='serializable',
+  'commit.retry.num-retries'='0'
+);
+INSERT INTO local.day24.conflict_lab VALUES
+  (1, TIMESTAMP '2026-08-25 09:00:00', 'base-a'),
+  (2, TIMESTAMP '2026-08-25 10:00:00', 'base-b'),
+  (3, TIMESTAMP '2026-08-26 09:00:00', 'other-day');
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Day transform partition 두 개와 append snapshot 하나가 생긴다. Retry 0은 conflict를 더 잘 드러내는 failure injection이지 correctness 검사를 끄는 옵션이 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Compatible append 경쟁</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">for i in 101 102 103 104 105 106; do
+  docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+    INSERT INTO local.day24.conflict_lab
+    VALUES ($i, TIMESTAMP '2026-08-27 09:00:00', 'append-$i');
+  &quot; &gt;&quot;/tmp/day24-append-$i.log&quot; 2&gt;&amp;1 &amp;
+done
+wait || true
+
+grep -EHn 'CommitFailed|ValidationException|Exception|Error' /tmp/day24-append-*.log || true
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT count(*) AS append_rows
+FROM local.day24.conflict_lab WHERE id &gt;= 101;
+SELECT committed_at, snapshot_id, parent_id, operation,
+       summary['added-data-files'] AS added_files
+FROM local.day24.conflict_lab.snapshots ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Retry 0이라 timing이 겹친 일부 append는 CAS에서 실패할 수 있다. 그러나 의미상 append끼리는 기존 file 제거 requirement가 없어 retry를 허용하면 합칠 수 있다. “실패가 발생했다”와 “semantic conflict라 재적용 불가”를 구분한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · 같은 predicate DELETE/INSERT 충돌 주입</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">for round in 1 2 3; do
+  docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+    DELETE FROM local.day24.conflict_lab
+    WHERE event_time &gt;= TIMESTAMP '2026-08-25 00:00:00'
+      AND event_time &lt; TIMESTAMP '2026-08-26 00:00:00';
+  &quot; &gt;&quot;/tmp/day24-delete-$round.log&quot; 2&gt;&amp;1 &amp;
+
+  docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+    INSERT INTO local.day24.conflict_lab
+    SELECT id + $round * 1000, event_time, concat(payload, '-late-$round')
+    FROM local.day24.conflict_lab
+    WHERE event_time &gt;= TIMESTAMP '2026-08-25 00:00:00'
+      AND event_time &lt; TIMESTAMP '2026-08-26 00:00:00';
+  &quot; &gt;&quot;/tmp/day24-insert-$round.log&quot; 2&gt;&amp;1 &amp;
+  wait || true
+done
+
+grep -EHn 'CommitFailed|ValidationException|conflict|Exception|Error' /tmp/day24-delete-*.log /tmp/day24-insert-*.log || true
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT id, event_time, payload FROM local.day24.conflict_lab ORDER BY id;
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day24.conflict_lab.snapshots ORDER BY committed_at;
+SELECT content, file_path, record_count, equality_ids
+FROM local.day24.conflict_lab.files ORDER BY content, file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 실제 충돌은 job scheduling과 data 크기에 따라 확률적이다. 겹치면 DELETE의 serializable validation 또는 CAS 실패가 log에 남을 수 있다. 둘 다 성공했다면 commit이 사실상 직렬화되었을 수 있으므로 snapshot parent 순서와 최종 row를 설명한다. 충돌이 없으면 row 수를 늘리거나 round를 6으로 늘리되 무한 반복하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Snapshot isolation 비교</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day24.conflict_lab SET TBLPROPERTIES (
+  'write.delete.isolation-level'='snapshot',
+  'commit.retry.num-retries'='4'
+);
+SHOW TBLPROPERTIES local.day24.conflict_lab ('write.delete.isolation-level');
+&quot;
+
+# 같은 3단계를 한 번 더 실행하고 성공률·최종 row·snapshot 순서를 비교한다.
+# 오늘은 차이를 관찰만 하고 보장 의미는 Day 25에서 엄밀히 해석한다.</pre>
+  <p><strong>예상 관찰:</strong> Snapshot isolation은 concurrent matching add를 serializable과 다르게 허용할 수 있어 conflict가 줄 수 있다. 하지만 실행 timing이 직렬화되면 차이가 드러나지 않는다. 반드시 설정값, log, snapshot lineage를 함께 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>DELETE syntax/extension 오류:</strong> Spark session에 Iceberg SQL extensions가 설정되었는지 프로젝트 구성과 <code>make smoke</code>를 확인한다.</li>
+    <li><strong>모든 job 성공:</strong> Scheduler가 직렬화했을 수 있다. Row를 늘리거나 round를 늘리고 snapshot parent 순서를 확인한다.</li>
+    <li><strong>모든 append 실패:</strong> Retry 0 contention 결과일 수 있다. Log에서 CAS와 validation을 구분하고 retry 4로 같은 append를 새 ID에 실행한다.</li>
+    <li><strong>Table property 무시:</strong> Connector version과 row-level mode 지원을 확인하고 <code>SHOW TBLPROPERTIES</code> 결과를 보존한다.</li>
+    <li><strong>Files table column 차이:</strong> Engine/version별 metadata table projection이 다르면 <code>DESCRIBE local.day24.conflict_lab.files</code> 후 존재하는 column만 조회한다.</li>
+    <li><strong>Production과 결과가 다름:</strong> Hadoop catalog timing과 실제 catalog의 conditional update, cache, throttling을 동일시하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day24.conflict_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day24;
+&quot;
+docker compose stop spark
+# /tmp/day24-*.log는 관찰 기록을 옮긴 뒤 필요 시 직접 정리한다.</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>CAS conflict면 business conflict다.</strong> Append처럼 semantic하게 합칠 수 있는 change도 pointer 경쟁은 발생한다.</li>
+    <li><strong>Append는 중복이 없다.</strong> Metadata retry 가능성과 batch idempotency·PK uniqueness는 별도다.</li>
+    <li><strong>Expression delete는 항상 안전하다.</strong> Spec retry 가능성과 row-level isolation의 concurrent matching add 검사는 다른 층이다.</li>
+    <li><strong>Overwrite는 table 전체 교체다.</strong> Filter/dynamic partition/file replacement 등 scope가 다르며 static mode 오설정은 실제 전체 교체가 될 수 있다.</li>
+    <li><strong>Source file 존재만 보면 충분하다.</strong> Delete file과 sequence applicability, predicate 범위의 concurrent add도 operation에 따라 중요하다.</li>
+    <li><strong>COW와 MOR validation은 같다.</strong> 제거·추가되는 artifact와 read-time merge 책임이 다르다.</li>
+    <li><strong>Isolation을 낮추면 성능만 좋아진다.</strong> 허용되는 concurrent 결과가 달라지므로 업무 invariant 검토가 먼저다.</li>
+    <li><strong>Validation 실패 artifact는 corruption이다.</strong> Current metadata graph에서 unreachable한 prepared output은 보통 orphan 후보다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문 3개</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>두 append와 두 overwrite가 같은 base에서 시작했다. 어떤 쌍을 retry할 수 있는지 설명하라.</strong><br>좋은 답변 구조: 요구사항·operation 정의 → read/write set → CAS와 semantic conflict 구분 → append add-only → overwrite source/predicate validation → rebase/abort → idempotency 대안.</li>
+    <li><strong>Late event ingestion과 GDPR DELETE가 같은 날짜 partition에서 경쟁한다. Isolation과 운영 방안을 설계하라.</strong><br>좋은 답변 구조: SLO·삭제 보장·late rate 수치 → matching predicate → serializable/snapshot 결과 → COW/MOR 비용 → conflict metric·backoff → window 분리/branch/compensation.</li>
+    <li><strong>Compaction이 계속 “required file missing”으로 실패한다. 원인과 복구를 방어하라.</strong><br>좋은 답변 구조: Source file identity assumption → concurrent rewrite/delete/sequence → snapshot·manifest 증거 → latest replan → maintenance scope 조정 → orphan/snapshot retention 안전선.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>CAS conflict 뒤 data file을 재사용해도 반드시 새로 만들어야 하는 metadata는?</li>
+    <li>Rewrite retry가 안전하려면 source file에 대해 어떤 가정이 유지되어야 하는가?</li>
+    <li>Commit contention을 키우는 두 변수 <code>λ</code>와 <code>T</code>는 무엇인가?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>최신 parent를 반영한 manifest list, snapshot, metadata JSON과 CAS attempt. <strong>Metadata rebase</strong>를 말하면 정답.</li>
+      <li>제거하려던 source file이 모두 current table에 live여야 한다. <strong>No stale replace</strong>가 핵심.</li>
+      <li><code>λ</code>는 table commit rate, <code>T</code>는 base load부터 CAS까지 stale window다. <strong>빈도×시간</strong>을 말하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>Append CAS conflict와 overwrite semantic conflict의 차이는?</li>
+    <li>Specific file delete와 expression delete의 retry validation은 어떻게 다른가?</li>
+    <li>Validation 통과가 commit 성공이 아닌 이유는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Append는 add-only라 새 current에 합칠 수 있지만 overwrite는 source/predicate의 concurrent 변화가 lost update를 만들 수 있다. <strong>Read/write set 교집합</strong>이 핵심.</li>
+      <li>Specific file delete는 대상 file이 여전히 live인지 검사하고, expression delete는 current에 재적용 가능하되 row-level isolation은 concurrent matching change를 추가 검사한다. <strong>Spec/engine 층 구분</strong>을 말하면 정답.</li>
+      <li>새 metadata pointer의 conditional catalog swap이 아직 남아 있으며 다른 writer가 먼저 이길 수 있다. <strong>CAS=linearization point</strong>가 핵심.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#commit-conflict-resolution-and-retry" style="color:#0b6f83;">Iceberg Table Spec · Commit Conflict Resolution and Retry</a> — append/replace/delete operation별 재적용 요구 조건.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/reliability/#retry-validation" style="color:#0b6f83;">Iceberg 1.11.0 Reliability · Retry validation</a> — assumption/action과 concurrent retry 정신 모델.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/configuration/#table-behavior-properties" style="color:#0b6f83;">Iceberg 1.11.0 Configuration</a> — row-level write mode와 isolation table property.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-configuration/#write-options" style="color:#0b6f83;">Iceberg 1.11.0 Spark Configuration · Write options</a> — DataFrame overwrite isolation-level과 validate-from-snapshot-id.</li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">공식 페이지는 2026-08-25 기준 최신 Java 문서 1.11.0과 현재 Table Spec을 확인했다. Nightly 기능이나 다른 engine의 지원은 별도 검증 없이 단정하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:8px;">
+    <strong style="color:#8ee7f6;">Day 25 · snapshot/serializable isolation</strong><br>
+    같은 conflict validation이 isolation level에 따라 어떤 concurrent 결과를 허용하는지, write skew와 matching concurrent add를 중심으로 비교한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-19T23:06:16+09:00",
+  "updatedAt": "2026-08-25T09:10:42+09:00",
   "lessons": [
     {
       "day": 1,
@@ -212,6 +212,15 @@
       "path": "day-23.html",
       "kind": "lesson",
       "publishedAt": "2026-08-24T09:18:54+09:00"
+    },
+    {
+      "day": 24,
+      "week": 4,
+      "title": "append/overwrite/delete conflict validation",
+      "summary": "Operation별 read/write set과 file·predicate validation으로 compatible append와 unsafe overwrite/delete 충돌을 구분합니다.",
+      "path": "day-24.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-25T09:10:42+09:00"
     }
   ]
 }
