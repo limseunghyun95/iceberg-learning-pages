@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 25</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 4 / DAY 25</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">snapshot/serializable isolation</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Commit·Isolation·Concurrency · 예상 학습 40분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    두 isolation 모두 committed snapshot을 일관되게 읽지만, serializable은 UPDATE·DELETE·MERGE 조건에 들어올 수 있는 concurrent data file 추가를 conflict로 막고 snapshot isolation은 이를 허용해 동시성을 높이는 대신 조건에 맞는 신규 row가 이번 operation에서 빠질 수 있다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Isolation</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">동시에 실행되는 transaction이 서로의 중간·완료 변화를 어느 범위까지 보거나 충돌로 판단할지 정한 규칙이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Snapshot</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">특정 시점의 table file membership을 가리키는 immutable state node다. 물리 data를 복사한 백업이 아니라 manifest tree의 root다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Snapshot isolation</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Operation은 시작 snapshot의 일관된 view를 읽고, 자신이 의존한 file을 concurrent delete/rewrite가 건드리면 실패한다. Concurrent matching add는 허용할 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Serializable isolation</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">성공한 operation들을 어떤 하나의 직렬 실행 순서로 설명할 수 있게 더 강하게 검증한다. 조건에 들어올 수 있는 concurrent add도 conflict다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Phantom</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">처음 scan에는 없었지만 concurrent insert로 predicate에 새로 들어온 row다. 예: 삭제 중인 날짜 범위에 늦게 들어온 event.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Write skew</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">각 transaction이 서로 다른 row/file을 갱신해 직접 충돌은 없지만, 함께 commit되면 cross-row business invariant가 깨지는 anomaly다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Predicate conflict</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Concurrent file의 partition/metric 범위가 UPDATE·DELETE·MERGE filter와 겹칠 가능성이 있어 해당 operation의 “모든 matching row 처리” 가정을 깨는 상태다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Linearization point</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Catalog가 expected metadata pointer를 새 metadata로 atomic하게 바꾼 순간이다. Validation 통과나 file PUT만으로는 commit 성공이 아니다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Isolation은 “정합성 on/off” 설정이 아니다. 더 강한 serializable은 phantom을 막아 조건 기반 operation의 의미를 지키지만, late ingestion과 UPDATE/DELETE/MERGE가 같은 범위를 자주 건드리면 validation 실패와 재계획 비용이 늘어난다. Snapshot isolation은 concurrent writer가 많은 환경에서 성공률을 높일 수 있지만, 신규 matching row가 이번 operation에서 빠져도 업무상 허용되는지 따져야 한다.</p>
+  <p>예를 들어 <code>event_date='2026-08-26'</code> 범위를 GDPR DELETE하는 동안 같은 날짜의 late event가 들어왔다고 하자. Serializable은 새 file이 delete predicate와 겹칠 수 있으므로 delete를 실패시켜 latest snapshot에서 다시 계획하게 한다. Snapshot isolation은 기존 source file이 concurrent delete되지 않았다면 delete를 commit할 수 있고, late row는 남을 수 있다. 후자가 허용되는지는 재처리 SLA와 삭제 보장에 달려 있다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>이름에 속지 말자:</strong> “Snapshot”은 약한 read consistency가 아니다. 두 수준 모두 reader에게 committed snapshot의 일관된 view만 보여준다. 차이는 주로 row-level writer가 commit 때 concurrent matching data를 얼마나 엄격히 검증하는가에 있다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① W1이 S0에서 predicate P scan</strong><br><span style="font-size:14px;color:#cdebf0;">catalog pointer → metadata JSON → snapshot → manifests → data/delete files</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ COW replacement 또는 MOR delete file 준비</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② W2가 P와 겹칠 수 있는 file F1 append</strong><br><span style="font-size:14px;">CAS(S0→S1) 성공 · F1이 current membership에 추가</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ W1 refresh, S0→S1 diff 검증</td></tr>
+    <tr><td style="background:#fff0f2;text-align:center;padding:13px;border:1px solid #efafb8;border-radius:8px;"><strong>③ Serializable 분기</strong><br><span style="font-size:14px;">F1이 P와 match할 가능성 → conflict → abort·latest replan</span></td></tr>
+    <tr><td style="text-align:center;color:#52636d;font-size:20px;">또는</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④ Snapshot 분기</strong><br><span style="font-size:14px;">W1 source에 conflicting delete가 없음 → commit 허용 · F1은 이번 P 처리에서 빠질 수 있음</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ 새 metadata CAS 성공 시 확정</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Reader가 S1 또는 S2 전체만 관찰</strong><br><span style="font-size:14px;color:#cdebf0;">Partial file set은 보이지 않음 · business invariant는 선택한 isolation 책임</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Plan at S0:</strong> W1은 P를 partition transform과 file metric에 투영해 read set을 고정한다. COW는 matching data file을 읽어 replacement를 만들고, MOR는 delete file을 준비한다.</li>
+    <li><strong>Concurrent add:</strong> W2는 F1을 manifest에 추가하고 catalog CAS로 S1을 publish한다. F1의 bounds나 partition tuple이 P와 겹칠 수 있다.</li>
+    <li><strong>Serializable validation:</strong> W1은 base snapshot 이후 added data file이 P와 충돌할 수 있는지 보수적으로 검사한다. 가능성이 있으면 실제 row를 전부 읽지 않아도 실패한다.</li>
+    <li><strong>Snapshot validation:</strong> W1이 의존하거나 제거하는 file을 concurrent delete/rewrite가 건드렸는지는 검사하지만, P와 겹치는 add만으로 반드시 실패하지 않는다. 따라서 F1 row는 W1의 효과를 받지 않을 수 있다.</li>
+    <li><strong>Commit:</strong> 어느 분기든 validation 통과 뒤 새 manifest list·snapshot·metadata JSON을 만들고 expected pointer CAS를 성공해야 한다. 그 전까지 output은 unreachable artifact다.</li>
+    <li><strong>Read:</strong> Reader는 load한 committed snapshot을 끝까지 사용한다. Refresh 전에는 S0, refresh 후에는 S1/S2를 보며 중간 상태를 섞어 보지 않는다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">보장·비용 비교</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:27%;">판단축</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:36%;">Serializable</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Snapshot</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Read view</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Committed S0 일관 view</td><td style="padding:9px;border:1px solid #dbe3e8;">Committed S0 일관 view</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Concurrent matching add</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">UPDATE/DELETE/MERGE를 실패시켜 replan</td><td style="padding:9px;border:1px solid #dbe3e8;">허용 가능 · 신규 row가 operation에서 빠질 수 있음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Concurrent source delete</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Conflict</td><td style="padding:9px;border:1px solid #dbe3e8;">Conflict</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Phantom 방지</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Predicate validation으로 방지</td><td style="padding:9px;border:1px solid #dbe3e8;">보장하지 않음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Contention</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">더 많은 safe failure·replan</td><td style="padding:9px;border:1px solid #dbe3e8;">더 높은 commit 성공 가능성</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>적합한 요구</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">조건의 모든 matching row 처리</td><td style="padding:9px;border:1px solid #dbe3e8;">Concurrent add를 다음 batch가 처리해도 됨</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Predicate validation은 왜 보수적인가</h3>
+  <p>Iceberg는 F1 전체를 다시 읽지 않고 manifest의 partition tuple과 lower/upper bounds로 “P와 절대 겹치지 않는다”를 증명한다. 증명하지 못하면 serializable은 conflict로 판단할 수 있다. False positive conflict는 성능 손실이지만, false negative는 serializability 손실이다. 따라서 넓은 bounds, null/NaN, 낮은 clustering, 오래된 partition spec은 validation 충돌 범위를 키울 수 있다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Per-operation isolation, general database transaction과의 차이</h3>
+  <p>Iceberg의 설정은 주로 한 table의 UPDATE/DELETE/MERGE 또는 overwrite operation이 commit할 때 적용된다. 여러 SQL 문장과 여러 table의 cross-row business constraint를 자동으로 하나의 serializable database transaction으로 묶는다는 뜻이 아니다. “A와 B 중 최소 한 명은 on-call” 같은 invariant는 application coordination, branch, catalog의 multi-table capability 또는 별도 transaction layer가 필요하다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">COW·MOR·sequence 연결</h3>
+  <p>COW는 base data file을 replacement로 바꾸므로 source file existence가 핵심이다. MOR는 delete file을 더하고 reader가 data와 delete를 합치므로 concurrent data file이 해당 delete의 적용 대상인지 sequence semantics가 중요하다. Snapshot isolation에서 허용된 F1이 delete보다 뒤 sequence를 받으면 이번 delete가 F1에 적용되지 않을 수 있다. 정확한 적용 규칙은 Day 26에서 이어간다. V3 deletion vector도 물리 표현은 달라도 data file identity와 applicability 불변식을 지켜야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · invariant부터 선택:</strong> “이번 DELETE 종료 시 P row가 0이어야 한다”면 serializable을 우선한다. “시작 시점 S0의 row만 처리하고 late row는 다음 checkpoint가 처리해도 된다”면 snapshot이 가능하다.</p>
+  <p><strong>Best practice 2 · 수치화:</strong> Conflict rate, replan 시간, late-arrival rate, predicate 폭, 삭제 완료 SLA, batch cadence를 기록한다. Isolation을 낮추기 전에 허용되는 phantom 수와 reconciliation 시간 상한을 명시한다.</p>
+  <p><strong>Best practice 3 · 범위 축소:</strong> Partition transform과 sort order를 query pattern에 맞추고, broad full-table predicate보다 event-time watermark·business key 범위를 사용해 validation scan과 false-positive conflict를 줄인다.</p>
+  <p><strong>Best practice 4 · reconciliation:</strong> Snapshot isolation을 쓴다면 batch ID/watermark와 post-condition query를 저장하고, late row를 잡는 second pass를 자동화한다. “다음번에 언젠가”는 정책이 아니다.</p>
+  <p><strong>Apache Iceberg 1.11.0 기준:</strong> <code>write.delete.isolation-level</code>, <code>write.update.isolation-level</code>, <code>write.merge.isolation-level</code>의 문서 기본값은 <code>serializable</code>이며 값은 <code>serializable</code> 또는 <code>snapshot</code>이다. Spark DataFrame overwrite의 write option <code>isolation-level</code>은 별도 surface이고, <code>validate-from-snapshot-id</code>와 함께 base를 명시할 수 있다.</p>
+  <p><strong>Multi-engine 차이:</strong> Table Spec은 optimistic commit의 기반을 정하지만, Spark·Flink·Trino·각 catalog가 row-level SQL, COW/MOR, isolation property와 exception을 같은 범위로 지원한다고 가정하지 않는다. Writer engine/version 조합별 concurrent test를 release gate로 둔다.</p>
+  <p><strong>Maintenance race:</strong> Compaction은 source file replacement validation으로 실패할 수 있고, serializable predicate conflict와 별개 원인이다. Ingestion, delete, rewrite가 같은 hot partition을 동시에 건드리지 않게 scope·시간·branch를 조정한다.</p>
+  <p><strong>Anti-pattern:</strong> Conflict가 귀찮다는 이유로 전체 table을 snapshot으로 낮추고 post-condition을 두지 않거나, serializable이면 cross-table business invariant까지 자동 보호된다고 믿는 것이다.</p>
+  <p><strong>Edge case:</strong> Catalog timeout은 isolation conflict가 아니라 unknown commit state일 수 있다. Object storage PUT 성공도 logical commit 성공이 아니다. 먼저 current metadata와 operation identity로 status를 확인한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Serializable conflict가 급증하거나 snapshot isolation operation 뒤 predicate에 맞는 row가 남아 있다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Conflicting data files/ValidationException, row-level job retry 폭증, late row 잔존, GDPR DELETE post-check 실패, p95 commit latency 상승, maintenance와 ingestion 동시 실패, 동일 predicate 재실행 반복.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Engine/connector/catalog/version, operation·COW/MOR·isolation property, base/current snapshot과 parent lineage, predicate·spec ID, concurrent added/removed data/delete file의 bounds·sequence, batch ID/watermark, attempt·validation latency, object PUT와 catalog CAS/status, maintenance timeline.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Late append가 serializable predicate와 중첩, broad bounds의 false-positive conflict, snapshot에서 matching add 허용, compaction이 source file 선점, property 미지원/오타, stale base·cache, partition evolution으로 validation 범위 확대, unknown state 오분류.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">동일 범위 writer·maintenance를 잠시 분리하고 current snapshot을 refresh한다. 실패 operation의 base, predicate, isolation과 concurrent file diff를 보존한다. Snapshot 결과는 post-condition으로 잔존 row를 계수하고, serializable은 latest state에서 canary 한 건만 재계획한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Serializable 실패는 latest snapshot에서 재계획한다. Snapshot phantom은 watermark 이후 second-pass DELETE/MERGE나 compensating write로 정정한다. 잘못된 snapshot은 영향 범위를 검증한 뒤 rollback 또는 forward fix하고, orphan은 safety window 후 정리한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Validation 비활성화, 전체 table isolation 즉시 하향, stale SQL 무한 retry, metadata/manifest 수동 편집, unknown state에서 중복 실행, 증거 전 snapshot expiration·orphan cleanup, post-condition 없이 “성공” 처리하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 같은 stale base 뒤 matching file을 추가하고 DataFrame overwrite를 serializable/snapshot으로 각각 commit해 predicate conflict 차이를 의도적으로 만든다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker daemon과 프로젝트 Spark/Iceberg 환경이 준비되어 있고 <code>make smoke</code>가 성공해야 한다.</li>
+    <li>Serializable table은 concurrent matching add 뒤 overwrite가 실패하고, snapshot table은 commit될 가능성이 높다고 예측한다.</li>
+    <li>Snapshot table에서 late row가 남을지 replacement에 의해 사라질지 먼저 적고 실제 row·snapshot lineage로 판정한다.</li>
+    <li>DataFrame write option 지원은 Spark/Iceberg connector 버전에 의존한다. 학습 환경은 Iceberg 1.11.0 기준이다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Spark shell에서 stale-base 시나리오 실행</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+docker compose up -d spark
+
+docker compose exec -T spark /opt/spark/bin/spark-shell &lt;&lt;'SCALA'
+import org.apache.spark.sql.functions.expr
+import spark.implicits._
+
+spark.sql(&quot;CREATE NAMESPACE IF NOT EXISTS local.day25&quot;)
+
+def setup(name: String): Long = {
+  spark.sql(s&quot;DROP TABLE IF EXISTS $name PURGE&quot;)
+  spark.sql(s&quot;&quot;&quot;
+    CREATE TABLE $name (
+      id BIGINT, region STRING, payload STRING
+    ) USING iceberg
+    PARTITIONED BY (region)
+    TBLPROPERTIES ('format-version'='2')
+  &quot;&quot;&quot;)
+  spark.sql(s&quot;INSERT INTO $name VALUES (1, 'A', 'base')&quot;)
+  spark.sql(s&quot;&quot;&quot;
+    SELECT snapshot_id FROM $name.snapshots
+    ORDER BY committed_at DESC LIMIT 1
+  &quot;&quot;&quot;).head.getLong(0)
+}
+
+def staleOverwrite(name: String, level: String): Unit = {
+  val base = setup(name)
+  spark.sql(s&quot;INSERT INTO $name VALUES (2, 'A', 'late-after-base')&quot;)
+  val replacement = Seq((100L, &quot;A&quot;, s&quot;replacement-$level&quot;))
+    .toDF(&quot;id&quot;, &quot;region&quot;, &quot;payload&quot;)
+  try {
+    replacement.writeTo(name)
+      .option(&quot;isolation-level&quot;, level)
+      .option(&quot;validate-from-snapshot-id&quot;, base.toString)
+      .overwrite(expr(&quot;region = 'A'&quot;))
+    println(s&quot;RESULT $level: COMMIT SUCCEEDED&quot;)
+  } catch {
+    case e: Throwable =&gt;
+      println(s&quot;RESULT $level: ${e.getClass.getSimpleName}: ${e.getMessage}&quot;)
+  }
+  spark.sql(s&quot;SELECT * FROM $name ORDER BY id&quot;).show(false)
+  spark.sql(s&quot;&quot;&quot;
+    SELECT committed_at, snapshot_id, parent_id, operation
+    FROM $name.snapshots ORDER BY committed_at
+  &quot;&quot;&quot;).show(false)
+}
+
+staleOverwrite(&quot;local.day25.serializable_lab&quot;, &quot;serializable&quot;)
+staleOverwrite(&quot;local.day25.snapshot_lab&quot;, &quot;snapshot&quot;)
+System.exit(0)
+SCALA</pre>
+  <p><strong>예상 관찰:</strong> Serializable은 base 이후 region A에 추가된 file이 overwrite predicate와 겹쳐 validation failure를 내야 한다. Snapshot은 concurrent add만으로는 같은 검사를 강제하지 않아 commit될 수 있다. 실제 row 결과는 connector 구현과 overwrite plan을 함께 기록하고, 성공/실패 문구만 보지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Evidence를 metadata로 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT 'serializable' AS level, *
+FROM local.day25.serializable_lab ORDER BY id;
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day25.serializable_lab.snapshots ORDER BY committed_at;
+
+SELECT 'snapshot' AS level, *
+FROM local.day25.snapshot_lab ORDER BY id;
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day25.snapshot_lab.snapshots ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>채점 기준:</strong> Serializable 실패는 corruption이 아니라 business predicate 보존을 위한 safe abort다. Snapshot 성공은 더 “정확하다”는 뜻이 아니라 concurrent add를 허용한 계약이다. 두 table 모두 reader는 partial snapshot을 보지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입과 대안</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>의도적 stale base:</strong> Initial snapshot ID를 저장한 뒤 matching append를 먼저 commit하고 그 오래된 ID로 overwrite validation을 시작한다.</li>
+    <li><strong>Serializable도 성공:</strong> Connector가 해당 DataFrame option을 지원하지 않거나 predicate/file metric이 겹치지 않은 것일 수 있다. <code>SHOW TBLPROPERTIES</code>, runtime version, log를 보존하고 row-level DELETE table property 실습으로 교차 검증한다.</li>
+    <li><strong>Snapshot도 실패:</strong> Concurrent add가 아니라 source delete/CAS 또는 overwrite plan validation이 원인일 수 있다. Exception의 validator 이름과 snapshot diff를 확인한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Unknown option:</strong> Iceberg runtime이 1.11.0인지 확인하고 Spark DataSource V2 경로를 사용한다.</li>
+    <li><strong>AnalysisException:</strong> Catalog와 SQL extensions 설정을 <code>make smoke</code> 및 프로젝트 compose config로 확인한다.</li>
+    <li><strong>getLong type 오류:</strong> <code>DESCRIBE local.day25.serializable_lab.snapshots</code>로 <code>snapshot_id</code> type을 확인한다.</li>
+    <li><strong>Both results identical:</strong> Message와 lineage, final rows를 모두 비교한다. Isolation 차이는 항상 row count 하나로만 드러나지 않는다.</li>
+    <li><strong>Production과 다름:</strong> Hadoop catalog 학습 결과를 REST/Glue/Hive catalog의 conflict wrapping·retry와 동일시하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day25.serializable_lab PURGE;
+DROP TABLE IF EXISTS local.day25.snapshot_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day25;
+&quot;
+docker compose stop spark</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Snapshot isolation reader는 dirty data를 본다.</strong> 두 수준 모두 committed snapshot만 본다.</li>
+    <li><strong>Serializable이면 lock을 오래 잡는다.</strong> Iceberg는 optimistic validation과 atomic metadata swap으로 구현한다.</li>
+    <li><strong>Snapshot은 source delete도 무시한다.</strong> 자신이 의존한 file의 conflicting delete/rewrite는 여전히 안전하지 않다.</li>
+    <li><strong>Serializable이면 multi-table ACID다.</strong> 보장은 operation·table·connector surface를 벗어나 자동 확장되지 않는다.</li>
+    <li><strong>Conflict가 많으면 isolation을 낮추면 된다.</strong> 업무 invariant와 reconciliation SLA가 먼저다.</li>
+    <li><strong>File metric overlap은 실제 row conflict 확정이다.</strong> 보수적 가능성 판정이라 false positive가 있을 수 있다.</li>
+    <li><strong>COW와 MOR 결과는 같다.</strong> Artifact와 sequence/delete applicability가 달라진다.</li>
+    <li><strong>CAS timeout은 isolation failure다.</strong> Commit 성공 여부가 불명인 unknown state이므로 status check가 먼저다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문 3개</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Snapshot isolation과 serializable isolation의 차이를 Iceberg file validation으로 설명하라.</strong><br>좋은 답변 구조: Committed S0 read → predicate/read set → concurrent matching add와 source delete → 두 분기 → CAS linearization → phantom·throughput trade-off.</li>
+    <li><strong>GDPR DELETE와 late ingestion이 경쟁한다. 어떤 isolation과 운영 정책을 선택할 것인가?</strong><br>좋은 답변 구조: 삭제 SLA·late rate 수치 → predicate 범위 → serializable safe abort → snapshot+watermark/second pass 대안 → COW/MOR 비용 → post-condition·감사 증거.</li>
+    <li><strong>Serializable conflict가 20%다. Isolation을 낮추지 않고 개선하라.</strong><br>좋은 답변 구조: λ·stale window·bounds 측정 → partition/sort/predicate scope → maintenance 분리 → batch coalescing/backoff → false-positive 분석 → canary와 correctness gate.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 어제 내용 회상 3문제</h2>
+  <ol style="padding-left:22px;">
+    <li>Append CAS conflict와 overwrite semantic conflict는 어떻게 다른가?</li>
+    <li>Specific file delete와 expression delete의 retry validation 차이는?</li>
+    <li>Validation 통과 뒤에도 commit 성공이 아닌 이유는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Append는 add-only라 새 current에 합칠 수 있지만 overwrite는 source/predicate 변화가 lost update를 만들 수 있다. <strong>Read/write set 교집합</strong>이 핵심.</li>
+      <li>Specific file delete는 대상 file이 live인지 검사하고, expression delete는 current에 재적용 가능하되 row-level isolation은 matching add를 추가 검사한다. <strong>Spec/engine 층</strong>을 구분하면 정답.</li>
+      <li>새 metadata pointer의 conditional catalog swap이 아직 남아 있다. <strong>CAS=linearization point</strong>가 핵심.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인 문제 3개</h2>
+  <ol style="padding-left:22px;">
+    <li>두 isolation이 공통으로 보장하는 read view는?</li>
+    <li>Serializable은 실패시키지만 snapshot은 허용할 수 있는 대표 concurrent 변화는?</li>
+    <li>Snapshot isolation을 선택할 때 반드시 함께 설계할 운영 장치는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준</strong>
+    <ol style="padding-left:22px;margin-bottom:0;">
+      <li>Operation이 load한 committed snapshot의 일관된 view이며 partial/uncommitted file set은 보지 않는다. <strong>Committed snapshot</strong>을 말하면 정답.</li>
+      <li>UPDATE/DELETE/MERGE predicate에 match할 수 있는 concurrent data file 추가다. <strong>Phantom add</strong>가 핵심.</li>
+      <li>Watermark/batch ID, post-condition query, late row second pass와 완료 SLA다. <strong>Reconciliation</strong>을 구체화하면 정답.</li>
+    </ol>
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/javadoc/latest/org/apache/iceberg/IsolationLevel.html" style="color:#0b6f83;">Iceberg 1.11.0 Javadoc · IsolationLevel</a> — 두 isolation의 공통 read view와 concurrent matching add 차이.</li>
+    <li><a href="https://iceberg.apache.org/spec/#optimistic-concurrency" style="color:#0b6f83;">Iceberg Table Spec · Optimistic Concurrency</a> — atomic metadata swap과 validation이 isolation을 만드는 원리.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/configuration/#table-behavior-properties" style="color:#0b6f83;">Iceberg 1.11.0 Configuration</a> — delete/update/merge isolation table property와 기본값.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-configuration/#write-options" style="color:#0b6f83;">Iceberg 1.11.0 Spark Configuration · Write options</a> — overwrite isolation-level과 validate-from-snapshot-id.</li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">공식 페이지는 2026-08-26 기준 최신 Java 문서 1.11.0과 현재 Table Spec을 확인했다. Nightly 기능이나 다른 engine 지원은 별도 검증 없이 단정하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">13. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:8px;">
+    <strong style="color:#8ee7f6;">Day 26 · sequence number와 delete applicability</strong><br>
+    어떤 delete file이 어떤 data file에 적용되는지, snapshot sequence·data sequence·file sequence의 비교 규칙을 COW/MOR와 연결한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

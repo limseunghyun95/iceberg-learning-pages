@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-08-25T09:10:42+09:00",
+  "updatedAt": "2026-08-26T09:09:21+09:00",
   "lessons": [
     {
       "day": 1,
@@ -221,6 +221,15 @@
       "path": "day-24.html",
       "kind": "lesson",
       "publishedAt": "2026-08-25T09:10:42+09:00"
+    },
+    {
+      "day": 25,
+      "week": 4,
+      "title": "snapshot/serializable isolation",
+      "summary": "Committed snapshot read는 공유하되 concurrent matching add 검증이 달라지는 두 isolation의 보장·phantom·비용을 비교합니다.",
+      "path": "day-25.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-26T09:09:21+09:00"
     }
   ]
 }
