@@ -230,6 +230,15 @@
       "path": "day-25.html",
       "kind": "lesson",
       "publishedAt": "2026-08-26T09:09:21+09:00"
+    },
+    {
+      "day": 26,
+      "week": 4,
+      "title": "sequence number와 delete applicability",
+      "summary": "Snapshot/data/file sequence를 구분하고 equality·position·DV의 strict/inclusive 적용 규칙과 rewrite 불변식을 추적합니다.",
+      "path": "day-26.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-27T09:18:32+09:00"
     }
   ]
 }
