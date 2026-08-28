@@ -239,6 +239,15 @@
       "path": "day-26.html",
       "kind": "lesson",
       "publishedAt": "2026-08-27T09:18:32+09:00"
+    },
+    {
+      "day": 27,
+      "week": 4,
+      "title": "랩: 두 writer concurrent commit",
+      "summary": "같은 base의 compatible append rebase와 same-file overwrite validation failure를 재현해 CAS·재시도·orphan 경계를 검증합니다.",
+      "path": "day-27.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-28T09:19:15+09:00"
     }
   ]
 }

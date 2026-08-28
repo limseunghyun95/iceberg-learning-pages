@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 27</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 4 / DAY 27 · INTEGRATION LAB</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">랩: 두 writer concurrent commit</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Commit·Isolation·Concurrency · 예상 학습 20분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    같은 base snapshot에서 출발한 두 writer 중 하나만 첫 catalog CAS에 성공하지만, append처럼 compatible한 변화는 최신 state에 rebase해 다시 commit할 수 있고 같은 data file을 교체하는 overwrite는 validation으로 안전하게 거부해야 한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Writer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Table에 새 snapshot을 만들려는 job 또는 process다. Spark driver, Flink checkpoint committer, maintenance action 모두 writer가 될 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Base snapshot</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Writer가 계획을 세울 때 읽은 출발 state다. “이 file들이 현재 존재한다”는 validation 전제의 기준점이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">CAS</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Compare-and-swap. Catalog pointer가 내가 예상한 metadata M0일 때만 M1로 바꾸는 원자 연산이다. 동시 commit의 승자를 정하는 linearization point다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Optimistic concurrency</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">긴 lock을 잡지 않고 각 writer가 독립 준비한 뒤 commit 시점에 충돌을 검사하는 방식이다. 충돌이 드물면 throughput이 높다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Rebase</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">CAS에서 진 writer가 최신 metadata를 읽고 자신의 논리 변화를 그 위에 다시 얹는 과정이다. 기존 data file을 다시 쓸 필요가 없는 경우가 많다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Validation</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Base 이후 변화가 operation의 전제를 깨는지 검사한다. Source file 소실, predicate와 겹치는 신규 file, delete 충돌 등이 대상이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Orphan artifact</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Object storage에는 있지만 committed metadata graph에서 도달할 수 없는 data·manifest·metadata file이다. 실패 writer의 준비물이 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Unknown commit state</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">CAS 요청 뒤 응답을 잃어 성공과 실패를 확정할 수 없는 상태다. 명시적 CAS conflict와 달리 blind retry하면 중복 commit 위험이 있다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Production에서는 streaming append, batch overwrite, CDC MERGE, compaction이 같은 table을 동시에 쓴다. “동시에 쓰면 하나는 무조건 실패한다”도, “Iceberg가 알아서 모두 retry한다”도 틀리다. 결과는 operation의 read/write set과 최신 state가 전제를 깨는지에 달려 있다.</p>
+  <p>Blind append 두 건은 서로의 file을 읽거나 지우지 않으므로 보통 compatible하다. 첫 writer가 pointer를 바꿔 두 번째의 CAS가 실패해도, 두 번째는 최신 snapshot 위에 자신의 manifest를 다시 연결할 수 있다. 반대로 두 overwrite가 같은 source file을 제거하려 하면 첫 commit 뒤 두 번째의 전제가 사라진다. 이를 다시 얹으면 삭제된 data를 되살리거나 상대 writer의 결과를 덮을 수 있으므로 safe abort가 맞다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>오늘의 핵심 구분:</strong> CAS 실패는 “누가 먼저 commit했다”는 신호이고, validation 실패는 “내 계획의 의미가 더 이상 안전하지 않다”는 신호다. Timeout은 성공 여부조차 모르는 세 번째 상태다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① W-A와 W-B가 catalog M0 → snapshot S0 load</strong><br><span style="font-size:14px;color:#cdebf0;">같은 base, 서로의 uncommitted artifact는 보지 않음</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ 독립적으로 immutable data/manifest 준비</td></tr>
+    <tr><td style="background:#e9f8fb;text-align:center;padding:13px;border:1px solid #9ed7e2;border-radius:8px;"><strong>② W-A: CAS(expected=M0, new=M1) 성공</strong><br><span style="font-size:14px;">S1 publish · 이 순간부터 reader가 전체 S1을 볼 수 있음</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ W-B의 CAS(expected=M0)는 명시적 conflict</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>③ W-B refresh: M1/S1을 읽고 S0→S1 diff 검증</strong><br><span style="font-size:14px;">Control path만 갱신 · 준비한 data file은 아직 재사용 가능</span></td></tr>
+    <tr><td style="text-align:center;color:#52636d;font-size:20px;">↙ compatible append　　　　　　　　　conflicting overwrite ↘</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④-A Rebase 후 CAS(M1→M2) 성공</strong><br><span style="font-size:14px;">두 append 모두 보존 · parent S1인 새 S2</span></td></tr>
+    <tr><td style="background:#fff0f2;text-align:center;padding:13px;border:1px solid #efafb8;border-radius:8px;"><strong>④-B Validation 실패, commit 중단</strong><br><span style="font-size:14px;">필수 source file이 이미 교체됨 · prepared file은 orphan 후보</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ committed pointer만 table state를 소유</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Reader는 S0, S1, S2 중 하나의 완전한 graph만 읽음</strong><br><span style="font-size:14px;color:#cdebf0;">Partial merge 없음 · failed artifact는 table row로 보이지 않음</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Plan:</strong> 두 writer는 M0가 가리키는 metadata JSON, S0, manifest list와 manifest를 읽는다. Data path에는 각자 새 file을 쓰지만 control path는 아직 바뀌지 않는다.</li>
+    <li><strong>First commit:</strong> W-A가 새 metadata M1을 준비하고 catalog CAS에 성공한다. 성공 확정 시점은 file PUT이나 manifest 생성이 아니라 pointer swap이다.</li>
+    <li><strong>Refresh:</strong> W-B의 stale expected pointer는 CAS에서 거절된다. W-B는 S1을 읽어 S0 이후 added/removed data·delete file과 sequence를 비교한다.</li>
+    <li><strong>Compatible branch:</strong> Append는 기존 file을 제거하지 않아 W-A의 append와 합성 가능하다. W-B는 새 manifest list/metadata만 만들고 준비한 data/manifest를 재사용해 M1→M2를 시도한다.</li>
+    <li><strong>Conflict branch:</strong> Overwrite가 제거하려던 source file이 W-A에 의해 사라졌다면 plan 전제가 깨졌다. W-B는 prepared replacement를 publish하지 않고 validation exception으로 끝난다.</li>
+    <li><strong>Read:</strong> Reader는 load한 snapshot을 query 끝까지 사용한다. S1과 S2의 file set을 임의로 섞거나 failed writer의 orphan을 directory listing으로 읽지 않는다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">State owner와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:27%;">구성요소</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:34%;">소유 상태</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">불변식</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Catalog</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Table 이름의 current metadata pointer</td><td style="padding:9px;border:1px solid #dbe3e8;">Expected pointer가 일치하는 한 writer만 atomic update</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Metadata JSON</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Current snapshot, history, schema/spec/order, last sequence</td><td style="padding:9px;border:1px solid #dbe3e8;">Committed graph는 immutable, parent lineage가 끊기지 않음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Snapshot/manifest</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Operation별 file membership 변화</td><td style="padding:9px;border:1px solid #dbe3e8;">Retry가 compatible change를 합쳐도 상대 commit을 잃지 않음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Writer operation</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Base snapshot, read/write set, predicate, prepared files</td><td style="padding:9px;border:1px solid #dbe3e8;">Base 이후 변화가 전제를 깨면 publish하지 않음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Object storage</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Immutable bytes와 URI</td><td style="padding:9px;border:1px solid #dbe3e8;">존재만으로 table membership을 뜻하지 않음</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">세 실패 상태는 복구법이 다르다</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:28%;">상태</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:32%;">아는 것</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">안전한 다음 행동</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>CAS conflict</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">내 update는 publish되지 않았고 다른 commit이 먼저 성공</td><td style="padding:9px;border:1px solid #dbe3e8;">Refresh → revalidate → compatible하면 bounded retry</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Validation failure</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Base 전제가 깨져 현재 plan은 의미적으로 unsafe</td><td style="padding:9px;border:1px solid #dbe3e8;">원 operation을 latest state에서 재계획하거나 업무 충돌 해결</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>Unknown state</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">CAS가 처리됐을 수도, 아닐 수도 있음</td><td style="padding:9px;border:1px solid #dbe3e8;">Operation identity·snapshot summary·added file로 status check 먼저</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">비용 모델</h3>
+  <p>Optimistic concurrency는 lock 대기 대신 충돌 시 metadata refresh, manifest diff, predicate validation, 새 metadata 생성 비용을 낸다. Append retry는 이미 쓴 data/manifest를 재사용해 비교적 싸다. Overwrite·MERGE·maintenance는 source file과 predicate가 넓을수록 replan 비용과 safe failure 확률이 커진다. Commit rate가 catalog CAS 처리량을 넘으면 backoff만으로는 해결되지 않으며 micro-batch 합치기, hot partition 분리, maintenance window가 필요하다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · operation identity:</strong> Job run ID, source checkpoint, batch ID를 snapshot summary에 남긴다. Unknown state에서 current history를 검색해 성공 여부를 판정하고 중복 재실행을 막을 수 있다.</p>
+  <p><strong>Best practice 2 · retry taxonomy:</strong> CommitFailed/CAS conflict, ValidationException, CommitStateUnknown을 같은 retry handler에 넣지 않는다. Exception class, base/current snapshot, attempt와 backoff를 구조화해 기록한다.</p>
+  <p><strong>Best practice 3 · 수치 예산:</strong> Commit p95/p99, CAS conflict rate, validation failure rate, retry attempts, status-check latency, orphan bytes, catalog error rate를 본다. Retry 횟수보다 total timeout과 downstream SLA를 함께 제한한다.</p>
+  <p><strong>Best practice 4 · scope 축소:</strong> Overwrite/MERGE predicate와 compaction file group을 작게 유지하고 streaming hot partition과 maintenance 범위를 시간·branch로 분리한다. 충돌 영역이 줄면 false-positive validation과 replan도 줄어든다.</p>
+  <p><strong>Apache Iceberg 1.11.0 문서 기준:</strong> Table behavior property의 기본값은 commit retry 4회, 최소 wait 100ms, 최대 wait 60초, total timeout 30분이다. Unknown-state status check는 별도 기본 3회다. 이 값은 보장 자체가 아니라 retry budget이며 catalog SLA와 job deadline에 맞춰 조정한다.</p>
+  <p><strong>Multi-engine 차이:</strong> Table Spec은 atomic replacement와 retry 원칙을 정의하지만 Spark·Flink·Trino와 REST/Hive/Glue/Hadoop catalog의 exception wrapping, automatic retry, isolation option, status-check surface는 같지 않다. Engine/version 조합별 concurrency contract test를 release gate로 둔다.</p>
+  <p><strong>Maintenance race:</strong> Rewrite action이 새 file을 준비한 뒤 streaming delete가 source에 붙으면 rewrite validation이 실패할 수 있다. 실패를 강제로 무시하면 delete가 유실될 수 있으므로 latest delete까지 포함해 다시 계획한다.</p>
+  <p><strong>Anti-pattern:</strong> 모든 conflict를 지수 backoff로만 덮거나, append가 재시도 가능하다는 사실을 overwrite에도 일반화하거나, timeout 직후 동일 batch를 새 ID로 다시 쓰는 것이다.</p>
+  <p><strong>Edge case:</strong> Catalog CAS는 성공했지만 client가 응답 전에 끊길 수 있다. Object storage가 read-after-write consistent해도 이 control-plane ambiguity는 남는다. Data object 존재 여부만으로 성공을 판정하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> 동시 writer에서 commit 실패·retry 폭증·중복 batch 또는 orphan file이 관찰된다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">CommitFailedException/ValidationException/CommitStateUnknown, retry storm, p99 commit 지연, 같은 batch row 중복, snapshot summary 누락, prepared data·manifest 증가, maintenance와 ingestion 동시 실패.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Engine/connector/catalog/version, exact exception class와 cause, operation·isolation·COW/MOR, base/current snapshot ID·sequence·parent, added/removed data/delete paths와 predicate/spec ID, job/batch ID, attempt/backoff, object PUT·catalog request timeline, current metadata pointer.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Compatible append의 정상 CAS 경쟁, 같은 source file overwrite, concurrent matching add/delete, compaction race, stale cache, retry budget 과소/과대, catalog throttling, 응답 유실 뒤 unknown state, idempotency key 불일치.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">동일 batch blind retry와 orphan cleanup을 멈춘다. Catalog를 refresh해 current graph에서 operation identity와 prepared path를 조회한다. 명시적 CAS conflict만 canary 한 건으로 revalidate하고, validation failure는 충돌 범위를 격리한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">성공 확인 시 checkpoint를 해당 snapshot에 맞춘다. 미성공 확인 시 latest snapshot에서 재계획한다. 중복은 compensating DELETE/MERGE로 forward fix하고, 잘못된 overwrite는 영향 검증 후 rollback한다. 고유 orphan은 safety window와 reachability 확인 뒤 정리한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Validation 비활성화, stale plan 무한 retry, metadata JSON·pointer 수동 편집, timeout을 실패로 단정, warehouse 최신 file 일괄 삭제, 증거 전 snapshot expiration/remove-orphan, job ID를 바꾼 중복 append를 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 같은 base에서 미리 만든 두 append operation은 둘 다 성공하는 반면, 같은 source file을 지우는 두 overwrite 중 두 번째는 validation failure가 되는 것을 Iceberg API와 snapshot lineage로 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker Desktop이 정상 실행 중이고 프로젝트의 <code>make smoke</code>가 성공해야 한다. 학습 환경은 Spark 3.5.8 + Iceberg 1.11.0이다.</li>
+    <li>두 append operation은 같은 base ID를 출력하고 최종 row/file 수가 base 포함 3이 될 것이라고 예측한다.</li>
+    <li>두 overwrite operation은 같은 victim path와 base를 사용하며, A 성공 뒤 B는 <code>ValidationException</code> 계열로 실패할 것이라고 예측한다.</li>
+    <li>실패 B가 준비한 replacement file은 table query에는 안 보이고 orphan 후보가 된다. 실습은 실패가 확정된 뒤 그 고유 file만 지운다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Deterministic concurrent-commit model 실행</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+docker compose up -d
+
+docker compose exec -T spark /opt/spark/bin/spark-shell &lt;&lt;'SCALA'
+import org.apache.iceberg._
+import org.apache.iceberg.spark.Spark3Util
+
+spark.sql(&quot;CREATE NAMESPACE IF NOT EXISTS local.day27&quot;)
+spark.sql(&quot;DROP TABLE IF EXISTS local.day27.concurrent_lab PURGE&quot;)
+spark.sql(&quot;&quot;&quot;
+  CREATE TABLE local.day27.concurrent_lab (
+    id BIGINT, writer STRING, note STRING
+  ) USING iceberg
+&quot;&quot;&quot;)
+spark.sql(&quot;INSERT INTO local.day27.concurrent_lab VALUES (0, 'base', 'seed')&quot;)
+
+def firstDataFile(t: Table): DataFile = {
+  val tasks = t.newScan().planFiles()
+  try tasks.iterator().next().file()
+  finally tasks.close()
+}
+
+// 동일 Parquet bytes를 unique path로 복제해 commit 전 prepared data file을 만든다.
+def cloneDataFile(t: Table, src: DataFile, label: String): DataFile = {
+  val token = java.util.UUID.randomUUID().toString
+  val target = s&quot;${t.location()}/data/day27-$label-$token.parquet&quot;
+  val in = t.io().newInputFile(src.path().toString).newStream()
+  val out = t.io().newOutputFile(target).create()
+  val buf = new Array[Byte](64 * 1024)
+  try {
+    var n = in.read(buf)
+    while (n != -1) {
+      if (n &gt; 0) out.write(buf, 0, n)
+      n = in.read(buf)
+    }
+  } finally {
+    in.close()
+    out.close()
+  }
+  DataFiles.builder(t.spec()).copy(src)
+    .withPath(target)
+    .withFileSizeInBytes(t.io().newInputFile(target).getLength())
+    .build()
+}
+
+// A. Compatible append: 두 operation을 commit 전에 만들어 같은 base를 고정한다.
+val seedTable = Spark3Util.loadIcebergTable(spark, &quot;local.day27.concurrent_lab&quot;)
+val seedFile = firstDataFile(seedTable)
+val appendFileA = cloneDataFile(seedTable, seedFile, &quot;append-A&quot;)
+val appendFileB = cloneDataFile(seedTable, seedFile, &quot;append-B&quot;)
+val appendTableA = Spark3Util.loadIcebergTable(spark, &quot;local.day27.concurrent_lab&quot;)
+val appendTableB = Spark3Util.loadIcebergTable(spark, &quot;local.day27.concurrent_lab&quot;)
+val appendBaseA = appendTableA.currentSnapshot().snapshotId()
+val appendBaseB = appendTableB.currentSnapshot().snapshotId()
+val appendA = appendTableA.newAppend().appendFile(appendFileA)
+  .set(&quot;lab.writer&quot;, &quot;append-A&quot;)
+val appendB = appendTableB.newAppend().appendFile(appendFileB)
+  .set(&quot;lab.writer&quot;, &quot;append-B&quot;)
+appendA.commit()
+appendB.commit() // stale base를 refresh/rebase한 뒤 내부 retry로 성공해야 한다.
+println(s&quot;APPEND_BASES=$appendBaseA,$appendBaseB&quot;)
+
+// B. Failure injection: 같은 victim을 교체하는 overwrite 둘을 같은 base에 고정한다.
+val overwriteTableA = Spark3Util.loadIcebergTable(spark, &quot;local.day27.concurrent_lab&quot;)
+val overwriteTableB = Spark3Util.loadIcebergTable(spark, &quot;local.day27.concurrent_lab&quot;)
+val overwriteBase = overwriteTableA.currentSnapshot().snapshotId()
+val victim = firstDataFile(overwriteTableA)
+val replacementA = cloneDataFile(overwriteTableA, victim, &quot;overwrite-A&quot;)
+val replacementB = cloneDataFile(overwriteTableB, victim, &quot;overwrite-B&quot;)
+val overwriteA = overwriteTableA.newOverwrite()
+  .deleteFile(victim).addFile(replacementA)
+  .validateFromSnapshot(overwriteBase)
+  .validateNoConflictingData().validateNoConflictingDeletes()
+  .set(&quot;lab.writer&quot;, &quot;overwrite-A&quot;)
+val overwriteB = overwriteTableB.newOverwrite()
+  .deleteFile(victim).addFile(replacementB)
+  .validateFromSnapshot(overwriteBase)
+  .validateNoConflictingData().validateNoConflictingDeletes()
+  .set(&quot;lab.writer&quot;, &quot;overwrite-B&quot;)
+
+overwriteA.commit()
+var expectedFailure = false
+try {
+  overwriteB.commit()
+  println(&quot;OVERWRITE_B=UNEXPECTED_SUCCESS&quot;)
+} catch {
+  case e: Throwable =&gt;
+    expectedFailure = true
+    println(s&quot;OVERWRITE_B=EXPECTED_FAILURE ${e.getClass.getSimpleName}: ${e.getMessage}&quot;)
+}
+
+// B가 publish되지 않았음이 확정된 경우에만 우리가 만든 고유 orphan을 지운다.
+if (expectedFailure) {
+  overwriteTableB.io().deleteFile(replacementB.path().toString)
+  println(s&quot;CLEANED_KNOWN_ORPHAN=${replacementB.path()}&quot;)
+}
+
+spark.sql(&quot;REFRESH TABLE local.day27.concurrent_lab&quot;)
+spark.sql(&quot;&quot;&quot;
+  SELECT committed_at, snapshot_id, parent_id, operation,
+         summary['lab.writer'] AS lab_writer,
+         summary['added-data-files'] AS added,
+         summary['deleted-data-files'] AS deleted
+  FROM local.day27.concurrent_lab.snapshots
+  ORDER BY committed_at
+&quot;&quot;&quot;).show(false)
+spark.sql(&quot;SELECT count(*) AS visible_rows FROM local.day27.concurrent_lab&quot;).show(false)
+spark.sql(&quot;SELECT content, file_path, record_count FROM local.day27.concurrent_lab.files ORDER BY file_path&quot;).show(false)
+System.exit(0)
+SCALA</pre>
+  <p><strong>예상 관찰:</strong> <code>APPEND_BASES</code>의 두 값은 같고 snapshot lineage에는 <code>append-A</code>, <code>append-B</code>가 연속 parent로 남는다. 두 번째 append는 library 내부 CAS retry 때문에 사용자 코드에는 성공으로 보일 수 있다. Overwrite A만 snapshot이 되고 B는 expected failure다. 최종 visible row 수는 3이며 failed replacement path는 metadata table에 없어야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Commit graph와 current state 재확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT made_current_at, snapshot_id, parent_id, is_current_ancestor
+FROM local.day27.concurrent_lab.history ORDER BY made_current_at;
+
+SELECT status, snapshot_id, sequence_number, file_sequence_number,
+       data_file.file_path
+FROM local.day27.concurrent_lab.entries
+ORDER BY sequence_number, file_sequence_number, data_file.file_path;
+&quot;</pre>
+  <p><strong>채점 기준:</strong> ① append B가 base snapshot을 parent로 직접 쓰지 않고 A 이후 current snapshot 위에 연결됐는가, ② overwrite B의 replacement가 current files에 없는가, ③ reader가 partial artifact가 아닌 committed graph만 보는가를 설명하면 통과다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">실패 주입 해설</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>주입:</strong> 두 overwrite가 같은 base와 같은 victim file을 삭제하도록 operation object를 commit 전에 모두 준비했다.</li>
+    <li><strong>안전한 실패:</strong> A commit 뒤 victim은 current membership에서 사라진다. B의 validation은 stale source를 발견하고 publish를 거부한다.</li>
+    <li><strong>왜 blind retry가 아닌가:</strong> B가 latest state에서 다시 무엇을 교체해야 하는지는 업무 의미를 포함한 재계획 문제다. 기존 victim 삭제를 그냥 무시하고 B replacement를 추가하면 A 결과와 중복될 수 있다.</li>
+    <li><strong>Unknown state는 미주입:</strong> Catalog 응답 유실은 임의로 만들면 상태 판정이 복잡해진다. 이 실습에서는 명시적 validation failure만 만들고 unknown state는 runbook으로 다룬다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Docker API 500/daemon 오류:</strong> Docker Desktop이 완전히 시작됐는지 확인하고 <code>docker version</code>, <code>docker compose version</code>을 먼저 점검한다.</li>
+    <li><strong>Dependency download 실패:</strong> 네트워크와 <code>/tmp/.ivy2</code> 쓰기 권한을 확인한 뒤 <code>make smoke</code>로 runtime loading을 선행한다.</li>
+    <li><strong>FileAlreadyExistsException:</strong> 이전 비정상 종료 artifact일 수 있다. Table을 drop/purge한 뒤 새 namespace로 재실행한다. Production path를 임의 삭제하지 않는다.</li>
+    <li><strong>OVERWRITE_B unexpected success:</strong> <code>validateFromSnapshot</code>와 두 validation 호출이 빠졌는지, 두 operation의 victim path/base가 정말 같은지 출력한다.</li>
+    <li><strong>Metadata column 오류:</strong> Connector version별 schema 차이는 <code>DESCRIBE local.day27.concurrent_lab.entries</code>로 확인해 projection을 맞춘다.</li>
+    <li><strong>다른 catalog에서 결과 차이:</strong> Hadoop/REST/Hive/Glue의 CAS와 exception wrapping은 다를 수 있다. Snapshot lineage와 current files라는 불변식으로 판정한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day27.concurrent_lab PURGE;
+DROP NAMESPACE IF EXISTS local.day27;
+&quot;
+docker compose stop spark</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>두 writer가 같은 base면 둘 중 하나는 최종 실패한다.</strong> Compatible append는 rebase 후 둘 다 성공할 수 있다.</li>
+    <li><strong>CAS conflict는 corruption이다.</strong> Optimistic concurrency에서 정상적인 경쟁 신호다.</li>
+    <li><strong>모든 CAS conflict는 blind retry 가능하다.</strong> Latest diff가 operation 전제를 깨는지 먼저 검증해야 한다.</li>
+    <li><strong>Validation failure는 retry 횟수를 늘리면 해결된다.</strong> Stale plan을 반복하는 한 의미적 충돌은 사라지지 않는다.</li>
+    <li><strong>Timeout은 실패다.</strong> Catalog가 commit한 뒤 응답만 잃었을 수 있다.</li>
+    <li><strong>Data file PUT 성공은 table commit 성공이다.</strong> Catalog pointer가 새 metadata를 가리켜야 한다.</li>
+    <li><strong>Retry는 모든 bytes를 다시 쓴다.</strong> Immutable data/manifest를 재사용하고 작은 metadata tree만 다시 만들 수 있다.</li>
+    <li><strong>Orphan은 즉시 삭제해도 된다.</strong> Unknown state, 장기 writer, 다른 branch의 reachability를 확인한 뒤 safety window를 둔다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>초당 50개 micro-batch append와 시간당 compaction이 같은 table에 commit한다. Control plane을 설계하라.</strong><br>좋은 답변 구조: Commit rate·catalog p99·SLA 수치 → append/rewrite read-write set → CAS/rebase/validation 경로 → retry/status-check budget → hot scope 분리 → batch coalescing·branch 대안과 비용 → metrics/alert.</li>
+    <li><strong>Commit timeout 뒤 job을 재실행해도 되는지 어떻게 판단하는가?</strong><br>좋은 답변 구조: Unknown state 정의 → operation/batch identity → catalog current pointer와 snapshot history → summary/added paths 확인 → success/failure/계속 unknown 세 분기 → idempotent recovery와 하지 말아야 할 조치.</li>
+    <li><strong>왜 concurrent append는 merge 가능하지만 같은-file overwrite는 그렇지 않은가?</strong><br>좋은 답변 구조: Base snapshot과 set 연산 모델 → append의 독립 add set → overwrite의 delete+add/read dependency → source file 소실 수치 예시 → serializable validation → replan·lock/queue 대안과 throughput trade-off.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Data sequence와 file sequence를 분리해야 하는 rewrite 사례는?</li>
+    <li>Equality delete와 position delete의 same-sequence 비교는 어떻게 다른가?</li>
+    <li>Applicable DV가 있는 data file에 position delete도 있으면 reader는 무엇을 선택하는가?</li>
+  </ol>
+  <p style="background:#f7fafb;border:1px solid #dbe3e8;padding:13px 15px;"><strong>짧은 정답:</strong> ① Sequence 2 content를 sequence 8에 rewrite하면 dataSeq=2, fileSeq=8이 가능하다. ② Equality는 <code>dataSeq&lt;deleteSeq</code>, position은 path·partition이 맞을 때 <code>dataSeq≤deleteSeq</code>다. ③ Applicable DV를 쓰고 그 data file의 position delete는 무시한다. 논리 나이·same-commit 의미·중복 적용 방지까지 말하면 만점.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>두 append가 같은 M0를 예상했는데 모두 최종 성공할 수 있는 이유는?</li>
+    <li>같은 source file을 교체하는 overwrite B가 A 이후 실패해야 하는 불변식은?</li>
+    <li>CAS conflict, validation failure, unknown state의 첫 조치를 각각 한 문장으로 말하라.</li>
+  </ol>
+  <p style="background:#edf8f2;border:1px solid #9fd4b7;padding:13px 15px;"><strong>정답/채점:</strong> ① B의 첫 CAS는 실패하지만 A의 append와 compatible하므로 최신 M1에 rebase하고 CAS(M1→M2)할 수 있다. ② 이미 제거된 victim을 여전히 current라고 가정한 plan을 publish하지 않아 상대 결과를 잃거나 data를 되살리지 않아야 한다. ③ CAS conflict는 refresh/revalidate, validation failure는 latest에서 재계획, unknown은 status check가 먼저다. Linearization point와 orphan 처리까지 연결하면 각 2점+보너스 1점.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#commit-conflict-resolution-and-retry" style="color:#087b94;">Apache Iceberg Table Spec · Commit Conflict Resolution and Retry</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/configuration/#table-behavior-properties" style="color:#087b94;">Apache Iceberg 1.11.0 · Table Behavior Properties</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-writes/" style="color:#087b94;">Apache Iceberg 1.11.0 · Spark Writes</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-configuration/#write-options" style="color:#087b94;">Apache Iceberg 1.11.0 · Spark Write Options</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">Table Spec의 atomic commit 원칙과 2026-08-28 현재 latest documentation(1.11.0)을 확인했다. Exception surface와 automatic retry 범위는 engine/connector/catalog 버전별로 달라질 수 있다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:9px;">
+    <strong>Day 28 · 회상: data file은 생겼지만 commit 실패한 경우</strong><br>
+    Week 4 전체를 회상하며 prepared artifact, explicit conflict, unknown state, orphan cleanup의 안전 경계를 incident drill로 설명한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
