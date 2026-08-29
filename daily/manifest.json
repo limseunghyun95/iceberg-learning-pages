@@ -248,6 +248,15 @@
       "path": "day-27.html",
       "kind": "lab",
       "publishedAt": "2026-08-28T09:19:15+09:00"
+    },
+    {
+      "day": 28,
+      "week": 4,
+      "title": "회상: data file은 생겼지만 commit 실패한 경우",
+      "summary": "물리 file 존재와 metadata graph membership을 분리하고 explicit failure·unknown state·orphan cleanup의 안전 경계를 회상합니다.",
+      "path": "day-28.html",
+      "kind": "review",
+      "publishedAt": "2026-08-29T09:20:38+09:00"
     }
   ]
 }
