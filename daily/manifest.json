@@ -257,6 +257,15 @@
       "path": "day-28.html",
       "kind": "review",
       "publishedAt": "2026-08-29T09:20:38+09:00"
+    },
+    {
+      "day": 29,
+      "week": 5,
+      "title": "copy-on-write vs merge-on-read",
+      "summary": "COW의 data file rewrite와 MOR의 delete/new-data delta를 비교해 write·read·compaction 비용과 호환성 경계를 판단합니다.",
+      "path": "day-29.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-30T09:00:50+09:00"
     }
   ]
 }

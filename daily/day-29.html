@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 29</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 5 / DAY 29</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">copy-on-write vs merge-on-read</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Row-level Update/Delete와 Format Version · 예상 학습 40분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Copy-on-write(COW)는 변경이 닿은 data file을 즉시 다시 써 read path를 단순하게 만들고, merge-on-read(MOR)는 기존 data file을 유지한 채 delete file과 새 row를 commit해 write latency를 낮추는 대신 reader와 compaction에 병합 비용을 넘긴다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Row-level mutation</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Table의 일부 row만 UPDATE·DELETE·MERGE하는 변경이다. Iceberg data file은 immutable이므로 같은 bytes를 제자리 수정하지 않는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Copy-on-write (COW)</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">변경 row가 들어 있는 data file을 읽고, 살아남은 row와 수정 row를 새 data file로 복사한 뒤 old file을 metadata에서 제거하는 방식이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Merge-on-read (MOR)</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">기존 data file을 유지하고 삭제 표식을 delete file에 기록한다. UPDATE는 old row 삭제 표식과 new row data를 함께 commit하며 reader가 scan 중 합친다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Delete file</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">V2에서 도입된 row 삭제 정보다. Position delete는 file path+row position, equality delete는 field ID로 식별한 key 값을 저장한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Write amplification</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">논리적으로 바꾼 bytes보다 물리적으로 읽고 다시 쓴 bytes가 더 큰 현상이다. 큰 file의 row 1개 COW 수정이 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Read amplification</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">질의 결과에 필요한 data 외에 delete file을 열고 매칭·필터링하는 추가 I/O·CPU·memory 비용이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Compaction</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Small data/delete file을 더 큰 data file로 다시 써 scan 비용을 회수하는 maintenance다. MOR 비용이 사라지는 것이 아니라 뒤로 이동한 것이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Mode property</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;"><code>write.delete.mode</code>, <code>write.update.mode</code>, <code>write.merge.mode</code>가 SQL operation별 전략을 선언한다. 실제 지원은 engine·connector·format version을 함께 확인한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>“COW가 빠른가, MOR가 빠른가”라는 질문에는 workload가 빠져 있다. 하루 한 번 읽는 CDC table이라면 MOR의 낮은 write latency가 유리할 수 있지만, 수천 개 dashboard query가 같은 file을 반복 읽는다면 delete merge 비용이 쓰기 절감액을 넘어선다. 반대로 512MB file의 row 1개를 자주 고치는 table에서 COW를 고집하면 매 mutation마다 수백 MB를 읽고 쓰게 된다.</p>
+  <p>이 선택은 단순 성능 knob가 아니다. Snapshot이 참조하는 file 종류, reader가 지켜야 할 불변식, conflict validation 범위, maintenance 주기, multi-engine 호환성과 장애 복구 절차가 바뀐다. 그래서 “writer가 빨랐다”가 아니라 end-to-end read/write/maintenance 비용과 freshness SLO를 함께 측정해야 한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 판단:</strong> COW는 변경 비용을 commit 전에 지불해 current snapshot을 self-contained한 data file 집합으로 만들고, MOR는 변경 의도를 별도 artifact로 commit해 reader가 snapshot 일관성 아래 data+delete를 결합하도록 한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 7px;table-layout:fixed;">
+    <tr><td colspan="2" style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Writer: catalog pointer → M0 → S0 → manifests → data file D0</strong><br><span style="font-size:14px;color:#cdebf0;">Predicate로 변경 대상 row와 file을 plan</span></td></tr>
+    <tr><td style="width:50%;text-align:center;color:#0b8198;font-size:18px;padding:6px;"><strong>↓ COW</strong></td><td style="width:50%;text-align:center;color:#b46a00;font-size:18px;padding:6px;"><strong>↓ MOR</strong></td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;vertical-align:top;"><strong>②-C file rewrite</strong><br><span style="font-size:14px;">D0 read → 변경 적용 → D1 write<br>D0 removed, D1 added</span></td><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;vertical-align:top;"><strong>②-M delta write</strong><br><span style="font-size:14px;">D0 유지 → delete file X1 write<br>UPDATE면 new row D1도 write</span></td></tr>
+    <tr><td colspan="2" style="text-align:center;color:#0b8198;font-size:20px;">↓ manifest list·manifest·metadata M1 준비 → CAS(M0, M1)</td></tr>
+    <tr><td colspan="2" style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>③ Catalog pointer swap이 공통 linearization point</strong><br><span style="font-size:14px;">성공 전 artifact는 비공개 · 성공 뒤 snapshot이 data/delete membership 소유</span></td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;vertical-align:top;"><strong>④-C Reader</strong><br><span style="font-size:14px;">D1만 scan<br>추가 delete merge 없음</span></td><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;vertical-align:top;"><strong>④-M Reader</strong><br><span style="font-size:14px;">D0(+D1) scan + X1 scope/sequence 확인<br>deleted row 제거</span></td></tr>
+    <tr><td colspan="2" style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Maintenance: rewrite_data_files로 delta를 새 base data file에 materialize</strong><br><span style="font-size:14px;color:#cdebf0;">새 snapshot commit 뒤 old data/delete file은 retention을 거쳐 정리</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Plan:</strong> Engine은 current snapshot을 고정하고 predicate·partition·metrics로 candidate data file을 찾는다. Mode property는 control path의 전략 선택이고, row bytes는 아직 바뀌지 않는다.</li>
+    <li><strong>COW prepare:</strong> Candidate file 전체를 읽어 변경되지 않은 row도 복사한다. 바꾼 row가 적을수록 logical change 대비 physical I/O 비율이 커진다.</li>
+    <li><strong>MOR prepare:</strong> Existing data file은 유지한다. DELETE는 delete artifact를, UPDATE는 old row delete와 new row data를 만든다. Writer는 빠르지만 file fan-out이 늘 수 있다.</li>
+    <li><strong>Commit:</strong> 두 방식 모두 immutable artifact와 새 metadata graph를 준비한 뒤 catalog CAS로 공개한다. COW/MOR도 atomicity와 optimistic conflict validation을 우회하지 않는다.</li>
+    <li><strong>Read:</strong> COW reader는 current data file만 읽는다. MOR reader는 manifest pruning 후 data file별 적용 가능한 delete를 sequence·partition·file scope로 붙이고 row를 제거한다.</li>
+    <li><strong>Compact:</strong> MOR delta가 누적되면 maintenance writer가 data+delete를 읽어 새 base data file을 쓴다. 이 동안 concurrent commit validation과 snapshot retention race를 관리해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:28%;">계층</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">책임과 불변식</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Table property</td><td style="padding:9px;border:1px solid #dbe3e8;">Operation별 기본 전략을 선언한다. Property 문자열이 실제 file을 바꾸지는 않으며 engine이 지원·해석해야 한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Snapshot/manifests</td><td style="padding:9px;border:1px solid #dbe3e8;">Current data/delete membership의 권위자다. COW old file removal과 MOR delete addition은 한 snapshot에서 원자적으로 보인다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Reader</td><td style="padding:9px;border:1px solid #dbe3e8;">고정한 snapshot의 모든 적용 가능한 delete를 정확히 반영해야 한다. Raw Parquet reader는 이 계약을 충족하지 못한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Catalog</td><td style="padding:9px;border:1px solid #dbe3e8;">Metadata pointer CAS가 성공을 확정한다. Mode와 무관하게 lost update를 막는 linearization point다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Maintenance</td><td style="padding:9px;border:1px solid #dbe3e8;">Logical row set을 보존하면서 file layout만 바꾼다. Concurrent writer가 건드린 file을 덮지 않도록 validation한다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">간단한 비용 모델</h3>
+  <p>영향 data file 크기를 <code>F</code>, 변경 bytes를 <code>Δ</code>, delete artifact를 <code>X</code>, 해당 snapshot을 읽는 query 수를 <code>Q</code>라 하자. 대략 COW mutation 비용은 <code>read(F)+write(F)</code>, MOR mutation 비용은 <code>write(X+new rows)</code>다. 반대로 query당 COW 추가 merge는 거의 0이고 MOR는 <code>read(X)+match(data,X)</code>를 지불한다. 총비용은 storage 단가뿐 아니라 p95 latency, CPU, shuffle, compaction, cache hit와 재시도까지 포함한다.</p>
+  <p><strong>예:</strong> 512MB file의 row 10개를 바꾸고 그 snapshot을 10,000번 읽는다면 COW는 한 번 큰 rewrite, MOR는 10,000번 delete 적용이 된다. 같은 table을 한 번만 읽고 계속 변경한다면 반대 결론이 날 수 있다. 따라서 “MOR=빠름”과 “COW=안전함” 같은 단일 라벨은 부족하다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Data path와 control path</h3>
+  <p><strong>Data path:</strong> COW는 old data read → filter/update → new data write, MOR는 delete/new data write → read-time merge다. <strong>Control path:</strong> 두 모드 모두 base snapshot load → validation → manifests/metadata 생성 → catalog CAS다. 실패 window도 artifact PUT 전, PUT 후 CAS 전, CAS 응답 유실로 동일하나, MOR는 orphan 후보에 delete file이 추가된다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:25%;">판단 축</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:36%;">COW 쪽 근거</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">MOR 쪽 근거</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Read:write 비율</td><td style="padding:9px;border:1px solid #dbe3e8;">Read-heavy, p95 query SLO 엄격</td><td style="padding:9px;border:1px solid #dbe3e8;">Write-heavy, mutation freshness 우선</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">변경 밀도</td><td style="padding:9px;border:1px solid #dbe3e8;">File의 큰 비율을 바꿔 rewrite 낭비가 작음</td><td style="padding:9px;border:1px solid #dbe3e8;">큰 file의 극소수 row만 변경</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Engine 집합</td><td style="padding:9px;border:1px solid #dbe3e8;">Delete 지원이 제각각인 multi-engine</td><td style="padding:9px;border:1px solid #dbe3e8;">모든 reader가 같은 delete feature를 검증</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Maintenance</td><td style="padding:9px;border:1px solid #dbe3e8;">별도 compaction 운영 여력이 낮음</td><td style="padding:9px;border:1px solid #dbe3e8;">Delete/file SLO와 compaction budget 보유</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Conflict scope</td><td style="padding:9px;border:1px solid #dbe3e8;">Hot file rewrite가 낮은 빈도</td><td style="padding:9px;border:1px solid #dbe3e8;">Fine-grained delta가 유리하되 semantics 검증 필요</td></tr>
+  </table>
+  <p><strong>Best practice 1 · 모드를 operation별로 분리:</strong> DELETE, UPDATE, MERGE의 빈도와 행위를 따로 계측한다. 한 table에 세 property를 기계적으로 같은 값으로 맞출 필요는 없다.</p>
+  <p><strong>Best practice 2 · file-level 지표:</strong> 변경 row 수뿐 아니라 scanned/replaced data bytes, added delete files, delete/data file ratio, query당 delete files opened, compaction lag, p95를 수집한다.</p>
+  <p><strong>Best practice 3 · MOR 예산:</strong> Partition/file별 delete file 수나 deleted-row ratio가 threshold를 넘으면 compaction을 예약한다. Fixed cron만 쓰면 hotspot과 한산한 partition을 동일하게 취급한다.</p>
+  <p><strong>Best practice 4 · 호환성 gate:</strong> Spark·Flink·Trino 등 모든 reader/writer의 format version과 delete/DV 지원을 staging에서 교차 검증한다. Spec이 허용한다는 사실과 배포 engine이 구현했다는 사실을 분리한다.</p>
+  <p><strong>Apache Iceberg 1.11.0 기준:</strong> <code>write.delete.mode</code>, <code>write.update.mode</code>, <code>write.merge.mode</code> 기본은 <code>copy-on-write</code>이며 <code>merge-on-read</code> 선택은 v2 이상으로 문서화되어 있다. Spark의 row-level SQL은 Iceberg SQL extensions가 필요하다.</p>
+  <p><strong>Format 경계:</strong> V1은 row-level delete file을 지원하지 않는다. V2는 position/equality delete를, V3는 deletion vector를 추가하며 새 position delete 추가를 금지한다. 오늘의 COW/MOR 논리는 공통이지만 실제 delta artifact와 reader 알고리즘은 version별로 다르다.</p>
+  <p><strong>Anti-pattern:</strong> Write latency 하나만 보고 MOR 전환, delete file 개수 무제한 방치, COW를 row 1개 CDC에 사용, raw Parquet reader 병행, property만 바꾸고 기존 delta를 즉시 사라졌다고 가정하는 것이다.</p>
+  <p><strong>Edge case:</strong> Predicate가 partition 전체를 정확히 제거하면 engine은 metadata-only delete로 file reference만 제거할 수 있다. 이때 row-level COW/MOR 비교 자체가 적용되지 않으므로 snapshot summary와 file diff를 먼저 본다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> MOR 전환 뒤 query가 느려지거나 engine별 row count가 달라졌다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Read p95·planning time 급증, delete file open/bytes 증가, OOM·spill, Spark와 다른 engine의 row count 불일치, deleted row 재등장, compaction conflict, referenced delete file 404.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Snapshot ID·sequence·operation/summary, table format/property history, data/delete manifests와 content type, file별 record_count/size/partition, query plan·delete planning mode·opened files·spill, engine/connector version, compaction job base/current metadata, object HEAD/404.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Delete file 누적, equality key의 낮은 선택도, position path mismatch, sequence 적용 오류/미지원 reader, V2/V3 feature 불일치, compaction 지연·충돌, premature cleanup, stale catalog cache, raw Parquet 우회.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">영향 snapshot과 engine을 pin하고 mutation/cleanup을 일시 중지한다. Known-good Iceberg reader로 row count와 metadata files를 교차 확인하고, dry-run 성격으로 compaction 후보·비용을 산정한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">호환 reader로 우회하거나 검증된 rewrite로 data+delete를 새 base file에 materialize한다. 잘못된 snapshot은 reference 보존 후 rollback/forward fix하고, 404 artifact는 동일 URI 복원 또는 안전 snapshot으로 되돌린다. 이후 COW 기본값과 threshold를 조정한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Raw data file만 읽어 delete를 무시하지 않는다. Manifest/sequence를 수동 편집하거나 delete file을 직접 지우지 않는다. Blind VACUUM·orphan cleanup, 전체 table 무계획 rewrite, validation 비활성화, 지원 미확인 engine 재투입을 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 같은 1,000-row dataset을 COW/MOR table에 넣고 row 1개를 삭제한다. 두 query 결과는 같지만 current file graph가 COW의 data rewrite와 MOR의 data+delete로 달라지는지 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker Desktop이 정상이고 프로젝트 <code>make smoke</code>가 성공해야 한다. Lab은 Spark SQL extensions와 Iceberg 1.11.0 runtime을 사용한다.</li>
+    <li>두 table의 final count는 999다. COW에는 current delete file이 0개, MOR에는 1개 이상이 생길 것이라고 먼저 적는다.</li>
+    <li>COW data file의 record count는 999로 바뀌고, MOR base data file은 1,000 row를 유지한 채 delete artifact가 1 row를 가리킬 것으로 예상한다. Task/file 수에 따라 물리 file 개수는 달라질 수 있다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 동일한 V2 table 두 개 생성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+docker compose up -d
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day29;
+DROP TABLE IF EXISTS local.day29.cow PURGE;
+DROP TABLE IF EXISTS local.day29.mor PURGE;
+
+CREATE TABLE local.day29.cow (id BIGINT, payload STRING) USING iceberg
+TBLPROPERTIES (
+  'format-version'='2',
+  'write.delete.mode'='copy-on-write',
+  'write.update.mode'='copy-on-write',
+  'write.merge.mode'='copy-on-write'
+);
+
+CREATE TABLE local.day29.mor (id BIGINT, payload STRING) USING iceberg
+TBLPROPERTIES (
+  'format-version'='2',
+  'write.delete.mode'='merge-on-read',
+  'write.update.mode'='merge-on-read',
+  'write.merge.mode'='merge-on-read'
+);
+
+INSERT INTO local.day29.cow
+SELECT /*+ REPARTITION(1) */ id, concat('v-', cast(id AS STRING)) FROM range(0, 1000);
+INSERT INTO local.day29.mor
+SELECT /*+ REPARTITION(1) */ id, concat('v-', cast(id AS STRING)) FROM range(0, 1000);
+&quot;</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · 같은 row 삭제</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DELETE FROM local.day29.cow WHERE id = 42;
+DELETE FROM local.day29.mor WHERE id = 42;
+
+SELECT 'cow' AS mode, count(*) AS rows FROM local.day29.cow
+UNION ALL
+SELECT 'mor' AS mode, count(*) AS rows FROM local.day29.mor;
+&quot;</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Current file graph 비교</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT 'cow' AS mode, content, count(*) AS files,
+       sum(record_count) AS records, sum(file_size_in_bytes) AS bytes
+FROM local.day29.cow.files GROUP BY content
+UNION ALL
+SELECT 'mor' AS mode, content, count(*) AS files,
+       sum(record_count) AS records, sum(file_size_in_bytes) AS bytes
+FROM local.day29.mor.files GROUP BY content
+ORDER BY mode, content;
+
+SELECT committed_at, operation, summary
+FROM local.day29.cow.snapshots ORDER BY committed_at;
+SELECT committed_at, operation, summary
+FROM local.day29.mor.snapshots ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> <code>content=0</code>은 data, V2의 <code>content=1</code>은 position delete, <code>content=2</code>는 equality delete다. COW는 current data만, MOR는 base data와 delete가 함께 보인다. Snapshot summary의 added/removed data/delete file 수가 전략의 증거다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Failure injection: MOR delta 누적</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DELETE FROM local.day29.mor WHERE id = 43;
+DELETE FROM local.day29.mor WHERE id = 44;
+DELETE FROM local.day29.mor WHERE id = 45;
+
+SELECT content, count(*) AS files, sum(record_count) AS records,
+       sum(file_size_in_bytes) AS bytes
+FROM local.day29.mor.files GROUP BY content ORDER BY content;
+
+EXPLAIN FORMATTED
+SELECT * FROM local.day29.mor WHERE id BETWEEN 40 AND 50;
+&quot;</pre>
+  <p><strong>관찰:</strong> 작은 logical deletes가 여러 snapshot/delete artifact로 누적될 수 있다. Query 결과는 맞아도 planning·file open·merge 비용은 증가한다. Exact file 수는 engine batching과 distribution에 따라 달라지므로 “몇 개”보다 data/delete 비율과 추세를 본다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>DELETE syntax/extension 오류:</strong> <code>spark.sql.extensions</code>와 catalog 설정을 확인하고 <code>make smoke</code>를 다시 실행한다.</li>
+    <li><strong>MOR에도 delete file이 없음:</strong> Property 오타, format-version, metadata-only delete 여부, engine connector 버전을 확인한다. Unpartitioned row 1개 조건은 metadata-only가 아니어야 한다.</li>
+    <li><strong>Data file이 여러 개:</strong> Spark task/AQE가 hint를 조정할 수 있다. File 수 자체가 아니라 current content와 record 합계를 비교한다.</li>
+    <li><strong>두 count가 다름:</strong> 동일 snapshot을 읽는지, catalog cache와 reader의 delete 지원을 확인한다. Raw Parquet path로 검증하지 않는다.</li>
+    <li><strong>EXPLAIN에 delete가 명시되지 않음:</strong> Plan 표시는 engine 버전별로 다르다. Metadata table과 scan metrics를 함께 사용한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day29.cow PURGE;
+DROP TABLE IF EXISTS local.day29.mor PURGE;
+DROP NAMESPACE IF EXISTS local.day29;
+&quot;
+docker compose stop spark</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>COW는 in-place update다.</strong> 아니다. Immutable old file을 새 file로 교체한다.</li>
+    <li><strong>MOR는 read할 때 SQL update를 다시 계산한다.</strong> 아니다. Committed delete/new-data artifact를 deterministic하게 적용한다.</li>
+    <li><strong>MOR는 항상 더 싸다.</strong> Write 비용을 read와 compaction으로 옮긴다.</li>
+    <li><strong>Property를 MOR로 바꾸면 기존 file이 변환된다.</strong> 이후 operation 전략만 바뀌며 기존 snapshot/file은 그대로다.</li>
+    <li><strong>Reader가 Parquet를 읽으면 충분하다.</strong> Delete manifest·scope·sequence를 해석하지 못하면 deleted row가 보인다.</li>
+    <li><strong>Delete file 수만 작으면 건강하다.</strong> Size, deleted-row ratio, key selectivity, data file fan-out과 query 횟수도 봐야 한다.</li>
+    <li><strong>Compaction은 metadata-only다.</strong> Data+delete를 읽고 새 data를 쓰는 큰 write이며 conflict·orphan window가 있다.</li>
+    <li><strong>V3는 MOR 비용을 없앤다.</strong> DV가 position representation을 효율화하지만 reader merge와 synchronous maintenance 책임은 남는다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>하루 10억 건 append, 1천만 건 CDC, dashboard QPS 500인 table의 COW/MOR를 선택하라.</strong><br>좋은 답변 구조: Freshness·p95·cost SLO → file size/변경 밀도/Q 수치 → operation별 mode → data/delete read path → compaction threshold → multi-engine gate → failure/rollback과 대안.</li>
+    <li><strong>MOR 전환 뒤 p95가 3배가 됐다. Root cause와 안전한 복구를 설명하라.</strong><br>좋은 답변 구조: Snapshot pin → delete file/bytes/selectivity/plan evidence → sequence·engine 호환 가설 → staged compaction → COW fallback → concurrent writer validation → SLO 재검증.</li>
+    <li><strong>COW와 MOR의 linearization point와 conflict 차이를 설계 리뷰하라.</strong><br>좋은 답변 구조: 공통 catalog CAS → prepared artifact 차이 → read/write set과 isolation → explicit/unknown failure → orphan 종류 → retry/replan → correctness와 throughput trade-off.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Object storage에 data file이 있지만 current catalog pointer에서 도달할 수 없다면 table row인가?</li>
+    <li>CAS 요청 뒤 timeout이 났을 때 같은 batch를 즉시 다시 append하면 안 되는 이유는?</li>
+    <li>Orphan cleanup 전에 확인할 두 축은?</li>
+  </ol>
+  <p style="background:#f7fafb;border:1px solid #dbe3e8;padding:13px 15px;"><strong>짧은 정답:</strong> ① 아니다. Reachable metadata graph가 membership의 권위자다. ② CAS 성공 후 응답만 유실됐을 수 있어 중복 commit 위험이 있다. Operation identity로 status check한다. ③ 모든 valid refs에서의 reachability와 active writer·retry를 덮는 safety window다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>512MB file의 row 1개를 DELETE할 때 COW와 MOR가 각각 쓰는 artifact는?</li>
+    <li>MOR reader가 data file만 읽으면 어떤 불변식을 깨는가?</li>
+    <li>MOR 선택 전 최소 세 가지 수치 판단 기준은?</li>
+  </ol>
+  <p style="background:#edf8f2;border:1px solid #9fd4b7;padding:13px 15px;"><strong>정답/채점:</strong> ① COW는 affected data file을 새 data file로 rewrite하고 old reference를 제거한다. MOR는 old data를 유지하고 delete file을, UPDATE라면 new row data도 쓴다. ② Snapshot에 적용 가능한 모든 delete를 반영한 logical row set을 반환해야 한다는 불변식이다. ③ Read:write 비율, 변경 밀도/affected bytes, delete file·bytes/ratio, query p95, compaction lag, engine 호환 중 세 가지 이상과 이유를 말하면 만점.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/configuration/#write-properties" style="color:#087b94;">Apache Iceberg 1.11.0 · Write properties와 COW/MOR 기본값</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-writes/" style="color:#087b94;">Apache Iceberg 1.11.0 · Spark Writes와 row-level SQL</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#delete-formats" style="color:#087b94;">Apache Iceberg Table Spec · Delete Formats</a></li>
+    <li><a href="https://iceberg.apache.org/javadoc/1.11.0/org/apache/iceberg/RowLevelOperationMode.html" style="color:#087b94;">Apache Iceberg 1.11.0 Javadoc · RowLevelOperationMode</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">2026-08-30 확인 기준 latest documentation은 1.11.0이다. Property, SQL extension, delete/DV 지원은 배포 engine·connector와 format version별로 검증하며 확인하지 않은 구현 동작을 공통 보장으로 단정하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:9px;">
+    <strong>Day 30 · equality/position delete의 적용 규칙</strong><br>
+    Delete가 어떤 data file과 row에 적용되는지 field ID, file path·position, partition scope와 sequence number를 따라 정확히 판정한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
