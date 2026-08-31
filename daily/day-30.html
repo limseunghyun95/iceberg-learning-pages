@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 30</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 5 / DAY 30</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">equality/position delete의 적용 규칙</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Row-level Update/Delete와 Format Version · 예상 학습 45분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Position delete는 정확한 data file path와 row position을 지우고 같은 data sequence에도 적용할 수 있지만, equality delete는 field ID로 정의한 key predicate를 같은 partition의 더 오래된 data file에만 적용해 같은 commit에서 쓴 replacement row를 되우지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Position delete</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">V2 delete file이 full data file URI와 0부터 시작하는 row position을 쌍으로 저장한다. “어느 파일의 몇 번째 row”인지 물리 주소로 지정한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Equality delete</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">하나 이상의 column 값을 predicate로 저장해 같은 값의 row를 지운다. Column name이 아니라 immutable field ID 목록 <code>equality_ids</code>가 key 정체성을 소유한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Data sequence number</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">File 내용의 논리적 나이다. Reader가 delete와 data의 선후 관계를 비교할 때 쓰며, manifest를 재작성해도 내용이 바뀌지 않으면 보존된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Inclusive / strict</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;"><code>dataSeq ≤ deleteSeq</code>는 같은 번호도 포함하고, <code>dataSeq &lt; deleteSeq</code>는 delete보다 엄격히 오래된 data만 포함한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Partition scope</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Delete와 data의 partition spec ID와 partition value가 같은 범위다. 단, unpartitioned spec으로 쓴 equality delete는 global delete로 적용될 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Referenced data file</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Position delete manifest entry가 하나의 target data file을 명시할 때 쓰는 optional URI다. Deletion vector에서는 required다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Null-safe equality</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Equality delete의 null key는 data row의 null과 일치한다. SQL의 일반 <code>=</code>가 unknown을 내는 것과 달리 <code>IS NOT DISTINCT FROM</code>에 가깝다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Delete index</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Reader가 position을 bitmap/set으로, equality key를 hash set 등으로 적재해 scan row를 빠르게 거르는 실행 자료구조다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Delete file은 “삭제할 row 목록”만 있으면 끝나는 단순 tombstone이 아니다. Reader는 current snapshot의 data/delete manifests에서 candidate를 고르고, partition, file path, data sequence, equality field ID를 모두 확인해야 한다. 이 중 하나라도 잘못 구현하면 이미 지운 row가 다시 보이거나 같은 commit의 replacement row까지 사라지는 correctness 사고가 난다.</p>
+  <p>특히 equality delete는 CDC key 삭제처럼 넓은 범위를 표현해 write 비용을 낮추지만, key 선택도가 낮거나 unpartitioned global scope이면 많은 data file에 붙는다. Position delete는 target이 정밀하지만 file rewrite로 path/position이 바뀌면 옛 좌표를 새 file에 적용해서는 안 된다. 두 형식의 범위와 시간 규칙은 성능 최적화가 아니라 logical table state를 결정하는 transaction 계약이다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Reader는 “현재 snapshot에 포함된 delete 중 이 data file에 적용 가능한 것”만 합쳐야 한다. Position은 path+position과 <code>≤</code>, equality는 field ID key와 <code>&lt;</code>가 중심이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 7px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① catalog pointer → metadata JSON → current snapshot</strong><br><span style="font-size:14px;color:#cdebf0;">Query 시작 시 immutable table state 고정</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ manifest list에서 data/delete manifest 후보 pruning</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② Data file D: path, spec+partition, dataSeq, metrics</strong></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ D에 적용할 delete를 두 규칙으로 분기</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>③-P Position candidate</strong><br><span style="font-size:14px;">같은 partition · referenced path 일치(있으면) · dataSeq ≤ deleteSeq · DV가 대신하지 않음</span></td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>③-E Equality candidate</strong><br><span style="font-size:14px;">같은 spec+partition 또는 unpartitioned global · dataSeq &lt; deleteSeq · equality_ids projection</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:20px;">↓ delete content load·index build</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>④ Data row scan → position 또는 null-safe key match면 제거</strong><br><span style="font-size:14px;color:#cdebf0;">남은 row만 query operator로 전달</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Snapshot pin:</strong> Catalog가 가리키는 metadata JSON에서 snapshot과 manifest list를 고정한다. 이후 concurrent commit은 이 query의 logical state를 바꾸지 않는다.</li>
+    <li><strong>Manifest pruning:</strong> Data manifest와 delete manifest의 partition summary·metrics·sequence로 가능성 없는 manifest/file을 제거한다. Raw warehouse listing은 사용하지 않는다.</li>
+    <li><strong>Scope matching:</strong> Position은 target URI와 partition을, equality는 equality field IDs와 partition을 결합한다. Partition evolution에서는 value만 같다고 다른 spec ID의 delete를 붙이지 않는다.</li>
+    <li><strong>Time matching:</strong> Position/DV는 같은 commit의 data를 가리킬 수 있어 inclusive <code>≤</code>다. Equality는 같은 commit에서 쓴 replacement row를 지우지 않도록 strict <code>&lt;</code>다.</li>
+    <li><strong>Load:</strong> Position file은 file path·position 정렬을 활용해 index를 만들고, equality file은 필요한 field ID column을 projection해 null-safe key set을 만든다.</li>
+    <li><strong>Filter:</strong> Data row를 decode하면서 index를 검사한다. Delete가 많으면 CPU·memory·I/O와 file open이 증가하며 compaction이 이 비용을 새 base file write로 회수한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">적용 규칙 진리표</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:24%;">조건</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:36%;">Position delete</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Equality delete</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Row identity</td><td style="padding:9px;border:1px solid #dbe3e8;">Full file URI + 0-based position</td><td style="padding:9px;border:1px solid #dbe3e8;"><code>equality_ids</code>의 field ID 값 tuple</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Sequence</td><td style="padding:9px;border:1px solid #dbe3e8;"><code>dataSeq ≤ deleteSeq</code></td><td style="padding:9px;border:1px solid #dbe3e8;"><code>dataSeq &lt; deleteSeq</code></td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Partition</td><td style="padding:9px;border:1px solid #dbe3e8;">같은 spec ID + value</td><td style="padding:9px;border:1px solid #dbe3e8;">같은 spec ID + value, 또는 delete spec이 unpartitioned면 global</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">File scope</td><td style="padding:9px;border:1px solid #dbe3e8;"><code>referenced_data_file</code>이 있으면 반드시 일치</td><td style="padding:9px;border:1px solid #dbe3e8;">특정 path가 아니라 key+partition+sequence 범위</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">Null</td><td style="padding:9px;border:1px solid #dbe3e8;">Key 비교 없음</td><td style="padding:9px;border:1px solid #dbe3e8;">Delete null은 data null과 일치</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;font-weight:700;">V3</td><td style="padding:9px;border:1px solid #dbe3e8;">새 position delete file 금지, DV로 표현</td><td style="padding:9px;border:1px solid #dbe3e8;">Equality delete 형식은 별도로 존재</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">왜 position은 ≤, equality는 &lt;인가</h3>
+  <p>Position delete는 특정 file의 특정 row를 직접 가리키므로 data와 delete가 같은 commit에서 추가되어도 대상을 모호하게 만들지 않는다. 반면 equality delete가 같은 sequence의 새 data에 적용되면 UPDATE가 old key를 delete하고 같은 commit에서 쓴 replacement row도 같은 key라는 이유로 사라질 수 있다. Strict ordering은 “이 delete보다 먼저 존재한 값”만 지우는 happens-before 경계를 만든다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Field ID와 schema evolution</h3>
+  <p>Equality delete는 name이 아니라 field ID로 key를 묶는다. Delete column이 나중에 table schema에서 drop돼도 기존 equality delete를 적용할 때는 그 field를 계속 읽어야 한다. 반대로 column이 추가된 뒤 delete key가 됐다면 더 오래된 data file은 projection rule에 따라 그 column을 null로 읽을 수 있다. Name rename이나 reorder가 delete semantics를 바꾸지 않는 이유다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">State owner·linearization·failure window</h3>
+  <p>Delete bytes의 물리 존재가 아니라 catalog pointer에서 도달 가능한 snapshot/manifest entry가 logical membership을 소유한다. Writer는 data/delete/manifest를 먼저 만들고 conflict validation 뒤 catalog CAS로 한 번에 공개한다. CAS 전 crash는 orphan data/delete를 남길 수 있고, 응답 유실은 unknown commit state다. Reader는 pin한 snapshot만 적용하므로 partial delete를 보지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Key 품질:</strong> Equality key는 stable field IDs, 낮은 null/duplicate ambiguity, 높은 선택도, partition locality를 가져야 한다. Business key가 바뀌면 old/new key delete·insert 순서를 명시한다.</p>
+  <p><strong>Best practice 2 · Path 정규화 금지:</strong> Position delete의 full URI를 임의로 <code>s3</code>/<code>s3a</code> 치환하거나 URL decode하지 않는다. Writer·reader·catalog의 canonical path 계약을 호환성 테스트한다.</p>
+  <p><strong>Best practice 3 · Scope 지표:</strong> Data file당 applicable position/equality delete 수, equality key cardinality, global delete 수, delete/data bytes ratio, index memory와 p95를 수집한다.</p>
+  <p><strong>Best practice 4 · Evolution gate:</strong> Partition spec 변경 전 old/new spec에서 delete가 어느 file에 적용되는지 fixture로 검증한다. 같은 날짜 value라도 spec ID가 다르면 일반 delete scope가 같지 않다.</p>
+  <p><strong>Best practice 5 · Conflict validation:</strong> Equality delete를 추가하는 writer는 base 이후 matching data가 추가됐는지 isolation 정책에 따라 검증해야 한다. CAS retry와 semantic replan을 분리한다.</p>
+  <p><strong>Format 경계:</strong> Row-level delete file은 V2에서 도입됐다. V3는 position delete를 deletion vector로 바꾸며 새 position delete file 추가를 금지하지만, V2에서 남은 position delete는 upgrade 후에도 읽어야 한다.</p>
+  <p><strong>Multi-engine 차이:</strong> Spec을 읽는 능력, equality delete write 능력, position/DV read 능력은 서로 별도다. Spark·Flink·Trino 등 실제 connector version별 read/write matrix와 cross-engine golden query를 운영한다.</p>
+  <p><strong>Anti-pattern:</strong> Column name으로 equality key 해석, global equality delete 남발, sequence 대신 file timestamp 비교, current snapshot의 delete를 모든 data file에 적용, raw Parquet count로 검증하는 것이다.</p>
+  <p><strong>Edge case:</strong> 같은 file path가 manifest에 두 번 나타나면 scan 결과는 undefined다. Reader가 반드시 오류를 내준다고 가정하지 말고 duplicate path를 commit 전 차단한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Engine별로 deleted row의 재등장 또는 과삭제가 발생했다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Spark/Trino row count 불일치, deleted key 재등장, replacement row 과삭제, 특정 partition만 오류, null key 미삭제, query OOM·spill, delete file 404, compaction 후 결과 변화.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Snapshot ID·parent·sequence, data/delete manifest entry의 content/path/spec/partition/data sequence/file sequence/equality_ids/referenced path, schema field ID history, engine·connector version, query scan metrics, object HEAD/ETag, compaction base/current snapshot.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Equality strict 비교를 inclusive로 구현, position path mismatch, null을 일반 <code>=</code>로 비교, field name/ID 혼동, partition spec mismatch, unpartitioned global scope 과다, V2/V3 미지원, stale catalog cache, premature cleanup.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">영향 snapshot과 reader version을 pin하고 mutation·compaction·cleanup을 멈춘다. Known-good reader와 metadata tables로 한 data file·한 delete의 적용 진리표를 재구성하고 artifacts를 보존한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">호환 reader로 우회하고 잘못된 writer snapshot을 검증 후 rollback/forward fix한다. Correct reader로 data+delete를 새 base file에 materialize하거나 missing file을 동일 URI로 복원한다. Cross-engine fixture 통과 후 traffic을 복구한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Delete file 직접 삭제·수정, manifest/sequence 수동 편집, raw file 재등록, full table blind rewrite, snapshot expiration/orphan cleanup, path 문자열 강제 치환, validation 비활성화를 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> Spark MOR DELETE가 position delete를 만드는지 관찰하고, equality delete의 strict sequence와 null-safe match를 작은 SQL 모델로 검증한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker Desktop이 정상이고 <code>make smoke</code>가 성공해야 한다. Spark SQL extensions와 Iceberg 1.11.0 runtime을 사용한다.</li>
+    <li>6행 table에서 id=2를 MOR DELETE하면 query는 5행, current <code>files</code>에는 <code>content=1</code> position delete가 생길 것으로 예상한다.</li>
+    <li>그 뒤 id=2를 새 data file로 append하면 old position delete는 새 path/sequence를 지우지 않아 id=2가 1행 보여야 한다.</li>
+    <li>Equality 모델에서는 dataSeq=1 key가 지워지고 같은 commit의 dataSeq=2 replacement와 이후 dataSeq=3 row는 살아남는다고 먼저 적는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 실제 position delete 생성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+docker compose up -d
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day30;
+DROP TABLE IF EXISTS local.day30.rules PURGE;
+CREATE TABLE local.day30.rules (
+  id BIGINT, category STRING, payload STRING
+) USING iceberg
+TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read');
+
+INSERT INTO local.day30.rules VALUES
+  (1, 'A', 'one'), (2, 'A', 'old-two'), (3, 'A', 'three'),
+  (4, 'B', 'four'), (5, NULL, 'five'), (6, NULL, 'six');
+
+SELECT content, file_path, record_count, equality_ids
+FROM local.day30.rules.files ORDER BY content, file_path;
+
+DELETE FROM local.day30.rules WHERE id = 2;
+SELECT count(*) AS rows_after_delete FROM local.day30.rules;
+SELECT content, file_path, record_count, equality_ids
+FROM local.day30.rules.files ORDER BY content, file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> <code>content=0</code> data와 <code>content=1</code> position delete가 함께 current snapshot에 존재한다. Position delete의 <code>equality_ids</code>는 null이다. Exact file 수는 Spark task/AQE에 따라 달라질 수 있다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · 새 path의 같은 business key는 생존</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day30.rules VALUES (2, 'A', 'new-two');
+
+SELECT * FROM local.day30.rules WHERE id = 2;
+SELECT status, snapshot_id, sequence_number, file_sequence_number,
+       data_file.content, data_file.file_path, data_file.record_count,
+       data_file.equality_ids
+FROM local.day30.rules.entries
+ORDER BY sequence_number, data_file.content;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> <code>new-two</code> 한 행이 보인다. Old position delete는 old data file의 row position을 가리킬 뿐 새 append file의 같은 id를 key로 삭제하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Equality strict sequence와 null-safe key 모델</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+WITH data(data_seq, id, category, payload) AS (
+  SELECT * FROM VALUES
+    (1, 10, 'A', 'old'),
+    (2, 10, 'A', 'replacement-same-commit'),
+    (3, 10, 'A', 'later'),
+    (1, 11, CAST(NULL AS STRING), 'null-key-old')
+), eq_delete(delete_seq, id, category) AS (
+  SELECT * FROM VALUES
+    (2, 10, 'A'),
+    (2, 11, CAST(NULL AS STRING))
+)
+SELECT d.*
+FROM data d
+WHERE NOT EXISTS (
+  SELECT 1 FROM eq_delete x
+  WHERE d.data_seq &lt; x.delete_seq
+    AND d.id &lt;=&gt; x.id
+    AND d.category &lt;=&gt; x.category
+)
+ORDER BY data_seq, id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Seq 1의 old와 null-key-old는 지워지고 seq 2 replacement와 seq 3 later만 남는다. Spark의 null-safe equality operator <code>&lt;=&gt;</code>가 Spec의 null match를 모델링한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Failure injection 두 가지</h3>
+  <ol style="padding-left:22px;">
+    <li>위 모델의 <code>d.data_seq &lt; x.delete_seq</code>를 <code>d.data_seq &lt;= x.delete_seq</code>로 바꿔 실행한다. 같은 commit의 replacement까지 사라지는 과삭제를 관찰한다.</li>
+    <li><code>d.category &lt;=&gt; x.category</code>를 일반 <code>d.category = x.category</code>로 바꾼다. Null key row가 삭제되지 않고 재등장하는 미삭제를 관찰한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>DELETE extension 오류:</strong> Spark extensions와 catalog 설정을 확인하고 <code>make smoke</code>를 다시 실행한다.</li>
+    <li><strong>content=1이 없음:</strong> Property 오타, format version, metadata-only 최적화 여부와 connector version을 확인한다. Unpartitioned row 하나 조건은 일반적으로 row-level delete다.</li>
+    <li><strong>entries column 오류:</strong> 배포 version의 metadata table schema를 <code>DESCRIBE local.day30.rules.entries</code>로 확인하고 지원 column만 projection한다.</li>
+    <li><strong>새 id=2도 사라짐:</strong> Equality delete가 함께 있는지, snapshot/file path·data sequence와 reader version을 확인한다.</li>
+    <li><strong>SQL 모델 결과 불일치:</strong> <code>&lt;</code>와 <code>&lt;=&gt;</code>가 HTML에서 escape된 문자를 shell에 잘못 복사하지 않았는지 확인한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day30.rules PURGE;
+DROP NAMESPACE IF EXISTS local.day30;
+&quot;
+docker compose stop spark</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Equality delete는 column name으로 매칭한다.</strong> Field ID가 정체성이다.</li>
+    <li><strong>Position delete는 primary key delete다.</strong> File URI와 row ordinal을 지운다.</li>
+    <li><strong>두 delete 모두 sequence 비교가 같다.</strong> Position은 <code>≤</code>, equality는 strict <code>&lt;</code>다.</li>
+    <li><strong>Null equality key는 아무것과도 같지 않다.</strong> Delete null은 data null과 일치한다.</li>
+    <li><strong>Partition value가 같으면 spec이 달라도 적용된다.</strong> 일반 scope는 spec ID와 value가 모두 같아야 한다.</li>
+    <li><strong>Unpartitioned equality delete도 좁은 범위다.</strong> Global delete로 많은 data file에 적용될 수 있다.</li>
+    <li><strong>Object storage의 같은 bytes면 path도 같다.</strong> URI scheme/authority/string 불일치는 position match를 깨뜨린다.</li>
+    <li><strong>V3는 old position delete를 무시한다.</strong> Upgrade table의 기존 position delete는 유효하며 DV로 교체될 때까지 읽어야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Equality delete가 같은 commit의 replacement row를 지우지 않는 이유를 설계하라.</strong><br>좋은 답변 구조: Immutable file·data sequence 정의 → strict <code>&lt;</code> → UPDATE old/delete+new data 예시 → same partition/field ID → concurrency validation → 잘못된 <code>≤</code>의 과삭제.</li>
+    <li><strong>10억-row table에서 position과 equality delete reader를 설계하라.</strong><br>좋은 답변 구조: Manifest/metrics pruning → scope 진리표 → sorted position index/hash equality set → memory·spill·cache 수치 → partition/global edge → compaction와 대안 DV.</li>
+    <li><strong>Spark와 Trino 결과가 다른 delete incident를 대응하라.</strong><br>좋은 답변 구조: Snapshot pin·version matrix → manifest entry/field ID/path/sequence 증거 → null/spec/global 가설 → known-good reader → rollback/forward rewrite → cross-engine regression gate.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>COW가 row 1개를 삭제할 때 affected data file에 무슨 일이 생기는가?</li>
+    <li>MOR UPDATE의 commit과 read path에 어떤 artifact가 추가되는가?</li>
+    <li>MOR 선택 전 최소 세 가지 판단 지표는?</li>
+  </ol>
+  <p style="background:#f7fafb;border:1px solid #dbe3e8;padding:13px 15px;"><strong>짧은 정답:</strong> ① Old file 전체를 읽어 살아남은 row를 새 file로 쓰고 old reference를 제거한다. ② Old row delete artifact와 new row data를 commit하고 reader가 data+delete를 합친다. ③ Read:write 비율, 변경 밀도/bytes, delete file·bytes, query p95, compaction lag, engine 호환 중 세 가지 이상이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Position과 equality delete의 row identity는 각각 무엇인가?</li>
+    <li>Sequence 적용식과 서로 다른 이유는?</li>
+    <li>Equality delete의 partition scope에서 예외는?</li>
+  </ol>
+  <p style="background:#edf8f2;border:1px solid #9fd4b7;padding:13px 15px;"><strong>정답/채점:</strong> ① Position은 full file path+0-based position, equality는 <code>equality_ids</code> field ID 값 tuple이다. ② Position은 <code>dataSeq ≤ deleteSeq</code>로 same-commit target이 가능하고, equality는 <code>dataSeq &lt; deleteSeq</code>로 same-commit replacement를 보호한다. ③ 같은 spec ID+partition value가 원칙이지만 unpartitioned spec의 equality delete는 global로 적용된다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#row-level-deletes" style="color:#087b94;">Apache Iceberg Table Spec · Row-level Deletes</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#delete-formats" style="color:#087b94;">Apache Iceberg Table Spec · Delete Formats</a></li>
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#087b94;">Apache Iceberg Table Spec · Scan Planning scope rules</a></li>
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-queries/#files" style="color:#087b94;">Apache Iceberg 1.11.0 · Spark files metadata table</a></li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">2026-08-31 확인 기준 latest documentation은 1.11.0이다. Delete read/write와 metadata column 지원은 engine·connector·format version별로 검증하며 확인하지 않은 구현 동작을 공통 보장으로 단정하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:17px 18px;border-radius:9px;">
+    <strong>Day 31 · v3 deletion vector와 Puffin 개요</strong><br>
+    Position delete를 bitmap blob으로 압축하는 DV의 file/offset/length 참조, one-DV-per-data-file 불변식과 V2→V3 호환 경계를 살펴본다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

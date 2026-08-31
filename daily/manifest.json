@@ -266,6 +266,15 @@
       "path": "day-29.html",
       "kind": "lesson",
       "publishedAt": "2026-08-30T09:00:50+09:00"
+    },
+    {
+      "day": 30,
+      "week": 5,
+      "title": "equality/position delete의 적용 규칙",
+      "summary": "Position의 path·row 위치와 equality의 field ID key를 partition·sequence scope와 결합해 delete 적용 진리표를 추적합니다.",
+      "path": "day-30.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-31T09:00:40+09:00"
     }
   ]
 }
