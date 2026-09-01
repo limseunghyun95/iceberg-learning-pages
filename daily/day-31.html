@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 31</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 5 / DAY 31</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">v3 deletion vector와 Puffin 개요</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Row-level Update/Delete와 Format Version · 예상 학습 45분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg v3 deletion vector(DV)는 한 data file의 삭제 row position을 압축 bitmap으로 표현해 Puffin blob에 담고, delete manifest가 그 blob의 정확한 byte offset·length를 가리키게 하며, snapshot마다 data file당 DV 하나라는 불변식을 writer가 동기적으로 유지한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Deletion vector (DV)</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">한 data file에서 삭제된 0-based row position을 bit 집합으로 기록한 v3 구조다. Position P의 bit가 1이면 P번째 row를 숨긴다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Bitmap</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">정수 집합을 bit로 표현하는 자료구조다. 삭제 위치가 {1,4,7}이면 1·4·7번 bit만 켠다. Membership test가 빠르고 압축 표현을 쓸 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Roaring bitmap</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">정수 영역을 container로 나눠 sparse/dense 구간을 효율적으로 저장하는 bitmap 형식이다. DV는 64-bit position을 상위 32-bit key와 하위 32-bit sub-position으로 나눠 여러 32-bit Roaring bitmap에 담는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Puffin</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Manifest에 직접 넣기 어려운 index·통계 같은 blob 여러 개와 해석 metadata를 한 container file에 보관하는 Iceberg 파일 형식이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Blob</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Puffin 안의 독립적인 byte 조각이다. DV는 <code>deletion-vector-v1</code> blob type이며, 여러 data file의 DV blob을 하나의 Puffin file에 함께 실을 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Offset / length</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Container의 어느 byte부터 몇 byte를 읽을지 나타내는 좌표다. Manifest의 <code>content_offset</code>/<code>content_size_in_bytes</code>는 Puffin footer의 blob <code>offset</code>/<code>length</code>와 정확히 같아야 한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Cardinality</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Bitmap에 켜진 bit 수, 즉 삭제 row 수다. DV manifest entry의 <code>record_count</code>와 Puffin blob property의 cardinality로 교차 검증할 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Range GET</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Object storage file 전체가 아니라 지정 byte 범위만 읽는 요청이다. Offset·length를 알면 큰 Puffin에서 필요한 DV blob만 가져올 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Synchronous maintenance</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">나중 background job에 맡기지 않고 DV update commit 안에서 old DV·position deletes와 새 deletes를 합쳐 하나로 만드는 의무다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>V2 position delete file은 <code>data file path + row position</code> pair를 columnar file로 저장한다. Reader는 적용 가능한 delete file을 찾고 target별 position을 읽어 index를 만들어야 한다. Delete가 계속 쌓이면 같은 data file에 여러 delete file이 붙어 file open, decode, merge, memory가 늘어난다.</p>
+  <p>V3 DV는 target data file 하나의 모든 position delete를 한 bitmap으로 합친다. Reader 입장에서는 한 DV만 읽고 bit membership을 검사하면 되므로 실행 자료구조가 자연스럽다. 하지만 비용이 사라지는 것은 아니다. Writer가 매 delete마다 기존 DV와 old position delete를 읽고 새 DV를 써야 하며, Puffin packing·range read·checksum·metadata 좌표라는 새로운 failure surface가 생긴다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> 한 snapshot에서 data file 하나에 적용되는 DV는 최대 하나다. 새 DV가 생기면 그 target의 기존 DV와 position deletes를 모두 포함해야 하므로 reader는 matching position delete files를 안전하게 무시할 수 있다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 7px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog current pointer → metadata JSON</strong><br><span style="font-size:14px;color:#cdebf0;">Query가 읽을 immutable snapshot을 고정</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ current snapshot의 manifest list</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② Data manifest → data file D</strong><br><span style="font-size:14px;">path · spec+partition · data sequence · record_count</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↕ path + partition + sequence scope match</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>③ Delete manifest → DV entry</strong><br><span style="font-size:14px;">Puffin path · referenced_data_file=D · offset · length · cardinality</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:20px;">↓ Object storage Range GET(offset…offset+length−1)</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>④ Puffin container: Magic | Blob₁ | DV Blob₂ | … | Footer</strong><br><span style="font-size:14px;">DV magic + 64-bit position bitmap + CRC-32</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ decode·checksum·bitmap membership</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Scan D: row position P → bit[P]=1이면 제거</strong><br><span style="font-size:14px;color:#cdebf0;">남은 row만 query operator에 전달</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Snapshot pin:</strong> Catalog pointer가 가리키는 metadata JSON과 snapshot을 고정한다. Concurrent writer가 새 commit을 해도 이 query의 logical state는 바뀌지 않는다.</li>
+    <li><strong>Data planning:</strong> Manifest list와 data manifest의 partition summary·metrics로 D를 고른다. D의 path, spec+partition, data sequence가 DV applicability의 기준이다.</li>
+    <li><strong>DV planning:</strong> Delete manifest에서 <code>referenced_data_file=D.path</code>, 같은 spec+partition, <code>D.dataSeq ≤ DV.dataSeq</code>인 entry를 찾는다. 최대 하나라는 invariant를 검증한다.</li>
+    <li><strong>Direct access:</strong> Reader는 manifest가 준 Puffin path와 byte range로 필요한 blob만 읽을 수 있다. Manifest 좌표는 Puffin footer 좌표와 정확히 일치해야 한다.</li>
+    <li><strong>Integrity:</strong> <code>deletion-vector-v1</code> magic·length·CRC-32, referenced file, cardinality를 확인하고 Roaring bitmap을 복원한다.</li>
+    <li><strong>Row filtering:</strong> Data file을 scan하며 물리 row ordinal P를 bitmap에서 조회한다. Set이면 삭제, unset이면 생존이다. SQL predicate 평가 전에 또는 engine plan에 맞춰 함께 적용한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Writer의 optimistic commit 경로</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 7px;table-layout:fixed;">
+    <tr><td style="background:#eef5ff;padding:12px;border:1px solid #adc7e8;border-radius:8px;"><strong>A. Base snapshot</strong>에서 target D의 current DV + applicable old position deletes를 읽는다.</td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ union(old positions, new positions)</td></tr>
+    <tr><td style="background:#edf8f2;padding:12px;border:1px solid #9fd4b7;border-radius:8px;"><strong>B. Immutable write</strong> 새 bitmap을 직렬화해 새 Puffin blob/file과 delete manifest를 준비한다.</td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ latest metadata refresh + conflict validation</td></tr>
+    <tr><td style="background:#fff7e6;padding:12px;border:1px solid #f0cf88;border-radius:8px;"><strong>C. Revalidate</strong> target D가 여전히 live인지, 새 position delete/DV가 추가됐는지, operation predicate가 유효한지 확인한다.</td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:20px;">↓ catalog compare-and-swap</td></tr>
+    <tr><td style="background:#123d49;color:#fff;padding:12px;border-radius:8px;"><strong>D. Linearization point</strong> 새 metadata pointer가 원자적으로 공개될 때 old delete entries는 제거되고 merged DV 하나가 current state가 된다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">Indirection과 packed container</h3>
+  <p>Delete manifest entry는 DV bytes 자체를 담지 않는다. <code>(Puffin path, offset, length)</code>라는 간접 참조를 담는다. 여러 작은 DV를 하나의 Puffin에 packing하면 object 수와 open 요청은 줄지만, 한 container 손상·권한 오류의 blast radius가 여러 target data file로 넓어진다. Range GET이 지원되지 않거나 cache가 file 단위뿐이면 필요한 blob보다 훨씬 많은 bytes를 읽을 수도 있다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Roaring bitmap과 membership 비용</h3>
+  <p>DV는 양의 64-bit position을 상위 32-bit key와 하위 32-bit sub-position으로 분리한다. Reader는 상위 key로 해당 32-bit bitmap을 찾고 하위 값을 membership test한다. 대부분의 data file row position이 32-bit 범위라면 key 0 container 중심이라 효율적이다. 그러나 삭제율이 매우 낮거나 bitmap이 아주 작아도 Puffin·manifest·range request의 고정 비용은 남는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">State owner와 이중 metadata</h3>
+  <p>Logical table membership은 catalog가 가리키는 snapshot/manifest graph가 소유한다. Puffin footer도 blob offset·length·type을 기록하지만, 어떤 snapshot에서 어떤 data file에 DV를 적용할지는 delete manifest가 소유한다. 두 좌표가 다르면 “어느 쪽을 믿을까”가 아니라 corruption이다. Reader는 조용히 다른 bytes를 읽어 삭제 결과를 만들면 안 된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Synchronous merge가 필요한 이유</h3>
+  <p>DV A={1,4}가 있는 D에 writer가 {4,7}을 새로 지울 때 결과는 {1,4,7}이다. 새 deletes만 쓴 {4,7}로 old DV를 대체하면 row 1이 부활한다. A와 별도 DV B를 둘 다 남기면 one-DV invariant가 깨지고 reader/metadata count가 복잡해진다. 따라서 writer는 commit 전에 union을 materialize한다. 이것은 read amplification을 writer read-modify-write 비용으로 옮기는 선택이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Commit과 failure window</h3>
+  <p>새 Puffin bytes가 object storage에 성공적으로 써져도 catalog pointer가 바뀌기 전에는 table state가 아니다. CAS 전 crash는 orphan Puffin을 남긴다. CAS 요청의 응답만 유실되면 commit 성공 여부가 unknown이므로 재발행 전에 current metadata를 조회해야 한다. Concurrent compaction이 target D를 제거했거나 다른 writer가 새 DV를 추가했다면 stale plan을 blind retry하지 말고 merge input을 다시 계산해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Capability gate:</strong> “v3 table을 열 수 있음”, “DV를 읽음”, “DV를 씀”, “v2→v3 old position delete를 merge함”을 별도 capability로 관리한다. 모든 writer와 reader의 connector version을 검증하기 전 format version을 올리지 않는다.</p>
+  <p><strong>Best practice 2 · Cross-check:</strong> Manifest의 offset·length·record_count·referenced path와 Puffin footer의 offset·length·cardinality·referenced-data-file을 일치 검증한다. CRC 오류와 short read를 삭제 없음으로 해석하지 않는다.</p>
+  <p><strong>Best practice 3 · Packing budget:</strong> Puffin당 blob 수·총 bytes·target 수를 제한한다. Too-small container는 object 수가 폭증하고, too-large container는 range/cache 비효율과 blast radius가 커진다.</p>
+  <p><strong>Best practice 4 · Update metric:</strong> Data file당 DV cardinality, deleted-row ratio, DV bytes, merge latency, range GET count/bytes, checksum failure, retry/conflict율을 수집한다. 삭제율이 커지면 data rewrite가 더 싸질 수 있다.</p>
+  <p><strong>Best practice 5 · Maintenance coordination:</strong> Compaction은 D를 새 data file D′로 바꾸므로 old D의 DV entry도 함께 제거한다. Puffin container 자체는 다른 live DV를 담을 수 있어 즉시 삭제하지 말고 snapshot reachability와 retention 뒤 orphan cleanup한다.</p>
+  <p><strong>V2→V3 경계:</strong> V3 writer는 새 position delete file을 추가할 수 없다. 하지만 V2에서 업그레이드된 table의 기존 position delete는 유효하며, D에 새 DV를 만들 때 기존 position deletes를 DV에 합쳐야 한다. 여러 target을 담은 old position delete file은 모든 target delete가 대체될 때까지 metadata에 남을 수 있다.</p>
+  <p><strong>Multi-engine 차이:</strong> Table spec의 기능 존재와 engine 구현 지원은 다르다. Spark·Flink·Trino 등은 배포 connector version별 read/write/upgrade/maintenance matrix와 golden snapshot을 통과해야 한다. 미지원 reader가 v3 feature를 우연히 무시하면 실패보다 위험하다.</p>
+  <p><strong>Anti-pattern:</strong> “DV니까 background merge해도 된다”, Puffin path만 보고 whole-file delete, latest DV만 골라 old positions 유실, checksum failure를 empty bitmap 처리, v3 upgrade를 metadata flag 변경으로만 판단하는 것이다.</p>
+  <p><strong>Edge case:</strong> Data file이 제거될 때 적용되는 DV manifest entry도 제거해야 하지만 Puffin file rewrite는 필수가 아니다. 한 Puffin에 다른 live DV blob이 있을 수 있기 때문이다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> V3 table에서 deleted row가 재등장하거나 Puffin read가 실패한다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">삭제 row 재등장·과삭제, engine별 count 불일치, 같은 data file에 DV entry 2개, Puffin 404/403, range short read, magic/CRC 오류, offset out-of-range, DV cardinality와 query delta 불일치, compaction 후 결과 변화.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Snapshot ID·parent·sequence, data/delete manifest entry의 path/spec/partition/data sequence/referenced path/offset/length/record_count, Puffin object HEAD(size·ETag), footer BlobMetadata, range response bytes, CRC, engine·connector version, prior position delete entries, writer commit/retry log.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Old positions merge 누락, one-DV invariant 위반, manifest/footer 좌표 mismatch, stale object/cache, partial upload, key/endianness/CRC decode bug, referenced path 또는 partition mismatch, premature orphan cleanup, v3 미지원 engine, compaction race.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">영향 snapshot과 known-good reader version을 pin하고 write·compaction·expiration·orphan cleanup을 멈춘다. Manifest·Puffin footer·raw range bytes를 보존한 뒤 한 target D의 expected position union을 재구성한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">정상 snapshot으로 검증 후 rollback하거나, old DV+position deletes+new deletes의 union으로 새 Puffin/DV manifest를 forward commit한다. Missing object는 동일 URI·검증된 bytes로 복원하거나 known-good snapshot에서 materialize rewrite한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Puffin byte/manifest offset 수동 수정, CRC 무시, empty DV 대체, duplicate DV 중 임의 하나 선택, whole Puffin 직접 삭제, snapshot expiration/orphan cleanup 실행, 같은 commit blind retry, 미지원 engine로 table rewrite를 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 30분 재현 실습</h2>
+  <p><strong>목표:</strong> V3 DV의 one-per-data-file merge invariant, bitmap membership, Puffin offset·length와 CRC failure를 작은 deterministic model로 재현한다. 로컬 runtime이 DV write를 지원한다고 가정하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Node.js 18+가 필요하다. Repository root에서 실행한다.</li>
+    <li>Data row position은 0~9, old DV는 {1,4}, 새 delete는 {4,7}이다. 정답 merged DV는 {1,4,7}, 생존 row는 {0,2,3,5,6,8,9}다.</li>
+    <li>Manifest offset=4, length=3이 blob bytes [0x12,0x34,0x56]를 가리킨다고 먼저 적는다.</li>
+    <li>Failure injection에서 새 delete만 publish하면 position 1이 부활하고, length를 2로 바꾸면 checksum 검증이 실패해야 한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · DV merge와 scan 모델</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node - &lt;&lt;'NODE'
+const oldDV = new Set([1, 4]);
+const newDeletes = new Set([4, 7]);
+const merged = new Set([...oldDV, ...newDeletes]);
+const rows = Array.from({length: 10}, (_, pos) =&gt; ({pos, value: `r${pos}`}));
+const visible = rows.filter(r =&gt; !merged.has(r.pos));
+
+console.log('old=', [...oldDV]);
+console.log('new=', [...newDeletes]);
+console.log('merged=', [...merged].sort((a,b) =&gt; a-b));
+console.log('cardinality=', merged.size);
+console.log('visible=', visible.map(r =&gt; r.pos));
+
+if (merged.size !== 3) throw new Error('cardinality invariant');
+if (JSON.stringify(visible.map(r =&gt; r.pos)) !== '[0,2,3,5,6,8,9]') {
+  throw new Error('membership invariant');
+}
+NODE</pre>
+  <p><strong>예상 관찰:</strong> Merged positions는 <code>[1,4,7]</code>, cardinality는 3, visible은 <code>[0,2,3,5,6,8,9]</code>다. Duplicate position 4는 한 bit이므로 한 번만 센다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Puffin direct-range와 integrity model</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node - &lt;&lt;'NODE'
+const puffin = Buffer.from([0x50,0x46,0x41,0x31, 0x12,0x34,0x56, 0xaa,0xbb]);
+const manifest = {
+  file_path: 's3://warehouse/table/metadata/dv.puffin',
+  referenced_data_file: 's3://warehouse/table/data/D.parquet',
+  content_offset: 4,
+  content_size_in_bytes: 3,
+  record_count: 3
+};
+const footer = {offset: 4, length: 3, cardinality: 3};
+const blob = puffin.subarray(
+  manifest.content_offset,
+  manifest.content_offset + manifest.content_size_in_bytes
+);
+console.log('magic=', puffin.subarray(0,4).toString('hex'));
+console.log('range=', blob.toString('hex'));
+console.log('coordinates_match=',
+  manifest.content_offset === footer.offset &amp;&amp;
+  manifest.content_size_in_bytes === footer.length);
+console.log('cardinality_match=', manifest.record_count === footer.cardinality);
+
+if (blob.toString('hex') !== '123456') throw new Error('range mismatch');
+NODE</pre>
+  <p><strong>예상 관찰:</strong> Puffin magic은 <code>50464131</code>, 선택 range는 <code>123456</code>, 두 cross-check는 true다. 실제 DV blob은 여기에 DV magic, bitmap serialization, CRC-32를 포함한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Failure injection</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Lost delete:</strong> 1단계에서 <code>const merged = new Set([...newDeletes]);</code>로 바꿔 실행한다. Position 1이 visible에 재등장한다. 이는 새 DV가 old DV를 포함하지 않은 correctness failure다.</li>
+    <li><strong>Duplicate DV:</strong> oldDV와 newDeletes를 별도 current DV라고 가정하고 <code>if (2 !== 1) throw new Error('one-DV invariant')</code>를 추가한다. Reader가 merge해 줄 것이라 미루면 spec의 synchronous writer 의무를 위반한다.</li>
+    <li><strong>Short range:</strong> 2단계의 <code>content_size_in_bytes</code>를 2로 바꾼다. Range가 <code>1234</code>가 되어 assertion이 실패한다. 실제 reader는 length/magic/CRC mismatch를 hard error로 처리해야 한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · 선택 관찰: 로컬 connector capability 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">rg -n &quot;iceberg-spark-runtime|icebergVersion|format-version&quot; \
+  compose.yml docker-compose.yml build.gradle settings.gradle pom.xml 2&gt;/dev/null || true
+
+# 문서/릴리스 노트로 아래 capability를 각각 판정한다.
+# 1) v3 metadata read  2) DV read  3) DV write
+# 4) v2 position delete → DV merge  5) maintenance compatibility</pre>
+  <p><strong>예상 관찰:</strong> Dependency version을 찾았다고 DV write 지원이 증명되지는 않는다. 실제 connector의 공식 문서와 cross-engine fixture가 필요하다. 지원이 불명확하면 production table format upgrade를 중단한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong><code>node</code>가 없음:</strong> <code>node --version</code>을 확인하거나 동일 Set/byte-range logic을 다른 로컬 언어로 옮긴다.</li>
+    <li><strong>Heredoc 복사 오류:</strong> Smart quote가 아닌 ASCII quote인지, HTML에서 보이는 <code>&lt;</code>/<code>&gt;</code>가 터미널에서 정상 문자로 복사됐는지 확인한다.</li>
+    <li><strong>Cardinality 4:</strong> Array concatenate length를 센 것이다. Set union 후 unique set bits를 세야 한다.</li>
+    <li><strong>Range off-by-one:</strong> Node <code>subarray(start,end)</code>의 end는 exclusive다. HTTP Range header라면 end는 <code>offset+length-1</code>인 inclusive 좌표다.</li>
+    <li><strong>Runtime이 v3 table 생성 실패:</strong> 억지로 property를 바꾸지 않는다. 오늘 실습은 invariant model이며, DV write 지원 확인 뒤 별도 integration lab을 수행한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <p>이 실습은 file을 만들지 않고 두 개의 일회성 Node process만 실행하므로 cleanup 대상이 없다. Docker나 catalog state도 변경하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>DV는 Puffin file 하나와 같다.</strong> DV는 blob이고 하나의 Puffin file에 여러 DV blob이 들어갈 수 있다.</li>
+    <li><strong>DV가 있으면 모든 position delete를 무조건 무시한다.</strong> 그 data file에 적용되는 DV가 있고 writer가 기존 deletes를 포함했을 때 matching position deletes를 무시한다.</li>
+    <li><strong>새 deletes만 새 DV에 쓰면 된다.</strong> Old DV와 position deletes를 union하지 않으면 deleted row가 부활한다.</li>
+    <li><strong>Manifest offset만 맞으면 된다.</strong> Manifest 좌표는 Puffin footer 좌표와 정확히 일치해야 하고 blob integrity도 검증해야 한다.</li>
+    <li><strong>Cardinality는 bitmap byte length다.</strong> Cardinality는 set position 수다.</li>
+    <li><strong>V3 upgrade 즉시 old position delete가 무효다.</strong> 기존 파일은 유효하며 target DV를 만들 때 병합한다.</li>
+    <li><strong>Data file을 제거하면 Puffin file도 즉시 지운다.</strong> 같은 Puffin의 다른 live blob을 손상시킬 수 있다.</li>
+    <li><strong>Spec v3 지원은 모든 engine의 DV write 지원을 뜻한다.</strong> Connector별 read/write/upgrade capability는 따로 검증해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>하루 5억 건 table에서 DV reader data path를 설계하라.</strong><br>좋은 답변 구조: 요구 latency·object storage 수치 → snapshot/manifest pruning → path+partition+sequence match → range GET·cache → magic/CRC/cardinality → bitmap membership → memory/spill → engine fallback·corruption 처리.</li>
+    <li><strong>동시 DELETE 두 개가 같은 data file의 DV를 갱신할 때 correctness를 보장하라.</strong><br>좋은 답변 구조: Base DV와 read/write set → immutable Puffin write → one-DV invariant → CAS conflict → latest refresh·union 재계산 → target removed edge → unknown commit state → orphan cleanup.</li>
+    <li><strong>V2에서 V3로 무중단 migration하는 계획을 제시하라.</strong><br>좋은 답변 구조: Reader/writer/maintenance capability matrix → canary copy·golden counts → old multi-target position delete 처리 → upgrade linearization → rollback 가능 범위 → mixed engine 차단 → 관측 지표·retention·비용 trade-off.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Position delete와 equality delete의 row identity는 각각 무엇인가?</li>
+    <li>왜 position은 <code>dataSeq ≤ deleteSeq</code>, equality는 strict <code>dataSeq &lt; deleteSeq</code>인가?</li>
+    <li>Equality delete에서 column name보다 field ID가 중요한 이유는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① Full path+0-based position / equality_ids의 field-ID key(2점). ② Same-commit position target 허용 / replacement row 과삭제 방지(2점). ③ Rename·reorder에도 identity 유지, projection/evolution 안전성(2점).
+  </div>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Delete manifest가 DV blob을 direct access하기 위해 반드시 제공하는 좌표와 target 정보는?</li>
+    <li>Old DV={1,4}, new deletes={4,7}일 때 publish할 DV와 cardinality는?</li>
+    <li>Data file D가 compaction으로 제거될 때 DV entry와 containing Puffin file은 각각 어떻게 처리하는가?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #9fd4b7;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① Puffin file_path, content_offset, content_size_in_bytes, referenced_data_file와 scope metadata(2점). ② {1,4,7}, cardinality 3; union/unique 언급(2점). ③ D의 DV manifest entry는 함께 제거, Puffin은 다른 live blobs 때문에 즉시 rewrite/delete할 의무 없음(2점). 총 10점 환산 시 8점 이상이면 통과.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#delete-formats" style="color:#0b6f83;">Apache Iceberg Table Spec · Delete Formats</a> — v1/v2/v3 delete 형식 경계와 writer 의무</li>
+    <li><a href="https://iceberg.apache.org/spec/#deletion-vectors" style="color:#0b6f83;">Apache Iceberg Table Spec · Deletion Vectors</a> — bitmap, manifest tracking, one-DV invariant</li>
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#0b6f83;">Apache Iceberg Table Spec · Scan Planning</a> — path·partition·sequence 적용 규칙</li>
+    <li><a href="https://iceberg.apache.org/puffin-spec/#deletion-vector-v1-blob-type" style="color:#0b6f83;">Apache Iceberg Puffin Spec · deletion-vector-v1</a> — file layout, blob metadata, encoding과 CRC</li>
+  </ul>
+  <p style="font-size:14px;color:#52636d;">확인 기준: 2026-09-01 공개 공식 spec. Engine 구현 지원은 해당 connector의 배포 version에서 별도 확인해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <div style="background:#073642;color:#fff;padding:16px 18px;border-radius:8px;">
+    <strong>Day 32 · MERGE, upsert, CDC semantics</strong><br>
+    Source event의 key·ordering·dedup 계약이 Iceberg의 DELETE+INSERT, conflict validation, COW/MOR physical plan으로 어떻게 번역되는지 추적합니다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
