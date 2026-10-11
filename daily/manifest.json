@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-09-01T09:01:45+09:00",
+  "updatedAt": "2026-10-11T14:51:25+09:00",
   "lessons": [
     {
       "day": 1,
@@ -284,6 +284,15 @@
       "path": "day-31.html",
       "kind": "lesson",
       "publishedAt": "2026-09-01T09:01:45+09:00"
+    },
+    {
+      "day": 32,
+      "week": 5,
+      "title": "MERGE, upsert, CDC semantics",
+      "summary": "MERGE를 source key·event ordering·dedup 계약에서 target match, COW/MOR physical plan, optimistic validation까지 연결해 idempotent CDC 경계를 추적합니다.",
+      "path": "day-32.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-11T14:51:25+09:00"
     }
   ]
 }

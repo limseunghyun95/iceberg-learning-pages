@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 32</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 5 / DAY 32</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">MERGE, upsert, CDC semantics</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Row-level Update/Delete와 Format Version · 예상 학습 45분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    <code>MERGE</code>는 CDC event를 table state로 접는 state transition이며, 정확성은 안정된 key·결정적인 event 순서·source 중복 제거·충돌 검증에 달려 있다. COW와 MOR은 같은 논리 결과를 만드는 물리 전략이지 CDC의 exactly-once를 대신하지 않는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">MERGE</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Source와 target을 key로 맞춘 뒤, match 여부와 조건에 따라 UPDATE·DELETE·INSERT 중 하나를 적용하는 SQL 연산이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Upsert</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">같은 key가 있으면 update하고 없으면 insert하는 뜻이다. Delete, key 변경, 늦은 event까지 포함하는 CDC 전체와는 다르다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">CDC</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Change Data Capture. 원본 DB의 insert·update·delete 변화를 event stream이나 batch로 전달하는 방식이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Business key</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">동일한 실제 객체를 식별하는 안정된 key다. Account ID처럼 source와 target row를 연결한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Sequence</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">한 key의 event 선후를 결정하는 단조 증가 값이다. Iceberg file sequence number와 달리, CDC producer가 제공하는 application-level 순서다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Deduplication</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Replay나 at-least-once delivery로 생긴 같은 event를 <code>event_id</code> 또는 key+sequence로 한 번만 남기는 과정이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Tombstone</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">“이 key를 삭제하라”는 delete event다. 값이 비었다는 뜻과 삭제 의도를 구분해야 한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Idempotency</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">같은 input을 재처리해도 logical result가 달라지지 않는 성질이다. Unknown commit 후 안전한 retry의 핵심이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">COW / MOR</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Copy-on-write는 영향 data file을 다시 쓰고, merge-on-read는 delete file과 새 data file을 남겨 reader가 합친다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>“CDC를 MERGE하면 최신 상태가 된다”는 말에는 숨은 전제가 많다. 동일 key에 update 2개가 오면 어느 것이 최신인가? Delete 뒤 늦은 update가 도착하면 row를 부활시켜도 되는가? Batch retry가 같은 event를 다시 넣으면 count 증가 같은 non-idempotent update는 어떻게 되는가? 이 계약이 없으면 SQL은 성공해도 business state는 틀릴 수 있다.</p>
+  <p>Iceberg는 snapshot, optimistic commit, row-level rewrite라는 table transaction 도구를 제공한다. 하지만 event ordering·dedup·key mutation·source offset의 소유자는 ingestion application이다. 실무에서 “table commit 성공”과 “source offset ack 성공” 사이 failure window를 설계하지 않으면 누락 또는 중복이 생긴다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> 한 target key를 바꾸는 source row는 MERGE 시점에 최대 하나여야 하며, 적용할 event는 deterministic ordering으로 선택되어야 한다. Iceberg commit 성공은 catalog pointer가 새 metadata를 가리킬 때 확정된다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 7px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① CDC log / batch</strong><br><span style="font-size:14px;color:#cdebf0;">key · op(I/U/D) · sequence · event_id · payload</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ schema normalize · key validation</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② Dedup + key별 최신 event 1개</strong><br><span style="font-size:14px;">ORDER BY sequence DESC, event_id DESC</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ target snapshot pin · ON target.id=source.id</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>③ MERGE decision</strong><br><span style="font-size:14px;">MATCHED DELETE / MATCHED UPDATE / NOT MATCHED INSERT</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:20px;">↓ physical plan: COW rewrite 또는 MOR delta</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>④ Immutable files + manifests + new metadata</strong><br><span style="font-size:14px;">data/delete files는 아직 current table state가 아님</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ refresh · conflict validation · catalog CAS</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ New snapshot 공개 → source offset/checkpoint ack</strong><br><span style="font-size:14px;color:#cdebf0;">Reader: pointer → metadata → snapshot → manifests → data/delete</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Capture:</strong> Producer는 변경 전/후 값과 함께 stable key, operation, source sequence, globally 또는 partition-local unique event ID를 보낸다.</li>
+    <li><strong>Normalize:</strong> Consumer는 schema를 target field에 맞추고, 같은 key의 event를 sequence로 정렬한다. Tie가 가능하면 event ID 같은 deterministic tie-breaker가 필요하다.</li>
+    <li><strong>Decide:</strong> MERGE의 <code>ON</code>은 identity를 찾고 <code>WHEN</code>은 state transition을 선택한다. 여러 matched clause가 true면 첫 clause가 적용되므로 delete clause와 stale-event guard의 순서가 의미를 가진다.</li>
+    <li><strong>Materialize:</strong> COW는 영향을 받은 data file을 새 파일로 대체하고, MOR은 delete representation과 새 row를 추가한다. 어느 쪽도 이미 공개된 파일을 in-place 수정하지 않는다.</li>
+    <li><strong>Commit:</strong> Writer는 latest metadata로 refresh해 target file·predicate assumptions를 검증한 뒤 catalog pointer를 CAS한다. Swap 성공이 linearization point다.</li>
+    <li><strong>Acknowledge:</strong> Commit 결과를 확인한 뒤에만 source offset을 ack한다. 응답 유실이면 snapshot summary, batch ID 또는 idempotency ledger로 성공 여부를 확인하고 retry한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Reader와 writer 경로를 함께 보기</h3>
+  <p><strong>Control path:</strong> Catalog pointer → metadata JSON → current snapshot → manifest list → manifest → content file 집합이 logical state를 정한다. <strong>Data path:</strong> Reader는 data file을 읽고 적용 가능한 equality/position delete 또는 DV를 합성한다. Writer는 새 content files를 먼저 만든 뒤 metadata graph와 pointer만 바꾼다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">State owner와 deterministic reduce</h3>
+  <p>Catalog pointer가 현재 table state의 owner이고, CDC log는 변경 intent의 owner다. Key <code>k</code>의 최종 상태는 대략 <code>reduce(sort(events[k], sequence), initialRow)</code>다. Sort 기준이 불완전하거나 consumer마다 tie-break가 다르면 같은 input으로 다른 state가 만들어져 replay safety가 사라진다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">One source row per target</h3>
+  <p>Spark MERGE는 target 한 row를 source 여러 row가 update하려 하면 오류를 낸다. 어느 update를 먼저 적용할지 SQL join에는 순서가 없기 때문이다. 따라서 raw CDC를 바로 MERGE하지 말고 <code>row_number() over (partition by key order by sequence desc, event_id desc)</code>로 한 row를 선택한다. 동일 sequence에 다른 payload가 있으면 임의 선택보다 quarantine가 안전하다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Optimistic validation과 isolation</h3>
+  <p>MERGE planning은 base snapshot의 target rows/files를 읽고 write set을 계산한다. 다른 writer가 그 사이 같은 predicate에 row를 추가하거나 target file을 교체하면 stale plan을 그대로 commit할 수 없다. Serializable isolation은 concurrent matching additions까지 확인해 phantom을 막지만 validation 비용과 conflict율이 올라간다. Snapshot isolation은 operation/config에 따라 더 좁은 conflict를 허용할 수 있으므로 요구 invariant를 먼저 정한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">COW와 MOR의 semantic/physical 분리</h3>
+  <p>COW는 update된 row가 든 file 전체를 다시 쓰므로 write amplification이 크지만 reader가 단순하다. MOR은 equality/position delete 또는 DV와 새 data row를 남겨 write latency를 낮추지만 reader merge와 compaction 부채가 생긴다. Logical MERGE result는 같아야 하지만 engine·format version별 지원과 maintenance race가 다르므로 physical mode를 correctness contract와 혼동하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Sequence number는 두 종류다</h3>
+  <p>CDC <code>source_seq</code>는 동일 business key의 event ordering을 결정한다. Iceberg sequence number는 successful table commit의 상대 나이를 나타내며 delete applicability를 계산한다. 후자가 크다고 더 최신 business event라는 뜻은 아니다. Late event가 나중 Iceberg commit에 들어갈 수 있으므로 target에 <code>last_source_seq</code>를 저장하고 stale event를 거절해야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Failure window와 exactly-once의 경계</h3>
+  <p>File write 성공 후 CAS 전 crash는 orphan file만 남긴다. CAS 성공 후 response 유실은 unknown commit state다. CAS 성공 뒤 source offset ack 전 crash는 같은 batch replay를 만든다. 이 세 구간을 구분하고, batch ID·event ID·source sequence guard로 logical idempotency를 만들지 않으면 “exactly-once connector”라는 이름만으로 안전하지 않다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Source contract:</strong> Key, operation, before/after, source sequence, event ID, schema version, transaction ID의 nullable/ordering/uniqueness 계약을 문서화한다. DB log position처럼 재현 가능한 sequence를 ingestion timestamp보다 우선한다.</p>
+  <p><strong>Best practice 2 · Two-stage table:</strong> Raw CDC append table은 감사·replay source로 보존하고, curated current-state table에는 검증·dedup된 event만 MERGE한다. 잘못된 MERGE의 재구성 근거가 남는다.</p>
+  <p><strong>Best practice 3 · Guarded update:</strong> <code>s.source_seq &gt; t.last_source_seq</code>처럼 stale event를 차단하고 target에 마지막 적용 sequence/event ID를 저장한다. Delete도 tombstone sequence를 보존하지 않으면 늦은 update로 row가 부활할 수 있다.</p>
+  <p><strong>Best practice 4 · Bounded batch:</strong> Batch ID, source offset range, input/output count, duplicate/quarantine count, base/result snapshot ID를 audit log에 남긴다. Unknown commit은 current snapshot과 이 증거를 먼저 조회한다.</p>
+  <p><strong>Best practice 5 · Cost-aware layout:</strong> MERGE key가 pruning할 수 있는 partition/sort/file metric과 전혀 맞지 않으면 매 batch가 많은 manifests/files를 scan한다. Hidden partitioning은 query predicate와 operation semantics를 기준으로 설계하고 지나친 고-cardinality partition은 피한다.</p>
+  <p><strong>Best practice 6 · Multi-engine matrix:</strong> Spark SQL MERGE, Flink upsert, Trino row-level DML의 지원 version, format version, COW/MOR, equality delete, branch/WAP, isolation setting을 별도 검증한다. Spec 기능과 connector 구현은 같지 않다.</p>
+  <p><strong>Anti-pattern:</strong> Raw CDC를 source dedup 없이 MERGE, ingestion timestamp를 ordering으로 사용, <code>UPDATE SET *</code>로 key·audit columns까지 덮기, unknown commit을 확인 없이 재발행, source offset을 commit 전에 ack, MOR delete files를 무기한 방치하는 것이다.</p>
+  <p><strong>Edge case:</strong> Business key 변경은 old key delete + new key insert라는 두 identity transition으로 모델링한다. 동일 transaction의 두 event가 분리 delivery되면 atomicity gap이 생기므로 transaction grouping 또는 compensating state가 필요하다.</p>
+  <p><strong>Version 주의:</strong> 공식 최신 Spark 문서는 SQL MERGE에 Iceberg Spark extensions가 필요하다고 설명한다. Spark 3.5의 <code>WHEN NOT MATCHED BY SOURCE</code>, Spark 4.x DataFrame MERGE/summary metrics 같은 기능은 배포 Spark·Iceberg 조합을 확인하고 사용한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> MERGE 후 row가 중복·누락되거나 오래된 값으로 되돌아간다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">MERGE multiple-match 오류, 같은 key 2개, delete row 재등장, row count 급감, batch 재실행 후 값 변화, engine별 결과 불일치, conflict/retry 급증, 작은 delete/data file 폭증.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Batch ID와 source offset 범위, key별 event_id/source_seq/op/payload, dedup 전후 수, quarantine, base/result snapshot ID·parent·operation summary, MERGE SQL/plan, table properties, data/delete files, conflict/retry/commit log, engine·connector version.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Source duplicate, non-deterministic tie, late event, delete tombstone 유실, 잘못된 ON key, clause 순서 오류, premature offset ack, unknown commit blind retry, concurrent MERGE conflict, unsupported MOR/delete reader, partition evolution 뒤 overwrite assumption.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">영향 batch offset과 target snapshot을 pin하고 해당 key range의 writer/offset ack를 멈춘다. Raw CDC를 보존한 채 dedup 결과와 target <code>last_source_seq</code>를 비교하고 known-good engine으로 snapshot별 count/sample을 재검증한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#eef5ff;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Known-good snapshot을 branch/tag로 보존한다. 잘못된 snapshot rollback 또는 corrected event set을 새 forward commit으로 MERGE한다. Raw log에서 deterministic reduce로 target을 재구성하고 snapshot ID·batch ID·offset을 audit한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f0;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Source log 삭제, data/delete file 수동 삭제, latest snapshot만 보고 원인 단정, 성공 여부 확인 없는 무한 retry, sequence guard 제거, table 전체 overwrite, retention 전에 snapshot/orphan cleanup을 실행하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 실습 · 35분: 중복·역순 CDC를 안전한 MERGE로 접기</h2>
+  <h3 style="font-size:18px;color:#07566a;">사전 조건</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트 로컬 lab의 Spark SQL 또는 <code>spark-sql</code>. Catalog 이름은 예시의 <code>local</code>을 환경에 맞게 바꾼다.</li>
+    <li>Iceberg Spark extensions와 format-version 2 이상의 row-level operation 지원.</li>
+    <li>실행 전 결과를 먼저 예측한다: ID 1은 seq 12의 130, ID 2는 삭제, ID 3은 300이어야 한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Target과 raw CDC 준비</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">CREATE NAMESPACE IF NOT EXISTS local.day32;
+
+CREATE TABLE local.day32.accounts (
+  id BIGINT,
+  balance BIGINT,
+  last_source_seq BIGINT,
+  last_event_id STRING
+) USING iceberg
+TBLPROPERTIES ('format-version'='2');
+
+INSERT INTO local.day32.accounts VALUES
+  (1, 100, 10, 'e10'),
+  (2, 200, 20, 'e20');
+
+CREATE OR REPLACE TEMP VIEW cdc_raw AS
+SELECT * FROM VALUES
+  (1, 120, 11, 'e11', 'U'),
+  (1, 130, 12, 'e12', 'U'),
+  (1, 130, 12, 'e12', 'U'),
+  (2, CAST(NULL AS BIGINT), 21, 'e21', 'D'),
+  (3, 300, 5, 'e05', 'I')
+AS cdc(id, balance, source_seq, event_id, op);</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Key별 최신 event 하나를 선택</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">CREATE OR REPLACE TEMP VIEW cdc_latest AS
+SELECT id, balance, source_seq, event_id, op
+FROM (
+  SELECT *, row_number() OVER (
+    PARTITION BY id
+    ORDER BY source_seq DESC, event_id DESC
+  ) AS rn
+  FROM cdc_raw
+)
+WHERE rn = 1;
+
+SELECT * FROM cdc_latest ORDER BY id;</pre>
+  <p><strong>예상 관찰:</strong> ID 1은 seq 12 하나만, ID 2는 delete, ID 3은 insert가 남는다. 같은 <code>event_id=e12</code> replay는 하나로 접힌다. 실제 운영에서는 같은 sequence에 서로 다른 payload가 있으면 미리 quarantine한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Stale-event guard가 있는 MERGE</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">MERGE INTO local.day32.accounts t
+USING cdc_latest s
+ON t.id = s.id
+WHEN MATCHED AND s.op = 'D'
+  AND s.source_seq &gt; t.last_source_seq THEN DELETE
+WHEN MATCHED AND s.op IN ('U','I')
+  AND s.source_seq &gt; t.last_source_seq THEN UPDATE SET
+    balance = s.balance,
+    last_source_seq = s.source_seq,
+    last_event_id = s.event_id
+WHEN NOT MATCHED AND s.op &lt;&gt; 'D' THEN INSERT
+  (id, balance, last_source_seq, last_event_id)
+VALUES
+  (s.id, s.balance, s.source_seq, s.event_id);
+
+SELECT * FROM local.day32.accounts ORDER BY id;
+SELECT committed_at, snapshot_id, operation
+FROM local.day32.accounts.snapshots
+ORDER BY committed_at;</pre>
+  <p><strong>예상 관찰:</strong> <code>(1,130,12,e12)</code>와 <code>(3,300,5,e05)</code>만 남는다. Snapshot이 하나 추가된다. 같은 MERGE를 다시 실행하면 logical rows는 변하지 않는다. No-op이 새 snapshot을 만드는지는 engine/version/plan에 따라 확인 대상으로 남긴다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Failure injection: dedup 제거</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">-- 아래 USING만 cdc_raw로 바꿔 별도 실행한다.
+MERGE INTO local.day32.accounts t
+USING cdc_raw s
+ON t.id = s.id
+WHEN MATCHED AND s.op = 'D' THEN DELETE
+WHEN MATCHED THEN UPDATE SET balance = s.balance
+WHEN NOT MATCHED AND s.op &lt;&gt; 'D' THEN INSERT
+  (id, balance, last_source_seq, last_event_id)
+VALUES
+  (s.id, s.balance, s.source_seq, s.event_id);</pre>
+  <p><strong>예상 관찰:</strong> Source의 ID 1 여러 row가 target 한 row를 update하려 해 오류가 난다. 만약 target 상태 때문에 재현되지 않으면 table을 초기 상태로 되돌리거나 새 namespace에서 실행한다. 오류는 모호한 update 순서를 조용히 선택하지 않는 안전장치다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>MERGE parser/extension 오류:</strong> Iceberg Spark session extensions와 catalog 설정을 확인한다.</li>
+    <li><strong>Cannot safely cast:</strong> VALUES의 NULL을 target type으로 명시적으로 cast하고 ANSI assignment policy를 확인한다.</li>
+    <li><strong>Multiple source rows matched:</strong> MERGE 조건을 느슨하게 바꾸지 말고 source dedup과 same-sequence conflict quarantine를 고친다.</li>
+    <li><strong>Delete가 stale update에 의해 부활:</strong> Delete tombstone의 source sequence를 별도 ledger/current-state에 보존한다.</li>
+    <li><strong>Retry 후 snapshot만 늘어남:</strong> Logical row equality와 snapshot summary를 함께 보고, batch ID 기반 commit detection을 추가한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">DROP TABLE IF EXISTS local.day32.accounts PURGE;
+DROP NAMESPACE IF EXISTS local.day32;</pre>
+  <p><code>PURGE</code> 지원과 실제 file 삭제 동작은 catalog/engine마다 다르다. 공유 warehouse에서는 namespace와 table이 실습 전용인지 확인하고 실행한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>MERGE 자체가 exactly-once다.</strong> Source delivery·offset ack·unknown commit까지 포함한 protocol이 필요하다.</li>
+    <li><strong>최신 event는 가장 늦게 도착한 event다.</strong> Arrival/ingestion time은 retry와 network delay에 흔들린다.</li>
+    <li><strong>MERGE의 source row는 입력 순서대로 적용된다.</strong> SQL relation에는 보장된 row order가 없으며 multiple match는 오류다.</li>
+    <li><strong>Iceberg sequence number가 CDC ordering이다.</strong> Table commit 순서와 business event 순서는 별개다.</li>
+    <li><strong>Delete row를 지웠으니 tombstone 정보도 버린다.</strong> Late update의 resurrection을 막을 근거가 사라진다.</li>
+    <li><strong>COW/MOR를 바꿔도 reader는 모두 같다.</strong> Delete file/DV와 format version 지원이 engine마다 다르다.</li>
+    <li><strong>UPDATE SET *가 편하고 안전하다.</strong> Key, partition source, audit/sequence field까지 잘못 덮을 수 있다.</li>
+    <li><strong>Conflict retry는 같은 plan 재전송이다.</strong> Latest snapshot에서 read/write assumptions와 source batch를 다시 검증해야 한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>일 10억 건 CDC를 Iceberg current-state table로 정확하게 반영하는 pipeline을 설계하라.</strong><br>좋은 답변 구조: key/ordering/exactness 요구 → raw append와 dedup state → batch·partition 수치 → MERGE read/write path → COW/MOR 비용 → offset/commit atomicity gap → conflict·replay·rebuild → engine compatibility.</li>
+    <li><strong>CAS 성공 응답을 잃은 MERGE를 어떻게 복구할 것인가?</strong><br>좋은 답변 구조: Unknown state 정의 → current metadata refresh → batch ID/snapshot summary/audit lookup → 이미 반영 시 ack → 미반영 시 idempotent replay → orphan 처리 → retry budget·alert.</li>
+    <li><strong>Out-of-order update와 delete가 있는 account table의 invariant를 방어하라.</strong><br>좋은 답변 구조: Stable key와 per-key sequence → tombstone retention → stale guard → same-sequence conflict quarantine → key 변경 transaction → snapshot isolation/serializable 선택 → rollback보다 raw log rebuild 대안.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>V3 DV에서 한 snapshot의 data file당 적용 가능한 DV는 최대 몇 개인가?</li>
+    <li>Delete manifest가 Puffin의 DV blob을 direct range read하려면 어떤 좌표가 필요한가?</li>
+    <li>기존 DV {1,4}에 새 delete {4,7}을 반영할 때 publish할 set과 cardinality는?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① 최대 1개와 writer synchronous merge(2점). ② Puffin path, content_offset, content_size_in_bytes, referenced data file(2점). ③ {1,4,7}, 3; old+new union과 duplicate 제거(2점).
+  </div>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>왜 target 한 row에 source 두 row가 match하면 임의 순서로 update하면 안 되는가?</li>
+    <li>CDC source sequence와 Iceberg sequence number는 각각 무엇을 정하는가?</li>
+    <li>MERGE commit 성공 후 source offset ack 전에 crash했다. 안전한 재시도 조건은?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #9fd4b7;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① SQL relation에는 적용 순서가 없고 결과가 non-deterministic하므로 source를 key별 한 row로 줄인다(3점). ② Business event ordering / successful table commit과 delete applicability의 상대 순서(3점). ③ Current snapshot에서 batch 반영 여부를 확인하고 event/batch ID와 source sequence guard로 replay가 idempotent해야 한다(4점). 8점 이상이면 통과.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/latest/spark-writes/#merge-into" style="color:#087f8c;">Apache Iceberg · Spark Writes: MERGE INTO</a> — affected file rewrite, clause 순서, single-source-row 제약과 Spark version 차이.</li>
+    <li><a href="https://iceberg.apache.org/spec/#snapshots" style="color:#087f8c;">Apache Iceberg Table Specification · Snapshots</a> — snapshot이 완전한 table state를 나타내는 방식.</li>
+    <li><a href="https://iceberg.apache.org/spec/#optimistic-concurrency" style="color:#087f8c;">Apache Iceberg Table Specification · Optimistic Concurrency</a> — metadata pointer swap, validation과 retry의 원리.</li>
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#087f8c;">Apache Iceberg Table Specification · Scan Planning</a> — manifest와 metrics를 이용한 file pruning 경로.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">확인 기준: Apache Iceberg 공식 최신 문서와 Table Specification. Spark 3.5/4.x 기능은 문서의 version 표기를 그대로 구분했으며 실제 배포 조합에서 재확인해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:16px 18px;border-radius:9px;">
+    <strong>Day 33 · delete amplification과 read cost</strong><br>
+    MOR의 빠른 write가 어떤 delete-file fan-out, manifest planning, object request, reader memory와 compaction 부채로 이동하는지 수치화한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
