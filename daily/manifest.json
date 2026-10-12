@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-10-11T14:51:25+09:00",
+  "updatedAt": "2026-10-12T09:01:00+09:00",
   "lessons": [
     {
       "day": 1,
@@ -293,6 +293,15 @@
       "path": "day-32.html",
       "kind": "lesson",
       "publishedAt": "2026-10-11T14:51:25+09:00"
+    },
+    {
+      "day": 33,
+      "week": 5,
+      "title": "delete amplification과 read cost",
+      "summary": "Delete file 수·bytes·density와 delete→data applicability fan-out을 비용 그래프로 연결해 read amplification과 compaction 손익분기를 판단합니다.",
+      "path": "day-33.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-12T09:01:00+09:00"
     }
   ]
 }

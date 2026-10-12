@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 33</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 5 / DAY 33</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">delete amplification과 read cost</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Row-level Update/Delete와 Format Version · 예상 학습 45분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    MOR은 변경 시점의 data rewrite를 피하는 대신 delete manifest planning, delete→data file pairing, object open·decode, row matching 비용을 모든 read에 빌려 쓴다. Delete amplification은 “삭제 row 수”가 아니라 적용 그래프의 fan-out과 file 수·크기·밀도로 측정하고 SLO가 깨지기 전에 compaction으로 갚아야 한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Amplification</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">논리 작업 1단위보다 더 많은 물리 I/O·CPU·memory·request가 발생하는 현상이다. Row 1개 삭제가 여러 file open과 join을 유발할 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Read amplification</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">최종 결과 row 외에 data/delete file, metadata, index를 읽고 삭제 여부를 검사하는 추가 비용이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Fan-out</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Delete file 하나가 적용될 수 있는 data file 수 또는 data file 하나에 붙는 delete file 수다. 적용 관계를 bipartite graph로 보면 node degree다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Delete density</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Data file row 중 논리 삭제된 비율이다. 밀도가 높으면 남은 row를 읽기 위해 원본 file 대부분을 scan하는 낭비가 커진다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Planning cost</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Manifest list·manifest·partition summary·file metrics를 읽어 scan task와 적용 가능한 delete를 찾는 control-path 비용이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Execution cost</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">선택된 data/delete file을 열고 decode한 뒤 position bitmap 또는 equality key set으로 row를 거르는 data-path 비용이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Minor compaction</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">작은 position delete files를 더 큰 file로 합쳐 metadata와 object-open 수를 줄이는 maintenance다. Logical live row 집합은 바뀌면 안 된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Dangling delete</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">현재 live data file에 더 이상 적용되지 않는 delete다. Whole file이 dangling이면 metadata-only로 참조를 제거할 수 있지만 mixed-valid file은 rewrite가 필요하다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Delete granularity</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Delete file을 partition 단위로 묶을지 data file 단위로 제한할지 정하는 쓰기 정책이다. File granularity는 fan-out을 줄일 수 있지만 file 수가 늘 수 있다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>MOR의 첫 DELETE는 빠르다. 기존 data file을 다시 쓰지 않고 작은 delete file만 추가하기 때문이다. 그러나 1분마다 작은 delete file이 쌓이면 다음 query는 data file뿐 아니라 많은 delete manifest와 delete file을 열고, 어느 delete가 어느 data file에 적용되는지 계산해야 한다. Write latency 절감이 read latency와 object-storage request 비용으로 이동한 것이다.</p>
+  <p>Delete row 수만 보면 이 부채를 놓친다. 같은 1만 건 delete라도 data file별로 잘 묶인 position delete 10개와 unpartitioned equality delete 1만 개는 planning, open, memory, CPU 비용이 전혀 다르다. 반대로 큰 delete file 하나가 partition 전체 data files에 적용되면 file 수는 작아도 fan-out이 크다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Compaction 전후의 live row 집합은 동일해야 한다. 비용을 줄이기 위해 delete applicability의 path·partition·sequence 조건을 바꾸거나 delete를 누락하면 maintenance가 data corruption이 된다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 7px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Catalog pointer → metadata JSON → snapshot</strong><br><span style="font-size:14px;color:#cdebf0;">Query가 읽을 immutable table state 고정</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ manifest list: partition summary·file counts</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>② Delete manifests 먼저 planning</strong><br><span style="font-size:14px;">partition projection + bounds/counts → candidate delete files/DV</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:20px;">↓ path·partition·sequence applicability graph</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>③ Data manifests planning</strong><br><span style="font-size:14px;">query predicate → candidate data files → delete attachments</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ task = data file + applicable deletes</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④ Object storage reads</strong><br><span style="font-size:14px;">data row groups + position/equality delete files 또는 DV range</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ decode · bitmap/key-set build · row filtering</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Live rows만 query operator에 전달</strong><br><span style="font-size:14px;color:#cdebf0;">Delete 부채가 클수록 같은 결과에 더 많은 작업</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Snapshot pin:</strong> Catalog current pointer가 가리키는 metadata JSON과 snapshot을 고정한다. Query 도중 새 compaction이 commit되어도 이 reader의 file graph는 변하지 않는다.</li>
+    <li><strong>Delete planning:</strong> Delete manifests의 partition summary와 metrics로 명백히 관련 없는 delete file을 제외한다. Candidate 수가 많으면 driver/local planning 자체가 병목이 되어 distributed planning이 필요할 수 있다.</li>
+    <li><strong>Pairing:</strong> Position delete/DV는 referenced path, partition, inclusive sequence 조건으로 target을 찾는다. Equality delete는 field-ID key, partition scope, strict sequence 조건으로 여러 data file에 적용될 수 있다.</li>
+    <li><strong>Open:</strong> Task는 data file과 붙은 delete files를 읽는다. 작은 delete file 수백 개는 bytes보다 request latency, TLS/authorization, footer open 비용이 더 클 수 있다.</li>
+    <li><strong>Filter:</strong> Position delete는 sorted position 또는 bitmap membership, equality delete는 key projection·hash/set matching 비용을 낸다. Memory 부족 시 spill·GC·OOM이 생길 수 있다.</li>
+    <li><strong>Return:</strong> 같은 100만 live rows라도 delete 부채가 큰 snapshot은 더 많은 metadata·objects·CPU를 소비한다. Query 결과 count만으로 성능 위험을 알 수 없다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">비용 모델</h3>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <code>T ≈ Tmanifest + Ndata×(open+scan) + Ndelete×(open+decode) + Eapply×matchCPU + spill/GC</code><br>
+    여기서 <code>Eapply</code>는 delete→data 적용 edge 수다. Delete file 수만 줄여도 한 file이 많은 data file에 붙으면 edge 수와 matching 비용은 남는다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">Bipartite graph와 fan-out</h3>
+  <p>왼쪽 node를 data files, 오른쪽 node를 delete files/DVs로 두고 “적용됨”을 edge로 그리자. File-scoped position delete는 낮은 degree를 만들기 쉽다. Partition-scoped equality delete는 같은 partition의 더 오래된 data files에 넓게 연결될 수 있다. Query planner는 결국 필요한 edge를 구성하고 executor가 각 edge의 delete를 적용한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Metadata pruning은 false negative가 없어야 한다</h3>
+  <p>Partition projection과 file metrics는 “절대 적용되지 않는다”를 증명할 때만 delete를 제외한다. Bounds가 겹친다고 실제 key가 존재한다는 뜻은 아니므로 false positive는 남는다. Pruning을 공격적으로 잘못하면 deleted row가 보이는 correctness bug가 되기 때문에 Iceberg는 inclusive projection을 사용한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Delete representation별 실행 비용</h3>
+  <p><strong>Position delete:</strong> Full data-file path와 row position을 읽는다. Path로 filter pushdown하고 position sort를 이용해 streaming merge할 수 있지만 small file open과 path 문자열 metadata가 쌓인다. <strong>Equality delete:</strong> 지정 field IDs를 data row에서 project하고 key를 비교하므로 wide/composite key, global scope, 높은 cardinality일수록 memory·CPU가 커진다. <strong>DV:</strong> Data file당 최대 하나의 bitmap을 range read해 membership test하므로 execution은 효율적이지만 writer가 기존 deletes를 동기적으로 합쳐야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Density와 rewrite 손익분기</h3>
+  <p>Delete density가 1%라면 원본 data file을 유지하고 bitmap으로 몇 row를 건너뛰는 편이 유리할 수 있다. 70%라면 live 30%를 얻으려고 원본 bytes 대부분과 delete를 매 query마다 읽는다. Compaction 비용은 한 번, read amplification은 query마다 반복되므로 <code>rewriteCost &lt; expectedQueryCount × savedReadCost</code>가 되는 시점이 경제적 threshold다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Compaction도 optimistic transaction이다</h3>
+  <p>Maintenance는 base snapshot의 data/delete files를 읽어 logical-equivalent replacement files를 만들고 latest snapshot에서 대상이 여전히 live인지 검증한 뒤 CAS한다. Streaming writer가 같은 partition에 append하는 것은 허용될 수 있지만, target file이 다른 rewrite로 교체되면 stale maintenance plan은 실패하거나 재계획해야 한다. Partial progress는 blast radius를 줄이는 대신 snapshot 수와 동시성 surface를 늘린다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Object storage의 작은 file penalty</h3>
+  <p>Object storage에서는 random seek보다 GET/HEAD 요청 수, authorization, connection, per-request billing이 중요하다. 64KB delete 1,000개는 64MB 한 file과 bytes는 비슷해도 open latency와 scheduler task 수가 훨씬 크다. Cache hit율, coalescing, range GET 지원 여부까지 비용 모델에 넣는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · 네 축을 함께 측정:</strong> Partition/data file별 delete file count, applicable edge count, deleted-row ratio, delete bytes를 함께 본다. P50보다 hotspot partition의 p95/p99와 query shape별 분포가 중요하다.</p>
+  <p><strong>Best practice 2 · Reader 비용 계측:</strong> Planning latency, manifest/delete files opened, object GET/bytes, equality key-set memory, spill/GC, scan task 수, p95 query latency를 수집한다. Engine이 노출하지 않는 edge count는 metadata table로 근사한다.</p>
+  <p><strong>Best practice 3 · SLO 기반 trigger:</strong> 매일 자정 고정 cron보다 “data file당 delete files &gt; K”, “delete ratio &gt; R”, “planning p95 &gt; budget”, “compaction lag &gt; X”를 조합한다. K/R은 workload·file size·query frequency로 실험해 정한다.</p>
+  <p><strong>Best practice 4 · 단계별 maintenance:</strong> Small position deletes만 문제면 <code>rewrite_position_delete_files</code>, 높은 delete density/나쁜 data layout이면 <code>rewrite_data_files</code>, 전체 delete file이 dangling이면 metadata-only removal을 선택한다. 모든 문제에 full data rewrite를 쓰지 않는다.</p>
+  <p><strong>Best practice 5 · Rewrite budget:</strong> Max file-group bytes, concurrent groups, query 시간대, object I/O budget, retry/conflict율을 제한한다. Hot partition부터 처리하고 WAP/branch 또는 canary로 counts와 latency를 검증한다.</p>
+  <p><strong>Configuration 기준:</strong> 공식 최신 설정에서 row-level mode 기본은 COW이고 MOR은 v2 이상에서 선택한다. Delete target file size 기본은 64MiB, data target은 512MiB이며 <code>write.delete.granularity</code> 기본은 partition이다. 이것은 시작점이지 모든 workload의 정답이 아니다.</p>
+  <p><strong>Planning mode:</strong> <code>read.data-planning-mode</code>와 <code>read.delete-planning-mode</code>는 auto/local/distributed 선택을 제공한다. Manifest 수가 매우 많을 때 distributed planning이 driver pressure를 줄일 수 있지만 작은 table에는 startup overhead가 더 클 수 있다.</p>
+  <p><strong>Multi-engine 차이:</strong> Spark procedure 지원, Trino/Flink의 row-level delete 생성 형식, DV read/write, equality delete planning, property 이름/기본값은 connector version별로 다르다. 하나의 engine에서 compaction한 snapshot을 모든 reader golden query로 검증한다.</p>
+  <p><strong>Anti-pattern:</strong> Delete count만 보고 fan-out 무시, MOR를 켜고 maintenance owner를 지정하지 않음, low-traffic partition까지 매일 rewrite, delete files를 object storage에서 수동 삭제, query latency가 깨진 뒤 full-table compaction, snapshot expiration과 rewrite를 조정 없이 동시 실행하는 것이다.</p>
+  <p><strong>Edge case:</strong> Unpartitioned equality delete는 global scope일 수 있다. Partition evolution 뒤에는 old/new spec별 scope를 따라야 하며 current partition spec만 보고 applicability를 계산하면 안 된다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> MOR table의 query latency와 object request가 급증하고 일부 executor가 OOM 난다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Planning p95 급증, delete manifest/file open 폭증, object GET 증가, scan task 과다, executor GC/spill/OOM, hotspot partition만 느림, snapshot마다 query latency 증가, compaction conflict 반복.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Query ID·snapshot ID·plan, manifest/data/delete file count·bytes·record_count, partition/spec/sequence/referenced path/equality_ids, data file별 applicable delete 수와 ratio, object requests·cache hit, task memory/spill/GC, recent DELETE/MERGE와 maintenance commits.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Small delete files 누적, global equality delete fan-out, delete density 임계 초과, partition evolution scope 확장, metrics 부재로 pruning 실패, maintenance backlog, data compaction 뒤 dangling records, unsupported reader/DV, cache churn, distributed planning 미사용.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Slow query의 snapshot을 pin하고 write/maintenance 이력을 보존한다. Hot partition의 metadata table만 분석해 file count·edge·ratio를 산출하고, new MOR write rate를 제한한 뒤 작은 범위 canary rewrite를 실행해 before/after count와 latency를 비교한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#eef5ff;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Known-good snapshot/branch를 보존하고 compaction 결과가 logical-equivalent하지 않으면 pointer rollback 또는 corrected forward rewrite를 한다. Validated canary 정책을 hotspot부터 확장하고 dangling cleanup은 retention 뒤 별도로 수행한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f0;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Delete/data file 수동 삭제, snapshot pin 없이 current count만 비교, full-table rewrite 즉시 실행, compaction 실패 blind retry, sequence number 변경, retention 이전 orphan cleanup, reader memory만 무한 증설하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 실습 · 35분: delete fan-out과 compaction 전후 관찰</h2>
+  <h3 style="font-size:18px;color:#07566a;">사전 조건</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트의 Spark/Iceberg lab. <code>make smoke</code>가 성공하고 local catalog와 Iceberg SQL extensions가 로드되어 있어야 한다.</li>
+    <li>오늘은 exact 실행시간보다 file graph 변화가 목적이다. Spark task/AQE에 따라 생성 file 수는 달라질 수 있다.</li>
+    <li>실행 전 예측: DELETE commit 5회 뒤 live row는 95개, MOR에서는 data file과 position delete files가 함께 보인다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · MOR table과 baseline 생성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day33;
+CREATE TABLE local.day33.events (
+  id BIGINT, category STRING, payload STRING
+) USING iceberg
+TBLPROPERTIES (
+  'format-version'='2',
+  'write.delete.mode'='merge-on-read',
+  'write.delete.granularity'='file',
+  'write.delete.target-file-size-bytes'='65536'
+);
+
+INSERT INTO local.day33.events
+SELECT id, concat('c', CAST(id % 4 AS STRING)), repeat('x', 200)
+FROM range(1, 101);
+
+SELECT content, count(*) AS files,
+       sum(record_count) AS records,
+       sum(file_size_in_bytes) AS bytes
+FROM local.day33.events.files
+GROUP BY content ORDER BY content;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 처음에는 <code>content=0</code> data files만 있다. Exact file 수는 Spark partition/AQE에 좌우된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Small delete commits 누적</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DELETE FROM local.day33.events WHERE id = 10;
+DELETE FROM local.day33.events WHERE id = 20;
+DELETE FROM local.day33.events WHERE id = 30;
+DELETE FROM local.day33.events WHERE id = 40;
+DELETE FROM local.day33.events WHERE id = 50;
+
+SELECT count(*) AS live_rows FROM local.day33.events;
+SELECT content, count(*) AS files,
+       sum(record_count) AS records,
+       sum(file_size_in_bytes) AS bytes
+FROM local.day33.events.files
+GROUP BY content ORDER BY content;
+
+SELECT committed_at, snapshot_id, operation, summary
+FROM local.day33.events.snapshots
+ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Live row는 95개다. <code>content=1</code> position delete files가 추가된다. Delete file 수가 정확히 5가 아닐 수 있으므로 snapshot별 added-delete-files와 current <code>files</code> table을 함께 본다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Query plan과 read cost 증거</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+EXPLAIN FORMATTED
+SELECT * FROM local.day33.events WHERE id BETWEEN 1 AND 60;
+
+SELECT file_path, content, record_count, file_size_in_bytes,
+       referenced_data_file, equality_ids
+FROM local.day33.events.files
+ORDER BY content, file_path;
+&quot;</pre>
+  <p><strong>관찰 포인트:</strong> Plan에서 batch scan과 row-level delete 적용 관련 node를 찾고, position delete의 <code>referenced_data_file</code>이 data file fan-out을 어떻게 제한하는지 본다. Engine version에 따라 plan label은 다르므로 문자열 이름보다 metadata file graph를 증거로 삼는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Position delete minor compaction</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CALL local.system.rewrite_position_delete_files(
+  table =&gt; 'day33.events',
+  options =&gt; map('rewrite-all', 'true')
+);
+
+SELECT count(*) AS live_rows_after FROM local.day33.events;
+SELECT content, count(*) AS files,
+       sum(record_count) AS records,
+       sum(file_size_in_bytes) AS bytes
+FROM local.day33.events.files
+GROUP BY content ORDER BY content;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Live row는 계속 95개여야 한다. Eligible position delete files가 더 적은 file로 합쳐지면 open/metadata overhead가 줄지만 data files 자체의 deleted-row density는 변하지 않는다. Procedure output의 rewritten/added counts도 기록한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Failure injection · compaction과 concurrent delete</h3>
+  <ol style="padding-left:22px;">
+    <li>Terminal A에서 rewrite procedure를 실행하는 동안 Terminal B에서 <code>DELETE ... WHERE id=60</code>을 실행한다.</li>
+    <li>둘 다 성공할 수 있다고 가정하지 말고 commit logs와 snapshots를 확인한다. Target delete files가 바뀌면 validation/retry가 필요하다.</li>
+    <li>최종 count는 94여야 하며 ID 60이 보이지 않아야 한다. Conflict가 났다면 latest snapshot에서 rewrite를 다시 계획한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Procedure not found:</strong> Spark extensions와 catalog 이름을 확인한다. Iceberg 1.11.0 문서의 procedure 지원과 runtime jar version을 맞춘다.</li>
+    <li><strong>Delete file이 생기지 않음:</strong> Table format v2와 <code>write.delete.mode=merge-on-read</code>를 확인하고 partition 전체 metadata-only delete가 아닌 row predicate를 사용한다.</li>
+    <li><strong>Rewrite 결과 0:</strong> Default selection threshold에 걸리지 않을 수 있다. 실습에서는 <code>rewrite-all=true</code>를 사용한다.</li>
+    <li><strong><code>referenced_data_file</code> column 오류:</strong> Runtime/format metadata schema 차이를 확인하고 <code>DESCRIBE local.day33.events.files</code>로 가용 column을 먼저 본다.</li>
+    <li><strong>Count mismatch:</strong> Current snapshot ID를 고정해 before/after를 비교하고 concurrent write가 있었는지 확인한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day33.events PURGE;
+DROP NAMESPACE IF EXISTS local.day33;
+&quot;</pre>
+  <p>공유 warehouse에서는 실습 전용 namespace인지 확인한다. <code>PURGE</code> 동작은 catalog/FileIO 구현에 따라 다를 수 있다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Delete row가 적으면 read cost도 작다.</strong> Small file count와 fan-out이 크면 몇 row 때문에 많은 objects를 연다.</li>
+    <li><strong>Delete file 수만 줄이면 해결된다.</strong> High density data file과 global equality fan-out은 남을 수 있다.</li>
+    <li><strong>Minor compaction이 data file을 정리한다.</strong> Position delete rewrite는 delete files를 합치며 data layout은 별도 rewrite 대상이다.</li>
+    <li><strong>Metrics overlap은 실제 match다.</strong> Metrics는 안전한 exclusion을 위한 보수적 synopsis라 false positive가 남는다.</li>
+    <li><strong>Dangling record와 dangling file은 같다.</strong> Valid/dangling rows가 섞인 delete file은 whole-file metadata removal이 불가능하다.</li>
+    <li><strong>File granularity는 항상 낫다.</strong> Fan-out은 줄지만 delete file 수와 small-file overhead가 늘 수 있다.</li>
+    <li><strong>Compaction은 read-only maintenance다.</strong> 새 files와 snapshot을 만드는 writer이며 conflict·orphan·unknown commit window가 있다.</li>
+    <li><strong>모든 engine이 같은 delete plan을 만든다.</strong> Connector version과 DV/equality support, planning mode, cache 구현이 다르다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Query p99가 2초에서 20초로 늘어난 MOR table을 진단하라.</strong><br>좋은 답변 구조: SLO와 query shape → snapshot pin → manifest/data/delete counts → applicability graph와 density → object GET/cache/memory → hotspot hypothesis → canary maintenance → logical equivalence·rollback.</li>
+    <li><strong>Position delete 1만 개를 언제 delete compaction과 data compaction 중 무엇으로 처리할지 결정하라.</strong><br>좋은 답변 구조: File size/count와 fan-out → delete ratio → query frequency → rewrite/read 비용 수치 → minor compaction 한계 → data rewrite 손익분기 → concurrency·budget → engine compatibility.</li>
+    <li><strong>Streaming MERGE와 compaction이 동시에 실행되는 안전한 protocol을 설계하라.</strong><br>좋은 답변 구조: State owner/base snapshot → immutable outputs → read/write set → sequence preservation → validation/CAS → partial progress → retry/replan → unknown commit → retention/orphan cleanup.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>왜 MERGE 전에 target key당 source row를 최대 하나로 만들어야 하는가?</li>
+    <li>CDC source sequence와 Iceberg sequence number의 책임 차이는?</li>
+    <li>Catalog CAS 성공 뒤 source offset ack 전에 crash하면 무엇을 먼저 확인해야 하는가?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① SQL input order가 없고 multiple match가 모호/오류이므로 deterministic dedup(2점). ② Business event 순서 / table commit 상대 나이와 delete applicability(2점). ③ Current snapshot의 batch ID·audit·summary로 이미 반영됐는지 확인 후 idempotent replay(2점).
+  </div>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Delete amplification을 delete row count 하나로 측정하면 왜 틀리는가?</li>
+    <li><code>rewrite_position_delete_files</code>가 줄이는 비용과 줄이지 못하는 비용은?</li>
+    <li>Compaction 전후 반드시 같아야 하는 logical invariant와 commit 성공 시점은?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #9fd4b7;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① File count·bytes·density·delete→data edge/fan-out이 독립 비용 축(3점). ② Small position delete open/metadata와 dangling records는 줄이지만 data-file density/layout과 equality delete fan-out은 그대로일 수 있음(3점). ③ Live row 집합 동일, catalog pointer CAS 성공이 linearization point(4점). 8점 이상이면 통과.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#087f8c;">Apache Iceberg Table Specification · Scan Planning</a> — delete/data file pruning과 path·partition·sequence 적용 규칙.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/configuration/#write-properties" style="color:#087f8c;">Apache Iceberg · Configuration</a> — COW/MOR, target size, delete granularity, planning mode 설정.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/maintenance/#rewrite-position-delete-files" style="color:#087f8c;">Apache Iceberg · Maintenance</a> — position delete minor compaction과 dangling record filtering.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-procedures/#rewrite_position_delete_files" style="color:#087f8c;">Apache Iceberg 1.11.0 · Spark Procedures</a> — 실습 runtime과 맞춘 procedure option·output.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">확인 기준: Apache Iceberg 공식 최신 문서·Table Specification과 프로젝트 runtime 1.11.0 procedure 문서. Latest 문서는 1.12.0으로 표시되므로 새 option/metric은 배포 connector에서 확인한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:16px 18px;border-radius:9px;">
+    <strong>Day 34 · 랩: delete file 생성과 query plan</strong><br>
+    Position/equality delete artifact와 scan plan을 직접 연결하고 delete file 누적·rewrite·dangling cleanup의 state transition을 통합 실습한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
