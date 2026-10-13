@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 34</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 5 / DAY 34 · INTEGRATION LAB</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">랩: delete file 생성과 query plan</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Row-level Update/Delete와 Format Version · 개념 25분 + 실습 40분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    오늘은 SQL DELETE 한 번을 catalog pointer→snapshot→delete manifest→position delete row→data-file scan task까지 추적하고, delete rewrite 전후에 live row 불변식과 file graph·query plan 비용이 어떻게 달라지는지 직접 증명한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Metadata table</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Iceberg metadata graph를 SQL row로 보여 주는 관찰 창이다. <code>snapshots</code>, <code>files</code>, <code>entries</code>, <code>position_deletes</code>가 대표적이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Content code</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;"><code>files.content</code>의 0은 data, 1은 position delete, 2는 equality delete다. V3 DV는 별도 manifest metadata로 추적된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Position delete</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">삭제 대상 data file의 full path와 0-based row position을 기록하는 V2 delete file이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Manifest entry</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Content file의 status, snapshot ID, data/file sequence와 file metadata를 가진 immutable manifest row다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Scan task</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Reader가 실행할 단위다. 선택된 data file, byte range, residual predicate와 적용할 delete files/DV를 묶는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">EXPLAIN FORMATTED</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Spark가 만든 logical/physical plan을 사람이 읽을 수 있게 출력한다. Plan label은 version별로 달라질 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Minor compaction</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">작은 position delete files를 더 큰 file로 합치고 dangling position rows를 거르는 maintenance다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Logical equivalence</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">물리 file graph가 바뀌어도 query가 보는 live row 집합은 동일해야 한다는 rewrite 불변식이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Golden evidence</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Count만이 아니라 key set/hash, snapshot ID, file graph, plan, procedure output을 함께 저장한 검증 증거다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>운영자는 “DELETE가 성공했다”는 SQL 결과만으로는 충분하지 않다. COW인지 MOR인지, 어떤 data file에 어떤 delete가 붙었는지, reader가 어느 snapshot에서 무엇을 적용하는지, compaction이 live rows를 보존했는지를 증명해야 한다. 장애 시 이 chain이 없으면 data loss와 단순 성능 저하를 구분하지 못한다.</p>
+  <p>Metadata table은 내부 file graph를 SQL로 관찰하게 해 주지만 그 자체가 current state의 owner는 아니다. Catalog pointer가 가리키는 metadata JSON과 snapshot이 authoritative state이며, metadata table은 그 snapshot의 manifests를 projection한 결과다. 따라서 모든 관찰에는 snapshot ID를 붙인다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>오늘의 완료 조건:</strong> DELETE 전후 live key set, snapshot/sequence, current data·delete files, position delete target path, query plan, rewrite procedure output을 모으고 rewrite 전후 live key hash가 같음을 확인한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 7px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① DELETE FROM … WHERE id IN (...)</strong><br><span style="font-size:14px;color:#cdebf0;">Engine이 base snapshot과 matching rows를 읽음</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ MOR writer: target path + row position 수집</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② New position delete file</strong><br><span style="font-size:14px;">(data_file_path, pos) sorted rows + metrics</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:20px;">↓ delete manifest → manifest list → new snapshot/metadata JSON</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>③ Conflict validation + catalog CAS</strong><br><span style="font-size:14px;">Pointer swap 성공 순간 DELETE 공개</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ next reader pins new snapshot</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④ Delete manifests → data manifests</strong><br><span style="font-size:14px;">path + partition + data sequence로 applicability pairing</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:20px;">↓ scan task opens data + applicable position deletes</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Row ordinal과 delete position merge</strong><br><span style="font-size:14px;color:#cdebf0;">삭제되지 않은 live rows만 operator에 전달</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Read set:</strong> DELETE predicate가 partition/metrics로 candidate data files를 찾고 실제 matching rows와 물리 positions를 계산한다.</li>
+    <li><strong>Immutable output:</strong> Position delete file은 original data를 수정하지 않는다. Full path와 pos를 정렬해 쓰고 reserved field metrics를 남긴다.</li>
+    <li><strong>Linearization:</strong> Delete file object가 존재해도 table state가 아니다. New metadata pointer CAS가 성공해야 current snapshot에서 보인다.</li>
+    <li><strong>Planning:</strong> Reader는 delete manifests를 먼저 보고 query/data candidate에 붙을 delete를 정한다. Position delete는 same path와 partition, <code>dataSeq ≤ deleteSeq</code> 조건을 따른다.</li>
+    <li><strong>Execution:</strong> Data row ordinal이 delete positions와 일치하면 row를 숨긴다. Query predicate와 delete filtering 모두 통과한 row만 결과가 된다.</li>
+    <li><strong>Rewrite:</strong> Minor compaction은 delete files를 교체하는 새 optimistic commit이다. Old snapshot reader는 old files를 계속 읽고 new snapshot reader만 replacement를 본다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">Control path와 data path를 분리한다</h3>
+  <p><strong>Control path:</strong> Catalog pointer → metadata JSON → snapshot → manifest list → delete/data manifests → scan tasks다. <strong>Data path:</strong> Object storage의 Parquet data/delete files를 열고 row group·positions를 decode해 live rows를 만든다. Planning latency가 느리면 control path, executor spill/OOM이면 data path를 먼저 의심한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">왜 delete manifest를 먼저 보는가</h3>
+  <p>Delete file이 어느 data file에 적용되는지 알아야 scan task를 완성할 수 있다. Manifest partition summary와 metrics가 query와 겹치지 않으면 delete manifest/file을 제외할 수 있다. 다만 inclusive pruning은 false negative를 금지하므로 실제 match가 없는 false positive는 실행 단계까지 남을 수 있다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Position delete metadata를 읽는 법</h3>
+  <p><code>files.content=1</code>은 delete file 자체의 통계다. Target 관계는 <code>position_deletes.file_path</code>와 <code>delete_file_path</code>를 함께 봐야 분명하다. <code>entries</code>의 sequence numbers는 file 상대 나이를 보여 주고, deleted status는 과거 manifest entry이지 current scan 대상이 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">EXPLAIN의 한계</h3>
+  <p>Physical plan이 모든 delete file path와 applicability edge를 그대로 출력한다고 가정하면 안 된다. Spark/Iceberg version에 따라 node label과 metrics가 달라진다. Plan은 “Iceberg scan과 predicate pushdown이 있는가”를 보고, exact file graph는 metadata tables, runtime I/O는 Spark metrics/object-store logs로 교차 검증한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Rewrite의 state transition</h3>
+  <p>Delete rewrite는 old delete files를 remove하고 logically equivalent new delete files를 add하는 snapshot을 만든다. New file의 data sequence는 replacement의 applicability를 보존해야 한다. Concurrent writer가 target graph를 바꾸면 latest snapshot에서 validation하고 replan해야 한다. CAS 전 crash는 orphan outputs, CAS response 유실은 unknown commit state를 만든다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">V2/V3 경계</h3>
+  <p>이 lab은 format v2 position delete를 관찰한다. V3 writer는 새 position delete file을 추가할 수 없고 data file당 최대 하나의 DV에 기존 positions를 동기적으로 합친다. 따라서 같은 SQL이라도 format/engine에 따라 artifact가 달라질 수 있으며, test assertion은 feature-aware해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Evidence bundle:</strong> Operation별 base/result snapshot ID, SQL/job ID, input predicate, added/removed data·delete files, sequence, key count/hash, object path를 한 run ID로 묶는다. 장애 시 재현 가능한 최소 단위가 된다.</p>
+  <p><strong>Best practice 2 · Snapshot pin:</strong> Before/after 비교는 current를 두 번 읽지 말고 explicit snapshot ID 또는 branch/tag를 사용한다. Concurrent writes가 있으면 current 비교가 서로 다른 state를 섞는다.</p>
+  <p><strong>Best practice 3 · Multi-level assertion:</strong> Row count만 같아도 값이 바뀔 수 있다. Count, sorted key set/hash, aggregates, duplicate key, null semantics, file applicability를 함께 검사한다.</p>
+  <p><strong>Best practice 4 · Mode capability gate:</strong> Table property, format version, writer output artifact, reader support를 모두 확인한다. <code>write.delete.mode=merge-on-read</code> property 하나만으로 position delete 생성과 모든 reader 호환을 단정하지 않는다.</p>
+  <p><strong>Best practice 5 · Maintenance canary:</strong> Small partition/branch에서 rewrite 후 golden query와 plan/I/O를 비교한다. Live row 불일치, unexpected global delete, conflict율 증가 시 확장을 중단한다.</p>
+  <p><strong>Anti-pattern:</strong> Warehouse listing으로 current file을 추정, all_files duplicate를 current files로 오해, EXPLAIN 문자열만 golden test로 고정, delete object를 수동 삭제, rewrite 결과 0을 성공 개선으로 보고, count만 맞으면 compaction 안전하다고 판단하는 것이다.</p>
+  <p><strong>Edge case:</strong> Predicate가 partition 전체를 정확히 지우면 metadata-only delete가 가능해 position delete가 생기지 않는다. Lab predicate는 개별 row를 겨냥해 이 경로를 피한다.</p>
+  <p><strong>Version 차이:</strong> Spark 3.x procedure는 Iceberg SQL extensions가 필요하다. 1.11.0의 <code>position_deletes</code>, <code>rewrite_position_delete_files</code>를 기준으로 하며 최신 spec의 DV/v4 규칙을 그대로 1.11 runtime 결과로 기대하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> DELETE 후 일부 row가 재등장하거나 compaction 뒤 count가 달라졌다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">삭제 row 재등장·과삭제, engine별 count 차이, position_deletes target path가 live data path와 불일치, rewrite 전후 key hash 차이, delete file 404, plan에 unexpected full scan, conflict/retry 반복.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Base/result/current snapshot ID·parent·sequence·summary, <code>files/entries/position_deletes</code>, data/delete manifests, target path+pos, query plan, key hash/count, writer/rewrite commit log, object HEAD/ETag, engine·connector·format version.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">잘못된 snapshot 비교, sequence applicability 손상, target data rewrite와 maintenance race, dangling/valid record 혼합 처리 오류, unsupported reader가 delete 무시, stale cache, premature orphan cleanup, unknown commit blind retry.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">영향 snapshot IDs를 tag/branch로 보존하고 writes·rewrite·expiration·orphan cleanup을 멈춘다. Known-good reader로 각 snapshot의 key hash와 position target graph를 재구성하고 object 존재를 read-only로 확인한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#eef5ff;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Known-good snapshot으로 pointer rollback하거나 raw source에서 corrected forward commit을 만든다. Missing object는 보존본에서 복구 후 metadata를 검증하고, rewrite는 latest snapshot에서 재계획한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f0;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Data/delete file 수동 삭제, current snapshot만 보고 원인 단정, sequence 편집, full overwrite, blind retry, snapshot expiration으로 증거 제거, orphan cleanup을 복구 수단으로 사용하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 통합 실습 · 40분</h2>
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>프로젝트 root에서 Docker가 실행 중이고 <code>make smoke</code>가 통과한다.</li>
+    <li>프로젝트 runtime은 Spark 3.5.8 + Iceberg 1.11.0이며 local catalog와 SQL extensions를 사용한다.</li>
+    <li>예측을 먼저 쓴다: Initial 80 rows → 8 rows delete → live 72. Minor compaction 전후 live key hash는 같다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">0단계 · 환경 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SHOW NAMESPACES IN local;
+&quot;</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · 여러 data file과 baseline 증거 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day34;
+CREATE TABLE local.day34.events (
+  id BIGINT, bucket STRING, payload STRING
+) USING iceberg
+TBLPROPERTIES (
+  'format-version'='2',
+  'write.delete.mode'='merge-on-read',
+  'write.delete.granularity'='file',
+  'write.delete.target-file-size-bytes'='65536'
+);
+
+INSERT INTO local.day34.events
+SELECT id, 'A', repeat('a', 100) FROM range(1, 21);
+INSERT INTO local.day34.events
+SELECT id, 'B', repeat('b', 100) FROM range(21, 41);
+INSERT INTO local.day34.events
+SELECT id, 'C', repeat('c', 100) FROM range(41, 61);
+INSERT INTO local.day34.events
+SELECT id, 'D', repeat('d', 100) FROM range(61, 81);
+
+SELECT count(*) AS rows_before,
+       sum(id) AS id_sum_before,
+       sha2(concat_ws(',', sort_array(collect_list(CAST(id AS STRING)))), 256)
+         AS key_hash_before
+FROM local.day34.events;
+
+SELECT content, count(*) AS files, sum(record_count) AS records,
+       sum(file_size_in_bytes) AS bytes
+FROM local.day34.events.files
+GROUP BY content ORDER BY content;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 80 rows와 data file(<code>content=0</code>)만 보인다. Insert commit을 나눴어도 Spark/AQE에 따른 exact file 수는 환경마다 다를 수 있다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · 두 DELETE commit으로 position delete 생성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DELETE FROM local.day34.events WHERE id IN (2,4,22,24);
+DELETE FROM local.day34.events WHERE id IN (42,44,62,64);
+
+SELECT count(*) AS rows_after_delete, sum(id) AS id_sum_after
+FROM local.day34.events;
+
+SELECT content, count(*) AS files, sum(record_count) AS records,
+       sum(file_size_in_bytes) AS bytes
+FROM local.day34.events.files
+GROUP BY content ORDER BY content;
+
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day34.events.snapshots
+ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Live row는 72개다. <code>content=1</code> position delete files가 생기며 두 DELETE는 각각 새 snapshot을 만든다. Exact delete file 수는 touched data files/task distribution에 따라 달라진다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Delete row→target data file graph 재구성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT delete_file_path,
+       file_path AS target_data_file,
+       count(*) AS deleted_positions,
+       min(pos) AS min_pos,
+       max(pos) AS max_pos
+FROM local.day34.events.position_deletes
+GROUP BY delete_file_path, file_path
+ORDER BY delete_file_path, target_data_file;
+
+SELECT status, snapshot_id, sequence_number, file_sequence_number,
+       data_file.content AS content,
+       data_file.file_path AS file_path,
+       data_file.record_count AS record_count
+FROM local.day34.events.entries
+ORDER BY snapshot_id, content, file_path;
+&quot;</pre>
+  <p><strong>관찰 포인트:</strong> 같은 delete file이 몇 target data files에 edge를 갖는지, position이 0-based인지, delete entry의 data sequence가 target보다 새롭거나 같은지 확인한다. <code>entries</code>의 status와 current <code>files</code>를 혼동하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Query plan과 current file graph</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+EXPLAIN FORMATTED
+SELECT id, bucket FROM local.day34.events
+WHERE id BETWEEN 1 AND 30 ORDER BY id;
+
+SELECT file_path, content, record_count, file_size_in_bytes,
+       equality_ids, lower_bounds, upper_bounds
+FROM local.day34.events.files
+ORDER BY content, file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Iceberg batch scan과 pushed/residual filters를 찾는다. Plan에 delete path가 모두 보이지 않아도 <code>position_deletes</code> graph와 live result가 delete 적용 증거다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">5단계 · Failure injection: small delete 누적</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DELETE FROM local.day34.events WHERE id = 6;
+DELETE FROM local.day34.events WHERE id = 8;
+DELETE FROM local.day34.events WHERE id = 26;
+DELETE FROM local.day34.events WHERE id = 28;
+
+SELECT content, count(*) AS files, sum(record_count) AS records
+FROM local.day34.events.files
+GROUP BY content ORDER BY content;
+
+SELECT count(*) AS live_rows_before_rewrite,
+       sha2(concat_ws(',', sort_array(collect_list(CAST(id AS STRING)))), 256)
+         AS key_hash_before_rewrite
+FROM local.day34.events;
+&quot;</pre>
+  <p><strong>예측 후 확인:</strong> 추가로 4개가 삭제되어 live rows는 68개다. Small delete commits가 늘며 object-open 후보가 증가한다. 출력한 hash를 다음 단계와 비교한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">6단계 · Minor compaction과 불변식 검증</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CALL local.system.rewrite_position_delete_files(
+  table =&gt; 'day34.events',
+  options =&gt; map('rewrite-all', 'true')
+);
+
+SELECT count(*) AS live_rows_after_rewrite,
+       sha2(concat_ws(',', sort_array(collect_list(CAST(id AS STRING)))), 256)
+         AS key_hash_after_rewrite
+FROM local.day34.events;
+
+SELECT content, count(*) AS files, sum(record_count) AS records,
+       sum(file_size_in_bytes) AS bytes
+FROM local.day34.events.files
+GROUP BY content ORDER BY content;
+
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day34.events.snapshots
+ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>통과 기준:</strong> Live rows 68, before/after key hash 동일, rewrite snapshot 추가, eligible delete files 감소 또는 재배치다. Procedure가 0 files를 rewrite했다면 threshold/runtime capability와 current graph를 확인하고 결과를 억지로 성공 처리하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">7단계 · 동시성 실패 주입(선택, 10분)</h3>
+  <ol style="padding-left:22px;">
+    <li>Terminal A에서 delete rewrite를 다시 실행하고 Terminal B에서 <code>DELETE ... WHERE id=10</code>을 실행한다.</li>
+    <li>Commit 순서, conflict/retry, final parent chain을 <code>snapshots</code>에서 확인한다.</li>
+    <li>최종 live rows는 67이며 ID 10은 없어야 한다. Conflict가 발생하면 same output을 blind commit하지 말고 latest snapshot에서 rewrite를 재계획한다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Position delete가 없음:</strong> Format v2, MOR property, row-level predicate를 확인한다. Partition 전체 match면 metadata-only delete일 수 있다.</li>
+    <li><strong><code>position_deletes</code> table 오류:</strong> Iceberg 1.11.0 runtime과 SQL extensions를 확인하고 <code>DESCRIBE local.day34.events.position_deletes</code>로 schema를 본다.</li>
+    <li><strong>Procedure not found:</strong> Catalog 이름과 Spark extension 설정을 확인한다. Spark 3.x에서는 extension이 필요하다.</li>
+    <li><strong>Hash가 null/불안정:</strong> Empty table 여부와 collect order를 확인한다. <code>sort_array</code> 뒤 string join을 사용하고 같은 snapshot을 비교한다.</li>
+    <li><strong>Exact file count가 문서와 다름:</strong> Spark partition/AQE에 따른 정상 차이다. Content, rows, applicability와 전후 상대 변화로 검증한다.</li>
+    <li><strong>Concurrent lab이 너무 빨리 끝남:</strong> Data 규모를 키우거나 두 terminal에서 barrier를 두고 실행하되 운영 table에는 failure injection하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day34.events PURGE;
+DROP NAMESPACE IF EXISTS local.day34;
+&quot;</pre>
+  <p>실습 전용 namespace에서만 실행한다. 장애 증거를 보존해야 하면 cleanup 전에 snapshot/file graph 출력을 저장한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ol style="padding-left:22px;">
+    <li><strong><code>files</code>는 warehouse listing이다.</strong> Current snapshot manifest graph의 projection이며 unreferenced objects는 나오지 않는다.</li>
+    <li><strong><code>all_files</code> row 수가 physical object 수다.</strong> 같은 file이 여러 snapshots에서 중복될 수 있다.</li>
+    <li><strong>DELETE SQL 성공 즉시 object가 안전하게 지워진다.</strong> Row-level delete는 새 metadata state를 만들고 old files는 time travel/retention 때문에 남는다.</li>
+    <li><strong>Plan에 delete path가 없으면 delete가 적용되지 않았다.</strong> Plan 표현은 version별로 다르므로 metadata/result와 교차 확인한다.</li>
+    <li><strong>Position delete file 하나는 target 하나다.</strong> V2 file은 여러 target paths를 담을 수 있다. File granularity 설정은 정책이지 spec 일반 불변식이 아니다.</li>
+    <li><strong>Rewrite 후 delete file 수는 반드시 1이다.</strong> Partition/file group, target size와 engine plan에 따라 여러 outputs가 정상이다.</li>
+    <li><strong>Count가 같으면 logical equivalence다.</strong> Key/value hash와 aggregates가 필요하다.</li>
+    <li><strong>V3에서도 같은 position delete lab 결과가 나온다.</strong> V3 writer는 새 position delete를 금지하고 DV를 사용한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>DELETE 한 건이 reader 결과에서 사라질 때까지 end-to-end 경로를 설명하라.</strong><br>좋은 답변 구조: Predicate/read set → position 수집 → immutable delete file → manifests/metadata → validation/CAS → reader snapshot pin → applicability → row filtering → failure windows.</li>
+    <li><strong>Compaction 전후 동일성을 어떻게 자동 검증할 것인가?</strong><br>좋은 답변 구조: Snapshot/branch pin → count+key/value hash+aggregates → file graph/sequence → golden multi-engine queries → canary threshold → conflict/unknown commit → rollback/forward repair.</li>
+    <li><strong>Query plan에는 delete details가 부족한데 production read amplification을 어떻게 측정할 것인가?</strong><br>좋은 답변 구조: Metadata tables로 graph 추정 → runtime scan metrics → object GET/bytes/cache → task memory/spill → p95/p99 SLO → delete/data rewrite 손익분기 → connector differences.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Delete amplification을 설명하는 네 가지 독립 비용 축은?</li>
+    <li>Position delete minor compaction이 줄이는 비용과 남기는 비용은?</li>
+    <li>Rewrite 손익분기를 한 줄 식으로 표현하면?</li>
+  </ol>
+  <div style="background:#f7fafb;border:1px solid #dbe3e8;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① File count·bytes·density·applicability fan-out/edges(2점). ② Small delete open/metadata는 감소, data-file density/layout과 equality fan-out은 남을 수 있음(2점). ③ One-time rewrite cost와 예상 query 수×절감 read cost 비교(2점).
+  </div>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Position delete row에서 target identity를 만드는 두 값은 무엇인가?</li>
+    <li>Delete file object write 성공과 DELETE commit 성공의 차이는?</li>
+    <li>Rewrite 전후 어떤 증거가 같아야 하고 무엇은 달라져도 되는가?</li>
+  </ol>
+  <div style="background:#edf8f2;border:1px solid #9fd4b7;padding:14px 16px;">
+    <strong>짧은 정답/채점 기준:</strong> ① Full data-file path + 0-based row position(3점). ② Object는 prepared artifact일 뿐, catalog pointer CAS 성공이 current state 공개 시점(3점). ③ Live key/value set·hash는 동일, physical data/delete paths/count/layout은 달라질 수 있음(4점). 8점 이상이면 통과.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-queries/#metadata-tables" style="color:#087f8c;">Apache Iceberg 1.11.0 · Spark Queries / Metadata Tables</a> — files, entries, position_deletes의 schema와 해석.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-procedures/#rewrite_position_delete_files" style="color:#087f8c;">Apache Iceberg 1.11.0 · rewrite_position_delete_files</a> — lab procedure의 input, options와 output.</li>
+    <li><a href="https://iceberg.apache.org/spec/#scan-planning" style="color:#087f8c;">Apache Iceberg Table Specification · Scan Planning</a> — delete manifest planning과 path·partition·sequence scope.</li>
+    <li><a href="https://iceberg.apache.org/spec/#delete-formats" style="color:#087f8c;">Apache Iceberg Table Specification · Delete Formats</a> — position/equality delete와 DV의 format-version 경계.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">실습은 프로젝트 runtime 1.11.0 문서를 기준으로 하고, format v3/v4 사실은 최신 Table Specification으로 별도 확인했다. Engine별 plan label과 artifact는 배포 connector에서 재검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <div style="background:#073642;color:#ffffff;padding:16px 18px;border-radius:9px;">
+    <strong>Day 35 · 회상: v1/v2/v3 feature·호환 경계</strong><br>
+    Week 5를 닫으며 format version별 row-level delete artifact, writer 금지 규칙, reader compatibility와 upgrade/rollback 경계를 백지에서 재구성한다.
+  </div>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
