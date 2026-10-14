@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 35</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 5 / DAY 35 · RECALL &amp; REVIEW</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">회상: v1/v2/v3 feature·호환 경계</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Row-level Update/Delete와 Format Version · 개념 30분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Format version은 기능 목록표가 아니라 reader·writer가 반드시 이해해야 하는 metadata 계약의 하한선이다. Upgrade는 기존 file을 즉시 rewrite하지 않지만 새 계약을 모르는 engine을 배제할 수 있으므로, 모든 소비자의 read·write·maintenance capability가 증명된 뒤에만 catalog pointer를 새 metadata로 전진시켜야 한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Table Specification</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">여러 engine이 같은 table state를 해석하기 위한 공개 wire/storage 계약이다. 특정 Spark·Flink·Trino 구현 자체가 아니다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Format version</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Table metadata JSON의 <code>format-version</code> 값이다. Reader가 이보다 높은 버전을 모르면 조용히 무시하지 말고 load를 거부해야 한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Backward compatibility</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">새 reader가 과거 버전 artifact를 올바르게 읽는 능력이다. Upgrade 후에도 old manifest와 data file이 남으므로 필수다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Forward compatibility</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">옛 reader가 미래 버전 metadata를 올바르게 읽는 능력이다. 새 기능이 이를 깨뜨릴 때 format version이 올라간다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Capability</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Engine이 table을 load하는 능력, data/delete를 scan하는 능력, 새 artifact를 쓰는 능력, maintenance하는 능력을 각각 뜻한다. 하나의 “지원” boolean으로 합치면 안 된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Metadata-only upgrade</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">기존 data tree를 즉시 rewrite하지 않고 새 table metadata에서 version 계약을 올리는 state transition이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Mixed-version tree</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Current table version은 v2/v3지만 historical snapshot·manifest·data file에는 이전 버전 규칙으로 작성된 artifact가 함께 있는 정상 상태다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Downgrade</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Format version을 낮추는 일이다. 이미 새 artifact가 생겼을 수 있어 일반적으로 금지되며, property 숫자만 되돌리는 것은 안전한 rollback이 아니다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>“V2를 읽는다”와 “V2 row-level delete를 쓴다”는 다른 문장이다. 어떤 connector는 v2 metadata를 load하고 position delete를 적용할 수 있지만 equality delete를 쓰거나 compaction procedure를 실행하지 못할 수 있다. V3도 table load, extended type, row lineage, deletion vector read/write가 같은 시점에 구현된다고 가정할 수 없다.</p>
+  <p>Upgrade의 위험은 data rewrite 시간이 아니라 <strong>호환 집합이 즉시 바뀐다는 점</strong>이다. Catalog pointer가 v3 metadata를 가리키는 순간 old reader는 아직 data file이 전부 v1 형식이어도 table 자체를 거부해야 한다. 반대로 지원하지 않는 feature를 무시하고 값을 반환한다면 hard failure보다 위험한 silent corruption이 된다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>Week 5 최종 불변식:</strong> Spec에 기능이 존재한다는 사실, library가 format version을 load한다는 사실, engine이 그 기능을 end-to-end로 읽고 쓰며 유지보수한다는 사실은 서로 다른 증거다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Consumer inventory</strong><br><span style="font-size:14px;color:#cdebf0;">Spark · Flink · Trino · batch · stream · maintenance job</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ 각 consumer의 load / read / write / maintain capability 증명</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② Catalog current pointer → M1, format-version=1</strong><br><span style="font-size:14px;">Snapshot → manifest list → data manifest → immutable data files</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ CAS로 새 metadata M2 publish</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>③ Current pointer → M2, format-version=2</strong><br><span style="font-size:14px;">기존 v1 files는 그대로 유효 · 새 commit은 sequence/delete metadata를 쓸 수 있음</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ 별도 v3 capability gate 통과 뒤에만 upgrade</td></tr>
+    <tr><td style="background:#f1edff;text-align:center;padding:13px;border:1px solid #bcb0e8;border-radius:8px;"><strong>④ Current pointer → M3, format-version=3</strong><br><span style="font-size:14px;">V1/V2 historical artifacts + V3 type/default/row-lineage/DV artifact 공존 가능</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ query마다 current root에서 mixed tree를 계획</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Reader 결과는 logical equivalence를 보존</strong><br><span style="font-size:14px;color:#cdebf0;">old data + applicable delete/DV + schema/default semantics를 함께 적용</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Inventory:</strong> Table owner는 interactive query만 보지 않고 streaming checkpoint, recovery tool, snapshot expiration, compaction, orphan cleanup까지 consumer graph에 넣는다.</li>
+    <li><strong>Evidence:</strong> 각 engine/version에 대해 golden table을 load하고 old snapshot, current snapshot, row-level delete, metadata table, write/rollback/maintenance를 구분해 시험한다.</li>
+    <li><strong>V1→V2:</strong> Writer가 latest metadata를 읽고 v2 metadata를 준비한 뒤 catalog CAS에 성공하면 upgrade가 확정된다. Existing v1 manifests는 rewrite되지 않아도 v2 reader가 default 규칙으로 읽는다.</li>
+    <li><strong>V2 feature activation:</strong> Version 숫자를 올린 것만으로 delete file이 생기지 않는다. 이후 MOR DELETE/MERGE 같은 commit이 delete manifest와 sequence를 추가할 때 실제 read path가 확장된다.</li>
+    <li><strong>V2→V3:</strong> V3 reader는 old v2 position/equality delete도 계속 적용하면서 새 DV·row lineage·extended type을 해석해야 한다. Upgrade와 새 feature 사용을 두 배포 단계로 나누면 rollback window가 커진다.</li>
+    <li><strong>Query:</strong> Reader는 current metadata version을 먼저 gate하고, snapshot의 manifest별 version/default 규칙을 적용한다. 모르는 상위 version을 “아는 field만 읽기”로 처리하면 안 된다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">V1/V2/V3 계약 비교</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:17%;">Version</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:34%;">핵심 계약</th><th style="padding:9px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">Reader/Writer 관점</th></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>V1</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Immutable Parquet/Avro/ORC 기반 analytic table, snapshot·manifest·evolution.</td><td style="padding:9px;border:1px solid #dbe3e8;">Data file 집합을 읽는다. V2의 sequence/delete file을 알지 못한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>V2</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Row-level delete file, sequence number, 더 엄격한 writer requirement.</td><td style="padding:9px;border:1px solid #dbe3e8;">Position/equality delete applicability를 data file에 적용한다. V1 artifact는 default sequence/content 규칙으로 계속 읽는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dbe3e8;"><strong>V3</strong></td><td style="padding:9px;border:1px solid #dbe3e8;">Nanosecond·variant·geometry/geography 등 확장 type, column default, multi-argument transform, row lineage, binary DV, encryption key metadata.</td><td style="padding:9px;border:1px solid #dbe3e8;">새 semantics와 old V2 delete를 함께 처리한다. Spec 채택과 개별 engine feature 구현 시점은 다르다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Reader는 관대하고 writer는 엄격해야 한다</h3>
+  <p>Upgrade가 metadata tree 전체를 rewrite하지 않으므로 later-version reader는 prior manifest에서 빠진 field를 spec의 default로 채워야 한다. 예를 들어 V1 artifact를 V2에서 읽을 때 sequence 관련 값과 manifest content는 V1→V2 규칙에 따라 해석한다. 반면 writer는 현재 table version의 required field와 불변식을 모두 지켜 새 metadata를 만들어야 한다. “읽을 수 있음”을 근거로 incomplete metadata를 쓰면 다음 engine에서 깨진다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Format version은 feature flag와 다르다</h3>
+  <p>Format version은 table 전체의 최소 해석 계약이다. <code>write.delete.mode=merge-on-read</code> 같은 property는 그 계약 안에서 어떤 artifact를 만들지 선택하는 동작 flag다. V2로 올린 직후에는 delete file이 없을 수 있고, V3로 올려도 DV나 row lineage가 즉시 모든 file에 생긴다고 단정할 수 없다. 따라서 <strong>version upgrade commit</strong>과 <strong>new feature activation commit</strong>을 분리해 관찰해야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">성공 확정 시점과 downgrade 불가능성</h3>
+  <p>Upgrade 성공은 새 metadata JSON 생성이 아니라 catalog pointer CAS가 성공해 current root가 바뀐 순간 확정된다. 그 뒤 새 writer가 V2/V3-only artifact를 publish할 수 있으므로 단순히 property를 낮추는 downgrade는 안전하지 않다. 복구가 필요하면 consumer를 차단하고 pre-upgrade snapshot/backup에서 새 table을 만들거나, forward fix로 호환되지 않는 artifact를 rewrite하는 migration을 설계한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Capability matrix:</strong> Engine 이름 옆에 지원/미지원 한 칸을 두지 않는다. 최소한 load metadata, scan data, apply position delete, apply equality delete, apply DV, append, row-level write, schema evolution, snapshot/compaction/orphan maintenance를 별도 열로 둔다.</p>
+  <p><strong>Best practice 2 · 두 단계 rollout:</strong> 먼저 모든 consumer를 새 version-capable connector로 올리고 old-format table을 계속 운용한다. Golden query와 recovery drill이 통과한 뒤 format version만 올린다. 마지막으로 new write feature를 canary table에서 활성화한다.</p>
+  <p><strong>Best practice 3 · 최소 공통 분모:</strong> Multi-engine table의 format version은 가장 최신 writer가 아니라 가장 느린 critical reader/recovery tool이 결정한다. 새 기능의 가치가 compatibility 비용보다 클 때만 별도 table이나 serving copy로 분리한다.</p>
+  <p><strong>Best practice 4 · Evidence 보존:</strong> Upgrade 전 current metadata location, snapshot ID, engine/container image digest, connector version, query checksum을 기록한다. Upgrade 뒤에도 old snapshot read와 row-count/key-hash를 비교한다.</p>
+  <p><strong>Anti-pattern:</strong> Spec V3 채택을 “모든 Spark/Flink/Trino가 V3 지원”으로 번역하기, staging의 append 성공만 보고 production MERGE 허용하기, format-version 숫자를 rollback switch로 보기, maintenance job을 matrix에서 빼는 것이다.</p>
+  <p><strong>Edge case:</strong> Table은 V3인데 아직 V3-only artifact가 없으면 old engine이 우연히 읽는 것처럼 보일 수 있다. 이는 지원 증거가 아니라 test coverage hole이다. 반대로 V2 table도 equality delete, position delete, Puffin statistics 등 실제 artifact 조합에 따라 필요한 capability가 달라진다.</p>
+  <p><strong>Version/engine 차이:</strong> 현재 Table Specification은 V1·V2·V3를 adopted로, V4를 개발 중으로 명시한다. Apache 구현 상태 표도 language/library별 read·write·catalog 기능이 다름을 보여준다. 프로젝트 Spark 3.5.8 + Iceberg 1.11.0 lab 결과를 다른 engine이나 최신 connector에 그대로 일반화하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Format upgrade 뒤 일부 engine이 table load에 실패하거나 삭제된 row를 다시 보여 준다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Unsupported format version, metadata parse error, old snapshot만 성공, engine별 row count/key hash 불일치, 삭제 row 재등장, DV/Puffin read error, maintenance job 실패, streaming checkpoint 재시작 실패.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Current/previous metadata location과 format-version, upgrade snapshot·timestamp, engine/connector/runtime exact version, failing query와 snapshot ID, manifest content·sequence, data/delete/DV file 수, affected partition/key checksum, catalog logs, maintenance/stream checkpoint, canary 결과.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Reader가 상위 version 미지원, metadata load만 지원하고 delete/DV 적용 미지원, writer가 required field 누락, old reader cache, new type/default semantics mismatch, compaction이 old delete를 누락, catalog pointer와 engine cache 불일치, recovery tool이 feature matrix에서 빠짐.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">모든 writer·maintenance와 문제 engine의 serving traffic을 멈춘다. Current metadata와 artifact를 보존하고 known-good engine으로 current/previous snapshot checksum을 비교한다. 영향 없는 reader는 검증된 snapshot을 pin한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">아직 new-version artifact가 없다면 catalog 구현이 제공하는 검증된 restore 절차를 사용한다. 이미 생성됐다면 property downgrade 대신 compatible connector로 forward fix/rewrite하거나 pre-upgrade snapshot에서 별도 table을 재구성해 atomic consumer cutover한다. Checkpoint와 checksum을 다시 맞춘다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON·catalog pointer 수동 편집, format-version 숫자 강제 하향, 모르는 field/delete/DV 무시, failing engine으로 compaction, delete file 임의 삭제, 증거 수집 전 snapshot expiration/orphan cleanup, 일부 query 성공만으로 traffic 재개를 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> V1 table을 만든 뒤 metadata-only로 V2에 upgrade하고, old data file이 그대로 남는 상태에서 V2 row-level delete artifact를 추가한다. 마지막으로 downgrade 실패를 주입해 format version이 reversible toggle이 아님을 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker Desktop이 정상이고 프로젝트 <code>make smoke</code>가 성공해야 한다. Runtime은 Spark 3.5.8 + Iceberg 1.11.0, local Hadoop-backed SparkCatalog와 SQL extensions다.</li>
+    <li>V1→V2 upgrade 직후 row count와 data file path는 같고 metadata JSON만 새로 생길 것이라고 먼저 적는다.</li>
+    <li>V2에서 MOR DELETE를 실행하면 current logical row는 3→2가 되고, data file과 position delete file이 함께 계획될 것이라고 예측한다.</li>
+    <li>V2→V1 downgrade 시도는 non-zero로 실패해야 한다. 실패가 나면 실습 성공이며 억지로 metadata를 편집하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">0단계 · 환경 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+rg -n &quot;apache/spark|iceberg-spark-runtime&quot; docker-compose.yml conf/spark-defaults.conf</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · V1 baseline과 증거 만들기</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day35;
+DROP TABLE IF EXISTS local.day35.compat PURGE;
+CREATE TABLE local.day35.compat (
+  id BIGINT, payload STRING
+) USING iceberg
+TBLPROPERTIES ('format-version'='1');
+INSERT INTO local.day35.compat VALUES
+  (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+SHOW TBLPROPERTIES local.day35.compat ('format-version');
+SELECT count(*) AS rows_before FROM local.day35.compat;
+SELECT file_path, content, record_count
+FROM local.day35.compat.files ORDER BY file_path;
+SELECT latest_snapshot_id, latest_schema_id, latest_sequence_number, file
+FROM local.day35.compat.metadata_log_entries ORDER BY timestamp;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Property는 1, row는 3, <code>files.content</code>는 data를 뜻하는 0이다. V1에서는 sequence field가 없거나 V2 reader의 default 관점으로 0처럼 보일 수 있으므로 metadata table schema를 먼저 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Metadata-only V1→V2 upgrade</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day35.compat
+SET TBLPROPERTIES ('format-version'='2');
+SHOW TBLPROPERTIES local.day35.compat ('format-version');
+SELECT count(*) AS rows_after_upgrade FROM local.day35.compat;
+SELECT file_path, content, record_count
+FROM local.day35.compat.files ORDER BY file_path;
+SELECT latest_snapshot_id, latest_sequence_number, file
+FROM local.day35.compat.metadata_log_entries ORDER BY timestamp;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Property는 2가 되고 metadata log에는 새 metadata JSON이 추가된다. Row count는 3이고 기존 data file path는 유지된다. Upgrade는 catalog root의 계약을 바꾸지만 historical tree를 즉시 rewrite하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · V2 feature activation과 read path 확장</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day35.compat SET TBLPROPERTIES (
+  'write.delete.mode'='merge-on-read',
+  'write.delete.granularity'='file'
+);
+DELETE FROM local.day35.compat WHERE id = 2;
+SELECT * FROM local.day35.compat ORDER BY id;
+SELECT content, count(*) AS files, sum(record_count) AS records
+FROM local.day35.compat.files GROUP BY content ORDER BY content;
+SELECT status, content, sequence_number, file_sequence_number,
+       data_file.file_path
+FROM local.day35.compat.entries
+ORDER BY sequence_number, data_file.file_path;
+EXPLAIN FORMATTED SELECT * FROM local.day35.compat WHERE id &gt;= 1;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Logical result는 id 1과 3이다. Current files에는 data(content=0)와 position delete(content=1)가 공존하고, reader는 applicable delete를 merge한다. V2 upgrade와 V2-only artifact 생성은 서로 다른 state transition임이 보인다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Failure injection: downgrade 거부 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">set +e
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+ALTER TABLE local.day35.compat
+SET TBLPROPERTIES ('format-version'='1');
+&quot; &gt;/tmp/day35-downgrade.log 2&gt;&amp;1
+DAY35_DOWNGRADE_RC=$?
+set -e
+sed -n '1,120p' /tmp/day35-downgrade.log
+test &quot;$DAY35_DOWNGRADE_RC&quot; -ne 0
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SHOW TBLPROPERTIES local.day35.compat ('format-version');
+SELECT count(*) AS rows_after_failed_downgrade
+FROM local.day35.compat;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Downgrade command는 실패하고 table은 V2, logical row는 2로 남는다. 이 hard failure가 old reader에게 V2 delete를 무시하게 허용하는 것보다 안전하다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">5단계 · Production capability gate 작성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;"># 실제 조직의 engine/version별로 PASS/FAIL/UNKNOWN을 채운다.
+# UNKNOWN은 PASS가 아니라 upgrade blocker다.
+printf '%s\n' \
+  'consumer,load_v3,read_old_v2_delete,read_dv,write_dv,maintain' \
+  'spark-batch,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN' \
+  'flink-stream,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN,UNKNOWN' \
+  'trino-serving,UNKNOWN,UNKNOWN,UNKNOWN,N/A,UNKNOWN' \
+  'recovery-tool,UNKNOWN,UNKNOWN,UNKNOWN,N/A,UNKNOWN'</pre>
+  <p><strong>판정:</strong> 하나라도 critical path에 UNKNOWN/FAIL이 있으면 V3 upgrade를 중단한다. 본 lab의 V2 성공은 V3/DV 지원 증거가 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong><code>metadata_log_entries</code> column 오류:</strong> <code>DESCRIBE local.day35.compat.metadata_log_entries</code>로 runtime schema를 확인하고 존재하는 column만 선택한다.</li>
+    <li><strong>DELETE extension 오류:</strong> <code>conf/spark-defaults.conf</code>의 Iceberg Spark extensions와 1.11.0 runtime package를 확인한다.</li>
+    <li><strong>Position delete가 안 생김:</strong> Property가 MOR인지 확인하고 current <code>files</code>/<code>entries</code>를 본다. Planner가 COW를 택했다면 engine/version 차이를 기록한다.</li>
+    <li><strong>Downgrade가 뜻밖에 성공:</strong> 즉시 writer를 멈추고 metadata log·artifact를 보존한다. 같은 환경을 production-safe로 간주하지 말고 connector bug/behavior를 별도 조사한다.</li>
+    <li><strong>V3를 직접 시험하고 싶음:</strong> 공유 table이 아니라 폐기 가능한 canary에서만 load/read/write/maintenance matrix 전체를 수행한다. Property 숫자 변경만으로 인증하지 않는다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day35.compat PURGE;
+DROP NAMESPACE IF EXISTS local.day35;
+&quot;
+rm -f /tmp/day35-downgrade.log</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px;">
+    <li><strong>최신 spec = 최신 engine 지원</strong>이 아니다. Spec은 계약이고 connector는 구현이다.</li>
+    <li><strong>Table load 성공 = feature 안전</strong>이 아니다. 실제 delete/DV/type/default artifact가 포함된 fixture로 결과를 검증해야 한다.</li>
+    <li><strong>Upgrade = rewrite</strong>가 아니다. Old artifact가 남기 때문에 new reader의 backward compatibility가 중요하다.</li>
+    <li><strong>Format version = write mode</strong>가 아니다. Version은 가능한 계약, write property는 실제 artifact 선택이다.</li>
+    <li><strong>Snapshot rollback = format downgrade</strong>가 아니다. Current table metadata 계약과 historical snapshot 선택은 다른 축이다.</li>
+    <li><strong>Query engine만 consumer</strong>가 아니다. Stream recovery, compaction, expiration, orphan cleanup, catalog migration tool도 포함한다.</li>
+    <li><strong>V3 table이면 모든 delete가 DV</strong>가 아니다. Upgrade된 tree에는 old V2 delete file이 남을 수 있어 reader가 둘 다 처리해야 한다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>10PB V2 table을 V3로 올리는 rollout을 설계하라.</strong><br><em>좋은 답변 구조:</em> Consumer/복구 경로 inventory → connector exact version → load/read/write/maintain capability matrix → golden fixture와 수치 SLA → connector 선배포 → metadata-only canary upgrade → DV/새 type activation 분리 → checksum/latency 관찰 → failure window와 forward-fix/별도 table cutover 대안.</li>
+    <li><strong>V3로 올렸지만 V3-only artifact는 아직 없다. Old reader traffic을 허용해도 되는가?</strong><br><em>좋은 답변 구조:</em> Spec의 upper-version hard gate → 우연한 성공과 지원 구분 → cache/metadata parse/미래 commit race → silent corruption 위험 → version-aware admission control → old-format serving copy라는 대안.</li>
+    <li><strong>Upgrade 후 Trino와 Spark row count가 다르다. 어디서부터 조사할 것인가?</strong><br><em>좋은 답변 구조:</em> Snapshot pin과 수치 차이 → metadata location/format version → engine/connector matrix → manifest content/sequence → position/equality/DV applicability → partition/key checksum → cache/compaction race → 안전한 traffic stop·known-good reader → forward rewrite 또는 pre-upgrade snapshot copy.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>MOR DELETE 뒤 logical row count와 physical file count가 반대로 움직일 수 있는 이유는?</li>
+    <li>Query plan만 보고 delete applicability를 완전히 증명할 수 없는 이유는?</li>
+    <li>Position delete rewrite 전후 반드시 같아야 하는 logical invariant 두 가지는?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Data file을 즉시 rewrite하지 않고 delete file을 추가하므로 logical row는 줄고 physical planning artifact는 늘 수 있다. ② Plan label은 engine별 표현이며 path·position·partition·sequence 적용 증거를 모두 노출하지 않는다. ③ Row count와 key/hash 또는 ordered result가 같아야 한다. 각 문항에서 상태 소유자와 metadata 증거를 언급하면 만점.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>V1→V2 upgrade에 data file rewrite가 필수가 아닌 이유는?</li>
+    <li>“V3 지원”을 최소 네 개 capability로 쪼개 보라.</li>
+    <li>Format downgrade가 property rollback으로 안전하지 않은 이유는?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① V1 artifact는 V2에서도 유효하고 missing field default 규칙으로 읽기 때문이다. ② 예: metadata load, old delete read, DV read, DV write, new type/default, maintenance 중 네 가지 이상. ③ Upgrade 후 새 version-only artifact와 semantics가 생길 수 있어 old reader가 이를 해석하지 못하며 downgrade 자체가 금지되기 때문이다. “version 숫자와 artifact activation 분리”까지 말하면 만점.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/#format-versioning" style="color:#087f8c;">Apache Iceberg Table Spec · Format Versioning</a> — V1/V2/V3의 채택 상태, 기능 경계와 forward-compatibility 원칙.</li>
+    <li><a href="https://iceberg.apache.org/spec/#appendix-e-format-version-changes" style="color:#087f8c;">Apache Iceberg Table Spec · Appendix E</a> — prior-version metadata default와 version별 writer requirement.</li>
+    <li><a href="https://iceberg.apache.org/status/" style="color:#087f8c;">Apache Iceberg · Implementation Status</a> — language/library별 read·write·catalog·maintenance capability 차이.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/configuration/#reserved-table-properties" style="color:#087f8c;">Apache Iceberg 1.11.0 · Configuration</a> — 프로젝트 runtime의 <code>format-version</code> reserved property.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">확인 기준: 2026-10-14. 현재 Table Specification은 V1·V2·V3를 adopted, V4를 개발 중으로 표시한다. 실습은 프로젝트의 Iceberg 1.11.0 runtime을 기준으로 하며, engine별 V3/DV/type 지원은 배포 connector 공식 문서와 fixture에서 별도 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <p><strong>Week 6 · Day 36 — Hadoop/Hive/REST/Glue/Nessie catalog</strong></p>
+  <p>다음에는 같은 Iceberg metadata graph 앞에서 catalog 구현마다 누가 pointer state를 소유하고, 어떤 CAS·lock·credential·failure domain을 가지는지 비교한다.</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
