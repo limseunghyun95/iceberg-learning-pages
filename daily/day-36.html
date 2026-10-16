@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 36</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 6 / DAY 36</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">Hadoop/Hive/REST/Glue/Nessie catalog</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Catalog·Multi-engine·Streaming · 개념 45분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Iceberg catalog는 data를 저장하는 창고가 아니라 table 이름을 current metadata JSON에 원자적으로 연결하는 control plane이다. Hadoop·Hive·REST·Glue·Nessie의 핵심 차이는 그 pointer state의 소유자, compare-and-swap 또는 lock 방식, 인증 경계와 장애 범위다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Catalog</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Namespace와 table 이름을 관리하고, 각 table의 current metadata location을 load·create·commit·drop하는 control plane이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Warehouse</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Metadata·manifest·data/delete file이 놓이는 base storage 경로다. Catalog와 같은 것이 아니며 다른 권한·SLA를 가질 수 있다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Metadata pointer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Table identifier가 현재 metadata JSON을 가리키는 작은 mutable state다. Commit의 선형화 지점이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">CAS</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Compare-and-swap. “Pointer가 아직 M0이면 M1로 바꿔라”는 조건부 갱신이다. 동시 writer의 lost update를 막는다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Catalog cache</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Load 비용을 줄이기 위해 table metadata를 잠시 저장하는 client/server cache다. 성능을 높이지만 stale pointer라는 failure window를 만든다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">FileIO</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">S3·GCS·ADLS·HDFS 등에서 metadata와 data bytes를 읽고 쓰는 계층이다. Catalog API 권한과 object storage 권한은 별개다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Reference</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Nessie의 branch·tag·commit hash처럼 catalog content state를 선택하는 이름 또는 immutable 지점이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Control/Data plane</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Control plane은 pointer·namespace·auth를, data plane은 metadata/manifest/data bytes 전송을 담당한다. 장애 대응에서 둘을 분리한다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>같은 Parquet와 같은 Iceberg metadata를 사용해도 catalog가 달라지면 commit의 성공 조건과 장애 양상이 달라진다. Hadoop catalog는 warehouse path와 file-system primitive에 크게 의존하고, Hive는 HMS의 table state와 lock, REST는 HTTP service의 commit protocol, Glue는 AWS managed metastore와 optimistic update, Nessie는 branch/ref content state가 권위자다.</p>
+  <p>Catalog 선택은 단순 연결 문자열 선택이 아니다. Multi-engine 지원, object storage의 rename 특성, 인증·감사, write 빈도, branch/multi-table 공개 방식, 재해복구 절차를 결정한다. 특히 writer가 data file을 다 쓴 뒤 catalog 응답을 잃으면 “실패”와 “성공했지만 응답만 유실”을 구분해야 하므로 pointer owner의 status check 방법이 필수다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Object storage에 M1·data file이 존재해도 catalog의 authoritative pointer/ref가 M1을 current로 확정하지 않았다면 table state가 아니다. 반대로 pointer가 M1을 가리키면 referenced object의 404는 catalog 문제가 아니라 committed graph 손상이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Engine: Spark · Flink · Trino</strong><br><span style="font-size:14px;color:#cdebf0;">table identifier + operation + expected current pointer</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ catalog client / Thrift / HTTP / AWS API / Nessie ref</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② Catalog control plane</strong><br><span style="font-size:14px;">Hadoop path · Hive HMS · REST server · AWS Glue · Nessie branch</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ load current M0 · auth/config · namespace</td></tr>
+    <tr><td style="background:#f7fafb;text-align:center;padding:13px;border:1px solid #c8d5dc;border-radius:8px;"><strong>③ Writer prepares immutable graph in warehouse</strong><br><span style="font-size:14px;">data/delete → manifest → manifest list → metadata JSON M1</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ commit(expected=M0, new=M1)</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④ Catalog-specific atomic state transition</strong><br><span style="font-size:14px;">rename/lock/CAS/version/ref commit · success 또는 conflict/unknown</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ reader reloads authoritative pointer</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ metadata JSON → snapshot → manifests → data/delete files</strong><br><span style="font-size:14px;color:#cdebf0;">control path가 고른 immutable data path만 읽음</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Resolve:</strong> Engine은 catalog name, namespace, table, 선택적 Nessie ref를 전달한다. Catalog는 current metadata location과 필요한 FileIO/config를 반환한다.</li>
+    <li><strong>Read:</strong> Reader는 load한 M0에 고정되어 snapshot→manifest list→manifest pruning을 수행한다. Catalog가 잠시 불가해도 이미 열린 scan task가 data 권한을 보유했다면 진행할 수 있지만 새 load·refresh는 실패할 수 있다.</li>
+    <li><strong>Prepare:</strong> Writer는 data/delete와 metadata graph M1을 warehouse에 먼저 쓴다. 이 단계 성공은 commit 성공이 아니다.</li>
+    <li><strong>Publish:</strong> Hadoop은 file-system 기반 pointer discovery/atomic primitive, Hive는 HMS table state와 lock, REST는 change-based HTTP commit, Glue는 managed catalog의 versioned/optimistic update, Nessie는 ref의 content commit으로 M0→M1을 확정한다.</li>
+    <li><strong>Conflict:</strong> Expected M0가 current가 아니면 writer는 latest state를 reload해 validation/rebase한다. Lock 획득은 semantic conflict가 없다는 뜻이 아니며 predicate/source-file validation은 별도다.</li>
+    <li><strong>Unknown:</strong> Catalog가 update를 처리한 뒤 응답이 유실될 수 있다. Operation identity와 current metadata/ref history를 조회하기 전 blind retry·artifact 삭제를 금지한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">Catalog별 상태 소유자와 trade-off</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:18%;">Catalog</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:35%;">Pointer owner / commit</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">강점과 주요 failure domain</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Hadoop</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Warehouse의 table path와 metadata version discovery, file-system atomic primitive.</td><td style="padding:8px;border:1px solid #dbe3e8;">별도 service 없이 단순. Path가 identity가 되기 쉬우며 object store에서 atomic rename/상호배제가 약하면 별도 lock과 검증이 필요하다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Hive</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Hive Metastore table parameter의 metadata location과 HMS lock/conditional update.</td><td style="padding:8px;border:1px solid #dbe3e8;">기존 HMS·namespace 통합. Thrift/HMS DB·lock heartbeat가 control-plane failure domain이며 Hive positional schema 검증과 Iceberg field ID가 충돌할 수 있다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>REST</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">HTTP API 뒤 server가 pointer, validation, config를 소유하고 change-based commit 처리.</td><td style="padding:8px;border:1px solid #dbe3e8;">언어·engine별 backend client 중복을 줄이고 auth/credential/remote planning을 중앙화. HTTP service·token·server compatibility가 새 failure domain.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Glue</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">AWS Glue Data Catalog table state의 metadata pointer와 optimistic update/version.</td><td style="padding:8px;border:1px solid #dbe3e8;">IAM·Athena/EMR/Lake Formation 생태계와 결합. AWS API throttling, region, IAM, Glue state와 S3 FileIO 권한의 이중 경계.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Nessie</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Branch/tag/hash가 선택한 content state와 ref commit.</td><td style="padding:8px;border:1px solid #dbe3e8;">Git-like branch·merge·history와 여러 table 변경 공개에 유리. Ref 선택·merge conflict·server availability가 추가되며 branch merge를 DB transaction과 동일시하면 안 된다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">세 개의 독립된 권한·가용성 경계</h3>
+  <p><strong>Catalog 권한</strong>은 이름·pointer를 load/update하고, <strong>FileIO 권한</strong>은 metadata와 data bytes를 GET/PUT/DELETE하며, <strong>KMS 권한</strong>은 encrypted file key를 해제한다. Catalog load가 성공해도 S3 403으로 scan이 실패할 수 있고, data read가 되더라도 catalog update 권한이 없으면 writer는 commit하지 못한다. REST credential vending은 이 경계를 연결할 수 있지만 내일 별도로 깊게 다룬다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Consistency와 cache</h3>
+  <p>Catalog cache는 load latency와 control-plane QPS를 줄이지만 stale M0를 늘린다. Reader는 한번 고정한 snapshot으로 일관된 결과를 낼 수 있지만, writer는 commit 직전 authoritative current를 확인하고 CAS/validation해야 한다. Cache TTL을 길게 만든다고 correctness가 깨져서는 안 되며 conflict rate와 freshness SLA가 비용으로 나타나야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Object storage와 lock</h3>
+  <p>S3 같은 object storage의 read-after-write가 강하더라도 “두 writer 중 한 명만 pointer를 바꾼다”는 mutual exclusion/CAS 문제는 남는다. Apache 문서는 file-system 기반 HadoopTables/HadoopCatalog에 DynamoDB lock manager 같은 보조 lock을 사용할 수 있음을 설명한다. 반대로 Hive lock을 무조건 끄는 것도 위험하며 서버 patch와 모든 writer 버전·설정이 일치해야 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Pointer owner를 한 문장으로 정의:</strong> “prod.orders의 current metadata location은 어느 시스템의 어느 record/ref가 소유하며, expected-old 조건은 무엇인가?”에 답하지 못하면 운영 준비가 안 된 것이다.</p>
+  <p><strong>Best practice 2 · Catalog와 FileIO를 분리 테스트:</strong> Load/commit API, metadata GET, data GET/PUT, KMS, delete 권한을 별도 synthetic check로 둔다. 단일 <code>SELECT 1</code> health check로 합치지 않는다.</p>
+  <p><strong>Best practice 3 · 선택 기준:</strong> HDFS·작은 단일 engine 환경은 Hadoop의 단순성이, 기존 HMS 중심 환경은 Hive가, 다언어·서비스화·보안 중앙화는 REST가, AWS 관리형 거버넌스는 Glue가, branch·다중 table 배포는 Nessie가 유리할 수 있다. 실제 SLA·RPO/RTO·write QPS·engine matrix로 결정한다.</p>
+  <p><strong>Best practice 4 · DR runbook:</strong> Catalog backup/restore와 object storage versioning을 함께 설계한다. Catalog만 복원해 pointer가 존재하지 않는 object를 가리키거나, storage만 복원해 current pointer를 잃는 반쪽 복구를 피한다.</p>
+  <p><strong>Anti-pattern:</strong> Warehouse listing을 catalog로 사용하기, 같은 bucket이면 같은 table이라고 가정하기, Hive lock을 성능 때문에 일괄 비활성화하기, REST 5xx 뒤 blind append하기, Glue 권한과 S3 권한을 한 역할로 뭉개기, Nessie branch merge를 row-level serializable transaction으로 부르기다.</p>
+  <p><strong>Edge case:</strong> 두 catalog가 우연히 같은 table location을 가리키면 각자 정상적으로 CAS하면서도 서로의 pointer update를 모를 수 있다. “Dual registration”은 migration 도중에도 single-writer fencing과 명확한 cutover 없이는 split brain이다.</p>
+  <p><strong>Version/engine 차이:</strong> Iceberg 1.11.0 Spark configuration은 <code>hive</code>, <code>hadoop</code>, <code>rest</code>, <code>glue</code>, <code>jdbc</code>, <code>nessie</code> type을 열거하지만, 필요한 runtime module·auth option·server protocol 기능은 engine/connector 배포별로 다르다. 공식 예제를 복사하기 전에 현재 runtime과 backend 문서를 함께 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Commit 중 catalog가 unavailable/timeout 상태가 되었고 data·metadata file은 이미 생성됐다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">HMS/REST/Glue/Nessie timeout·5xx·throttling, lock timeout, CAS conflict, Spark catalog load 실패, 새 object는 존재하지만 snapshot 미노출, 일부 reader는 old snapshot 지속, retry 후 중복 가능성.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog 종류·endpoint·region/ref, exact exception와 HTTP/AWS code, operation/batch ID, base/current metadata location, CAS expected/new 값, lock owner·lease·heartbeat, request/response timeline, snapshot summary, object path/ETag/time, cache age, engine/connector version, auth principal.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Catalog service outage, DNS/TLS/token expiry, IAM deny, throttling, stale cache, concurrent writer CAS 승리, lock heartbeat 만료, REST server는 commit했지만 응답 유실, 잘못된 Nessie ref, Glue region mismatch, storage는 성공하고 control plane만 실패.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">동일 operation의 blind retry와 orphan cleanup을 멈춘다. Writer traffic을 제한하고 artifact·로그를 보존한다. Catalog가 복구되면 cache를 우회/refresh해 operation ID, new metadata path, current ref를 read-only로 조회한다. Reader는 검증된 snapshot을 pin한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Current pointer에 operation이 있으면 성공 처리하고 checkpoint를 맞춘다. 명시적 미commit이면 latest state에서 revalidate/replan한다. Unknown이면 status 확인이 가능할 때까지 보류한다. 잘못된 pointer는 catalog-native restore/forward commit으로 고치고, 확정 orphan만 safety window 뒤 제거한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON·HMS/Glue record·Nessie ref 수동 편집, 다른 catalog로 즉시 같은 location 재등록, timeout 뒤 새 batch ID append, lock 강제 삭제, future cutoff orphan cleanup, object listing으로 commit 성공 추정, evidence 전 snapshot expiration을 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 프로젝트의 Hadoop-backed catalog에서 SQL commit 전후 metadata pointer graph를 관찰하고, 도달 불가능한 REST catalog로 control-plane 장애를 주입한다. 실패 뒤 local table의 committed state와 storage artifact가 변하지 않았음을 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker Desktop이 정상이고 <code>make smoke</code>가 성공해야 한다. 프로젝트는 Spark 3.5.8 + Iceberg 1.11.0의 <code>local</code> Hadoop catalog를 사용한다.</li>
+    <li>첫 INSERT 뒤 catalog load→metadata JSON→snapshot→manifest→data file 경로가 생긴다. 둘째 INSERT는 새 metadata/snapshot을 publish하지만 기존 data file을 덮어쓰지 않는다.</li>
+    <li>Invalid REST endpoint의 <code>SHOW NAMESPACES</code>는 non-zero로 실패하고 local table row·snapshot 수에는 영향을 주지 않아야 한다.</li>
+    <li>실패 로그에는 connection/REST 계층 증거가 있고, local warehouse에는 그 REST catalog의 새 table artifact가 없어야 한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">0단계 · Catalog 설정 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+rg -n &quot;spark.sql.catalog.local|type|warehouse|cache&quot; conf/spark-defaults.conf
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SHOW NAMESPACES IN local;
+&quot;</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Baseline commit과 graph 증거</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day36;
+DROP TABLE IF EXISTS local.day36.catalog_probe PURGE;
+CREATE TABLE local.day36.catalog_probe (
+  id BIGINT, payload STRING
+) USING iceberg;
+INSERT INTO local.day36.catalog_probe VALUES (1, 'base');
+SELECT count(*) AS rows_v1 FROM local.day36.catalog_probe;
+SELECT committed_at, snapshot_id, parent_id, operation
+FROM local.day36.catalog_probe.snapshots ORDER BY committed_at;
+SELECT latest_snapshot_id, latest_sequence_number, file
+FROM local.day36.catalog_probe.metadata_log_entries ORDER BY timestamp;
+SELECT file_path, record_count
+FROM local.day36.catalog_probe.files;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 한 snapshot이 current이고 metadata log의 <code>file</code>이 root JSON을 보여 준다. Data file path는 metadata graph가 참조할 때만 table member다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Pointer state transition 비교</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">find warehouse/day36/catalog_probe -type f -print | sort &gt; /tmp/day36-before.txt
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day36.catalog_probe VALUES (2, 'next');
+SELECT count(*) AS rows_v2 FROM local.day36.catalog_probe;
+SELECT committed_at, snapshot_id, parent_id, operation
+FROM local.day36.catalog_probe.snapshots ORDER BY committed_at;
+SELECT latest_snapshot_id, latest_sequence_number, file
+FROM local.day36.catalog_probe.metadata_log_entries ORDER BY timestamp;
+&quot;
+
+find warehouse/day36/catalog_probe -type f -print | sort &gt; /tmp/day36-after.txt
+comm -13 /tmp/day36-before.txt /tmp/day36-after.txt</pre>
+  <p><strong>예상 관찰:</strong> 새 data/manifest/metadata artifact가 추가되고 old artifact는 남는다. Catalog commit의 결과는 기존 file 교체가 아니라 current root 전진이다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Failure injection: 도달 불가능한 REST catalog</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">set +e
+docker compose exec -T spark /opt/spark/bin/spark-sql \
+  --conf spark.sql.catalog.unreachable=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.unreachable.type=rest \
+  --conf spark.sql.catalog.unreachable.uri=http://127.0.0.1:9 \
+  -e &quot;SHOW NAMESPACES IN unreachable;&quot; \
+  &gt;/tmp/day36-rest-failure.log 2&gt;&amp;1
+DAY36_REST_RC=$?
+set -e
+sed -n '1,140p' /tmp/day36-rest-failure.log
+test &quot;$DAY36_REST_RC&quot; -ne 0</pre>
+  <p><strong>상태 해설:</strong> REST control plane을 load하지 못했으므로 table identifier조차 resolve되지 않았다. Data path 문제로 오인해 local warehouse를 수정하거나 catalog를 바꿔 재등록하면 안 된다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Known-good catalog 불변식 확인</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+REFRESH TABLE local.day36.catalog_probe;
+SELECT count(*) AS rows_after_rest_failure
+FROM local.day36.catalog_probe;
+SELECT count(*) AS snapshots_after_rest_failure
+FROM local.day36.catalog_probe.snapshots;
+SELECT file_path, record_count
+FROM local.day36.catalog_probe.files ORDER BY file_path;
+&quot;
+
+find warehouse/day36/catalog_probe -type f -print | sort \
+  | shasum -a 256</pre>
+  <p><strong>예상 관찰:</strong> Row는 2이고 committed snapshot/file graph는 REST 실패 전과 같다. 별도 catalog failure는 local catalog의 state transition을 만들지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">5단계 · 선택 matrix 작성</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">printf '%s\n' \
+  'candidate,pointer_owner,commit_primitive,auth,dr,write_qps,multi_engine' \
+  'hadoop,path+filesystem,atomic-fs-or-lock,storage,paired,measure,verify' \
+  'hive,HMS,lock+conditional-update,HMS+storage,paired,measure,verify' \
+  'rest,REST-server,change-based-commit,HTTP+vended-storage,paired,measure,verify' \
+  'glue,Glue-table,optimistic-update,IAM+S3,paired,measure,verify' \
+  'nessie,ref-content,ref-commit,server+storage,paired,measure,verify'</pre>
+  <p><strong>판정:</strong> “운영 경험이 있음” 대신 pointer owner, atomicity, auth, backup pair, p95 commit latency, throttling, engine별 support를 증거로 채운다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong><code>metadata_log_entries</code> column 오류:</strong> <code>DESCRIBE local.day36.catalog_probe.metadata_log_entries</code>로 runtime schema를 확인한다.</li>
+    <li><strong>REST 실패가 오래 걸림:</strong> OS connect timeout 뒤 종료될 수 있다. 같은 실행에서 endpoint를 반복 호출하지 말고 첫 exception과 elapsed time을 증거로 남긴다.</li>
+    <li><strong>Warehouse path가 다름:</strong> <code>conf/spark-defaults.conf</code>의 local warehouse와 container mount를 확인한다. Listing을 pointer 권위자로 사용하지 않는다.</li>
+    <li><strong>Hadoop catalog를 S3에 그대로 사용:</strong> Atomic rename/lock 보장을 검증하고 필요한 lock manager를 구성한다. 단순히 S3가 strongly consistent라는 이유로 CAS를 생략하지 않는다.</li>
+    <li><strong>Hive schema evolution 실패:</strong> HMS positional validation과 Iceberg field ID semantics를 구분한다. 검증 비활성화의 Hive direct-read trade-off를 문서화한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day36.catalog_probe PURGE;
+DROP NAMESPACE IF EXISTS local.day36;
+&quot;
+rm -f /tmp/day36-before.txt /tmp/day36-after.txt /tmp/day36-rest-failure.log</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px;">
+    <li><strong>Catalog = warehouse</strong>가 아니다. 이름/pointer state와 immutable bytes는 다른 시스템이 소유할 수 있다.</li>
+    <li><strong>Object exists = committed</strong>가 아니다. Authoritative pointer/ref의 reachability가 membership을 결정한다.</li>
+    <li><strong>Lock 획득 = semantic conflict 없음</strong>이 아니다. Overwrite/delete의 source file·predicate validation은 별도다.</li>
+    <li><strong>Strong consistency = atomic multi-writer commit</strong>이 아니다. CAS/lock이 여전히 필요하다.</li>
+    <li><strong>REST = storage proxy</strong>라고 단정할 수 없다. Client-side/remote scan planning과 credential 방식은 protocol/server/version별로 다르다.</li>
+    <li><strong>같은 location의 dual catalog 등록</strong>은 migration이 아니라 split-brain risk다.</li>
+    <li><strong>Nessie merge = 하나의 DB transaction</strong>이 아니다. Branch 위 개별 Iceberg commit과 ref merge의 가시성 의미를 분리한다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>하루 10만 commit, Spark·Flink·Trino가 공유하는 S3 lake의 catalog를 선택하라.</strong><br><em>좋은 답변 구조:</em> Write/read QPS와 p95 SLA → pointer owner/CAS → engine·language matrix → IAM/credential boundary → throttling/cache → RPO/RTO와 backup pair → Hadoop/Hive/REST/Glue/Nessie trade-off → canary와 migration/fallback.</li>
+    <li><strong>Catalog timeout 뒤 data file은 보이지만 job은 실패했다. 정확히 한 번 처리를 어떻게 지키는가?</strong><br><em>좋은 답변 구조:</em> Operation identity/checkpoint → base/current pointer → explicit/unknown state 분류 → read-only status check → committed면 성공 처리, 미commit이면 latest replan → orphan safety window → blind retry·수동 pointer edit 금지.</li>
+    <li><strong>HMS에서 REST catalog로 무중단 이전을 설계하라.</strong><br><em>좋은 답변 구조:</em> Source of truth와 single-writer fencing → table/location inventory → metadata pointer·auth mapping → shadow read와 snapshot checksum → write freeze/cutover marker → atomic consumer config 배포 → rollback 기준 → dual registration 방지 → DR 검증.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Format version과 feature activation을 분리해야 하는 이유는?</li>
+    <li>V1→V2 upgrade 뒤 old manifest를 계속 읽을 수 있는 원리는?</li>
+    <li>“V3 지원”을 하나의 boolean으로 표시하면 놓치는 capability 네 가지는?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Version은 최소 해석 계약이고 delete/DV write property는 실제 artifact 생성 선택이다. ② Later reader가 V1 artifact의 missing field를 spec default로 해석한다. ③ Metadata load, old delete read, DV read/write, type/default, maintenance 중 네 가지 이상. 계약과 구현을 구분하면 만점.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Catalog와 warehouse의 상태 소유 차이를 한 문장으로 설명하라.</li>
+    <li>Hadoop/Hive/REST/Glue/Nessie에서 pointer owner를 각각 말하라.</li>
+    <li>Catalog timeout 후 가장 먼저 해야 할 일과 하지 말아야 할 일은?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Catalog는 table name→current metadata pointer, warehouse는 immutable bytes를 소유한다. ② Path/filesystem, HMS record, REST server, Glue table state, Nessie ref/content. ③ Operation identity와 authoritative current pointer를 read-only로 확인하고 blind retry·orphan 삭제를 하지 않는다. 성공 확정 시점을 언급하면 만점.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-configuration/#catalog-configuration" style="color:#087f8c;">Apache Iceberg 1.11.0 · Spark Catalog Configuration</a> — Hadoop/Hive/REST/Glue/JDBC/Nessie type과 공통 설정.</li>
+    <li><a href="https://iceberg.apache.org/rest-catalog-spec/" style="color:#087f8c;">Apache Iceberg · REST Catalog Specification</a> — change-based commit, 언어 호환, remote service 경계.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/aws/#which-catalog-to-choose" style="color:#087f8c;">Apache Iceberg 1.11.0 · AWS Catalog Selection</a> — Glue/DynamoDB catalog와 Hadoop lock 판단 기준.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/nessie/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Nessie Integration</a> — branch/tag/ref와 multi-table 공개 모델.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">확인 기준: 2026-10-16. 프로젝트 실습은 Spark 3.5.8 + Iceberg 1.11.0의 local Hadoop catalog다. REST server capability, Glue retry/locking, HMS patch, Nessie API/ref semantics는 배포 version과 backend 공식 문서에서 재검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <p><strong>Week 6 · Day 37 — REST catalog와 credential vending 경계</strong></p>
+  <p>다음에는 REST catalog가 engine에 table config와 임시 storage credential을 전달할 때 control plane·data plane·trust boundary가 어떻게 바뀌는지 추적한다.</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
