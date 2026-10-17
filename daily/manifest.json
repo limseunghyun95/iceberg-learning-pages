@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-10-16T09:10:39+09:00",
+  "updatedAt": "2026-10-17T09:02:30+09:00",
   "lessons": [
     {
       "day": 1,
@@ -329,6 +329,15 @@
       "path": "day-36.html",
       "kind": "lesson",
       "publishedAt": "2026-10-16T09:10:39+09:00"
+    },
+    {
+      "day": 37,
+      "week": 6,
+      "title": "REST catalog와 credential vending 경계",
+      "summary": "REST catalog token과 table-scoped temporary storage credential을 분리하고 scope·TTL·refresh·FileIO·remote signing의 trust boundary와 장애 대응을 검증합니다.",
+      "path": "day-37.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-17T09:02:30+09:00"
     }
   ]
 }
