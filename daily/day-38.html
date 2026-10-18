@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 38</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 6 / DAY 38</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">Spark read/write/MERGE/procedure</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Catalog·Multi-engine·Streaming · 개념 45분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Spark는 SQL을 바로 Parquet에 실행하지 않는다. Catalog에서 current metadata를 load하고 Catalyst·DataSource V2가 scan/write를 계획한 뒤 executor가 immutable data/delete file을 만들며, driver의 optimistic commit이 catalog pointer를 새 metadata JSON으로 바꿀 때만 INSERT·MERGE·procedure의 state transition이 확정된다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Catalyst</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Spark SQL의 parser·analyzer·optimizer다. SQL identifier와 column을 해석하고 filter/projection, join, write command의 logical/physical plan을 만든다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">DataSource V2 (DSv2)</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Spark가 catalog, table, scan, batch write, commit을 connector와 교환하는 API다. Iceberg table semantics를 Spark plan에 연결한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">SparkCatalog</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Spark identifier를 Hadoop/Hive/REST/Glue/Nessie 같은 Iceberg catalog로 연결하는 구현이다. 프로젝트에서는 <code>local</code>이라는 Hadoop catalog를 사용한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">SQL extensions</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Spark parser와 planner에 Iceberg의 MERGE/UPDATE/DELETE/CALL 등을 추가한다. Spark 3.x에서 row-level command와 stored procedure에 필요하다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Scan task</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Manifest pruning 결과로 읽어야 할 data file, 적용할 delete file, byte range와 residual filter를 묶은 실행 단위다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Commit message</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Executor task가 쓴 file의 path·metrics·partition 정보를 driver에 돌려주는 결과다. 아직 table commit은 아니다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">MERGE</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Source와 target을 key로 맞춰 matched row를 update/delete하고 unmatched row를 insert하는 row-level state transition이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Procedure</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;"><code>CALL catalog.system.name(...)</code> 형태의 관리 작업이다. Compaction·snapshot expiration·rollback 등도 새 metadata commit을 만들 수 있다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>사용자는 <code>SELECT</code>, <code>INSERT</code>, <code>MERGE</code>, <code>CALL</code>만 보지만 실패를 고치려면 command 아래의 상태 경계를 알아야 한다. Read가 느리면 Spark join보다 먼저 metadata planning과 manifest pruning을 봐야 할 수 있고, MERGE가 비싸면 수정 row 수보다 “몇 개의 target data file을 건드렸는가”가 더 중요할 수 있다.</p>
+  <p>또한 Spark job success와 Iceberg commit success도 같은 사건이 아니다. Executor가 file을 다 쓴 뒤 driver가 죽으면 object는 있지만 snapshot에는 없는 orphan이 남는다. 반대로 catalog가 commit을 받아 pointer를 바꾼 뒤 응답만 유실되면 job은 실패처럼 보여도 table은 이미 전진했다. 같은 input을 재실행하기 전에 current snapshot과 batch identity를 확인해야 한다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Spark task output은 후보 artifact이고 catalog current pointer가 도달 가능한 metadata graph만 table state다. Query·write·MERGE·procedure 모두 이 불변식을 공유한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① SQL / DataFrame command</strong><br><span style="font-size:14px;color:#cdebf0;">SELECT · INSERT · MERGE · CALL</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ parse · analyze identifier/schema · optimize</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② Spark driver: Catalyst + DSv2 + Iceberg extension</strong><br><span style="font-size:14px;">catalog load · scan/write builder · conflict assumptions</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ catalog pointer → metadata JSON → snapshot → manifest list → manifest</td></tr>
+    <tr><td style="background:#f7fafb;text-align:center;padding:13px;border:1px solid #c8d5dc;border-radius:8px;"><strong>③ Planning</strong><br><span style="font-size:14px;">projection/filter pruning · join/MERGE match · distribution/shuffle · file tasks</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ serialized scan/write tasks</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④ Executors + FileIO</strong><br><span style="font-size:14px;">read data/delete · apply residual · write immutable data/delete files · metrics</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ task commit messages; speculative/retry outputs 중 선택</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Driver commit</strong><br><span style="font-size:14px;color:#cdebf0;">manifest → manifest list → metadata JSON → validation → atomic catalog pointer swap</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Analyze:</strong> Spark는 <code>local.day38.orders</code>를 <code>local</code> SparkCatalog에 resolve하고 Iceberg schema의 field ID·type·nullability를 analyzer에 제공한다. Extension이 없으면 Spark 3.x의 MERGE/CALL plan 자체가 생성되지 않을 수 있다.</li>
+    <li><strong>Read planning:</strong> Driver는 한 snapshot에 pin하고 manifest list와 manifest statistics로 file을 줄인다. Projection/filter pushdown 뒤에도 남은 residual은 executor가 row level에서 평가한다.</li>
+    <li><strong>Read execution:</strong> Executor는 FileIO로 data file과 적용 가능한 delete file을 열고 sequence/partition/file path 규칙대로 삭제를 병합한다. Reader가 raw Parquet만 읽으면 이 logical state를 놓친다.</li>
+    <li><strong>Write planning:</strong> INSERT는 append, MERGE는 target match와 row-level write plan, procedure는 관리 action을 만든다. Distribution mode와 AQE가 shuffle·file 크기를 좌우한다.</li>
+    <li><strong>Task write:</strong> 각 task는 고유한 immutable file을 만들고 metrics가 든 commit message를 driver에 반환한다. Retry/speculation으로 버려진 attempt output은 table에 commit되지 않지만 orphan 후보가 된다.</li>
+    <li><strong>Commit:</strong> Driver는 selected file을 manifest graph에 넣고 base snapshot 이후의 변경을 validation한 다음 catalog pointer를 교체한다. 이 시점이 write의 linearization point다.</li>
+    <li><strong>Post-commit:</strong> Spark cache와 이미 분석된 plan은 stale할 수 있다. Metadata-changing procedure는 관련 cache invalidation과 concurrent writer race를 고려한다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">Read path: control plane이 data path를 만든다</h3>
+  <p>SELECT의 driver-side planning은 catalog pointer→metadata JSON→selected snapshot→manifest list→manifest를 따라간다. Partition summary와 file lower/upper bound로 pruning하고 남은 file마다 scan task를 만든다. 이때 snapshot pinning이 query isolation의 핵심이다. Query 도중 새 commit이 생겨도 이미 계획된 scan은 같은 snapshot의 graph를 읽는다.</p>
+  <p>Executor는 data file만 읽는 것이 아니다. MOR table이면 position/equality delete 또는 DV를 같은 scan task에 적용하고 residual predicate를 평가한다. 그래서 “Parquet 파일 수 × 평균 크기”만으로 read cost를 설명할 수 없고 manifest planning, delete applicability fan-out, open cost, split size가 함께 필요하다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">Write/MERGE path: 분산 준비, 단일 publish</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:21%;">단계</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:37%;">상태 소유자</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">불변식·비용·실패 창</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Logical plan</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Spark driver/Catalyst가 target, source, predicate, action 순서를 소유.</td><td style="padding:8px;border:1px solid #dbe3e8;">한 target row를 둘 이상의 source row가 update하면 ambiguity error. Source dedup은 business contract다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Physical plan</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Iceberg extension과 Spark planner가 COW/MOR, join, distribution을 선택.</td><td style="padding:8px;border:1px solid #dbe3e8;">COW는 affected data file rewrite, MOR은 delete/new data artifact로 write 비용을 미루며 read amplification을 만든다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Task output</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Executor와 object storage가 file bytes·metrics를 소유.</td><td style="padding:8px;border:1px solid #dbe3e8;">Task success는 global commit이 아니다. Driver failure 전후로 uncommitted artifact가 남을 수 있다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Snapshot</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Iceberg metadata graph가 added/removed data/delete file을 소유.</td><td style="padding:8px;border:1px solid #dbe3e8;">Snapshot summary는 진단 증거지만 engine/version에 따라 row count field가 없을 수 있다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Publish</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Catalog가 current metadata pointer의 authoritative owner.</td><td style="padding:8px;border:1px solid #dbe3e8;">Optimistic validation 후 atomic swap. Response loss는 unknown commit state를 만든다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">MERGE와 procedure의 차이</h3>
+  <p>MERGE는 source/target row semantics를 지키며 새 snapshot을 만든다. 같은 source가 한 target row를 여러 번 바꾸려 하면 Spark가 오류를 내는 이유는 결과가 source 순서에 따라 달라지기 때문이다. 반면 <code>rewrite_data_files</code> 같은 procedure는 logical row 결과를 유지하면서 physical file layout을 바꾼다. 둘 다 commit이므로 concurrent writer와 validation race를 피할 수 없다.</p>
+  <p>Maintenance procedure는 “관리 명령”이라서 transaction 밖이라는 뜻이 아니다. Compaction이 old file을 읽어 new file을 쓰는 동안 streaming writer가 새 snapshot을 commit할 수 있고, procedure는 rewrite scope와 latest state를 검증해야 한다. 성공 후에는 snapshot·manifest·file metrics를 다시 읽어 logical equivalence와 비용 개선을 확인한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Named catalog와 full identifier:</strong> Production SQL과 job config에서 catalog.namespace.table을 명시하고 runtime JAR·Spark minor·Scala binary·Iceberg version을 배포 단위로 고정한다. Session catalog의 암묵적 fallback을 줄인다.</p>
+  <p><strong>Best practice 2 · Spark 3.x extension preflight:</strong> MERGE/UPDATE/DELETE/CALL 전 <code>spark.sql.extensions</code>와 catalog class를 검증한다. Parser error를 table corruption이나 catalog outage로 오인하지 않는다.</p>
+  <p><strong>Best practice 3 · DSv2 write 사용:</strong> DataFrame에서는 <code>writeTo(...).append/overwrite/createOrReplace</code>를 우선한다. Table property, partition transform, catalog commit semantics가 명확하고 오래된 V1 writer의 path/table 혼동을 줄인다.</p>
+  <p><strong>Best practice 4 · MERGE source 계약:</strong> Stable key, event ordering, dedup, late-event policy를 upstream에서 증명한다. “한 target row당 최대 한 source row”를 사전 검사하고 touched file 수·shuffle bytes·delete/data file 증가를 함께 관찰한다.</p>
+  <p><strong>Best practice 5 · Procedure guardrail:</strong> WHERE scope, max concurrent file groups, target size, partial progress, snapshot retention, rollback window를 정한다. Streaming writer와 maintenance window를 분리하거나 conflict/retry budget을 둔다.</p>
+  <p><strong>Anti-pattern:</strong> <code>INSERT OVERWRITE</code>를 idempotency 만능키로 사용하기, raw Parquet path로 Iceberg table을 읽기, MERGE input duplicate를 “마지막 값”으로 기대하기, procedure 결과 row만 보고 snapshot/file 변화를 무시하기, commit timeout 뒤 같은 batch를 blind retry하기다.</p>
+  <p><strong>Edge case:</strong> Partition evolution 뒤 dynamic overwrite가 대체하는 partition 집합은 현재 spec과 input에 의해 달라질 수 있다. MERGE도 target predicate가 넓으면 소수 row 변경이 많은 file rewrite로 증폭된다. Predicate selectivity와 file clustering을 함께 본다.</p>
+  <p><strong>Version/engine 차이:</strong> 프로젝트는 Spark 3.5.8 + Iceberg 1.11.0이다. Spark 3.x에서 SQL MERGE와 stored procedure는 Iceberg extensions가 필요하다. DataFrame <code>mergeInto</code> API는 Spark 4.0 이상이므로 현재 실습에서는 SQL MERGE를 사용한다. Spark 4.1+ snapshot summary row-count field나 최신 function 지원을 3.5.8에 소급해 가정하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Spark MERGE 또는 procedure가 실패했고 object storage에는 새 file이 보이지만 job 상태와 table 결과가 모호하다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Parser/analysis error, duplicate-match MERGE error, task OOM/shuffle failure, FileIO 403/timeout, commit conflict, catalog timeout, job failed 뒤 row는 반영됨, new data/delete file은 있으나 snapshot에 없음, compaction 후 file 수가 기대와 다름.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Spark/Scala/Iceberg runtime과 extension config, app/job/stage/task attempt ID, exact logical/physical plan, source key 중복, base/current snapshot ID, snapshots/history/metadata_log_entries, snapshot summary, added/removed data/delete file 수·bytes, commit exception/CAS, catalog request ID, artifact path·mtime·ETag.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Extension/runtime mismatch, source duplicate, schema/nullability mismatch, overly broad target scan, shuffle skew/OOM, credential expiry, task retry orphan, concurrent writer conflict, catalog가 commit 후 응답 유실, COW/MOR property 오해, procedure scope/filter 오류, stale Spark plan/cache.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">같은 batch 재실행과 orphan 삭제를 멈춘다. Input과 로그를 보존하고 current snapshot·history·summary를 read-only로 조회해 operation/batch가 publish됐는지 판정한다. Parser/plan 단계 실패인지 task write 이후 실패인지 timeline을 나누고 writer/maintenance concurrency를 제한한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Published면 성공 처리해 checkpoint를 맞추고 결과 검증한다. 명시적 미commit이면 duplicate/source/schema를 고친 뒤 latest snapshot에서 replan한다. Unknown이면 pointer 확인 가능할 때까지 보류한다. 잘못 publish된 snapshot은 검증된 rollback/cherry-pick/forward correction을 사용하고 orphan은 safety window 뒤 제거한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Warehouse file 수로 성공 판단, metadata JSON 수동 편집, timeout 뒤 새 batch ID로 즉시 재실행, duplicate source의 임의 last-wins 처리, admin credential 배포, active writer 중 즉시 orphan cleanup, evidence 전 snapshot expiration·cache/log 삭제를 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> Spark 3.5.8 + Iceberg 1.11.0에서 INSERT→MERGE→metadata table→procedure를 실행하고, duplicate source MERGE 실패가 snapshot을 전진시키지 않는지 확인한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Docker Desktop이 정상이고 프로젝트 root에서 <code>make smoke</code>가 성공해야 한다.</li>
+    <li><code>conf/spark-defaults.conf</code>에 Iceberg SQL extensions와 <code>local</code> SparkCatalog가 있어야 한다.</li>
+    <li>첫 INSERT는 append snapshot을, valid MERGE는 update/insert를 담은 새 snapshot을 만든다.</li>
+    <li>Duplicate source MERGE는 error로 끝나고 current snapshot ID와 row 결과가 바뀌지 않아야 한다.</li>
+    <li><code>rewrite_data_files</code>는 작은 file을 합칠 수 있지만 logical row count는 유지해야 한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">0단계 · Runtime과 extension preflight</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make smoke
+rg -n &quot;spark.sql.extensions|spark.sql.catalog.local&quot; conf/spark-defaults.conf
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SET spark.sql.extensions;
+SHOW CURRENT NAMESPACE;
+SHOW NAMESPACES IN local;
+&quot;</pre>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Baseline INSERT와 read path</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+CREATE NAMESPACE IF NOT EXISTS local.day38;
+DROP TABLE IF EXISTS local.day38.orders PURGE;
+CREATE TABLE local.day38.orders (
+  id BIGINT, status STRING, amount DECIMAL(10,2), updated_at TIMESTAMP
+) USING iceberg
+TBLPROPERTIES (
+  'format-version'='2',
+  'write.target-file-size-bytes'='134217728'
+);
+INSERT INTO local.day38.orders VALUES
+  (1, 'NEW', 100.00, TIMESTAMP '2026-10-18 09:00:00'),
+  (2, 'PAID', 200.00, TIMESTAMP '2026-10-18 09:01:00');
+SELECT * FROM local.day38.orders ORDER BY id;
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day38.orders.snapshots ORDER BY committed_at;
+SELECT file_path, record_count, file_size_in_bytes
+FROM local.day38.orders.files ORDER BY file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> 2 rows와 append snapshot 하나가 보인다. Data file이 table member인 근거는 directory listing이 아니라 current snapshot의 manifest entry다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Valid MERGE와 physical 증거</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+EXPLAIN EXTENDED
+MERGE INTO local.day38.orders t
+USING (
+  SELECT * FROM VALUES
+    (1L, 'PACKED', 120.00, TIMESTAMP '2026-10-18 09:05:00'),
+    (3L, 'NEW',     30.00, TIMESTAMP '2026-10-18 09:06:00')
+  AS s(id, status, amount, updated_at)
+) s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+
+MERGE INTO local.day38.orders t
+USING (
+  SELECT * FROM VALUES
+    (1L, 'PACKED', 120.00, TIMESTAMP '2026-10-18 09:05:00'),
+    (3L, 'NEW',     30.00, TIMESTAMP '2026-10-18 09:06:00')
+  AS s(id, status, amount, updated_at)
+) s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+
+SELECT * FROM local.day38.orders ORDER BY id;
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day38.orders.snapshots ORDER BY committed_at;
+SELECT content, file_path, record_count
+FROM local.day38.orders.files ORDER BY content, file_path;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> id=1은 PACKED/120, id=2는 유지, id=3은 insert다. Explain에서 DSv2 row-level plan과 target scan을 찾고, snapshot summary의 added/removed file을 COW/MOR table property와 함께 해석한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Failure injection: 한 target에 두 source row</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT snapshot_id AS before_bad_merge
+FROM local.day38.orders.snapshots
+ORDER BY committed_at DESC LIMIT 1;
+&quot;
+
+set +e
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+MERGE INTO local.day38.orders t
+USING (
+  SELECT * FROM VALUES
+    (1L, 'X', 121.00, TIMESTAMP '2026-10-18 09:07:00'),
+    (1L, 'Y', 122.00, TIMESTAMP '2026-10-18 09:08:00')
+  AS s(id, status, amount, updated_at)
+) s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET *;
+&quot; &gt;/tmp/day38-bad-merge.log 2&gt;&amp;1
+DAY38_MERGE_RC=$?
+set -e
+test &quot;$DAY38_MERGE_RC&quot; -ne 0
+sed -n '1,140p' /tmp/day38-bad-merge.log
+
+docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+SELECT snapshot_id AS after_bad_merge
+FROM local.day38.orders.snapshots
+ORDER BY committed_at DESC LIMIT 1;
+SELECT * FROM local.day38.orders ORDER BY id;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Multiple source rows match 같은 cardinality 오류가 나며 before/after snapshot ID가 같다. 오류를 없애려 source를 임의 <code>DISTINCT</code>하지 말고 ordering column으로 deterministic dedup 규칙을 정의한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Procedure를 state transition으로 관찰</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+INSERT INTO local.day38.orders VALUES
+  (4, 'NEW', 40.00, TIMESTAMP '2026-10-18 09:09:00');
+INSERT INTO local.day38.orders VALUES
+  (5, 'NEW', 50.00, TIMESTAMP '2026-10-18 09:10:00');
+
+SELECT count(*) AS files_before, sum(record_count) AS records_in_files_before
+FROM local.day38.orders.files;
+
+CALL local.system.rewrite_data_files(
+  table =&gt; 'day38.orders',
+  options =&gt; map('min-input-files','2')
+);
+
+SELECT count(*) AS logical_rows FROM local.day38.orders;
+SELECT count(*) AS current_files FROM local.day38.orders.files;
+SELECT committed_at, snapshot_id, parent_id, operation, summary
+FROM local.day38.orders.snapshots ORDER BY committed_at;
+&quot;</pre>
+  <p><strong>예상 관찰:</strong> Procedure output은 rewritten/added file count를 반환할 수 있고 새 replace snapshot이 생긴다. File 수는 줄 수 있지만 logical row는 5로 유지돼야 한다. 작은 test file이 selection threshold를 충족하지 않으면 rewrite가 0이어도 오류가 아니며 output을 근거로 해석한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>MERGE/CALL parse error:</strong> Iceberg runtime JAR와 <code>IcebergSparkSessionExtensions</code>가 같은 Spark session에 적용됐는지 확인한다.</li>
+    <li><strong><code>SET *</code> schema mismatch:</strong> Source column name·type·nullability와 target schema를 맞추거나 explicit assignment를 사용한다.</li>
+    <li><strong>Duplicate MERGE error:</strong> Key uniqueness와 event ordering을 upstream에서 검증한다. 임의 aggregate는 business 의미를 바꿀 수 있다.</li>
+    <li><strong>Procedure가 file을 rewrite하지 않음:</strong> <code>min-input-files</code>, target size, WHERE scope와 current file metrics를 확인한다.</li>
+    <li><strong>Snapshot summary field가 없음:</strong> Engine/version이 보고하지 않을 수 있다. <code>files</code>, <code>entries</code>, <code>snapshots</code> metadata table을 함께 본다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">docker compose exec -T spark /opt/spark/bin/spark-sql -e &quot;
+DROP TABLE IF EXISTS local.day38.orders PURGE;
+DROP NAMESPACE IF EXISTS local.day38;
+&quot;
+rm -f /tmp/day38-bad-merge.log</pre>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px;">
+    <li><strong>Spark job success = commit success</strong>가 아니다. Current snapshot으로 publish를 확인한다.</li>
+    <li><strong>Task file exists = table member</strong>가 아니다. Manifest graph reachability가 membership을 결정한다.</li>
+    <li><strong>MERGE row count = cost</strong>가 아니다. Touched target file, shuffle, delete/data artifact를 함께 본다.</li>
+    <li><strong>Procedure = side-effect 없는 query</strong>가 아니다. Maintenance도 snapshot commit과 concurrency validation을 가진다.</li>
+    <li><strong>SQL 지원 = DataFrame API 지원</strong>이 아니다. Spark 3.5는 SQL MERGE를 쓰고 DataFrame <code>mergeInto</code>는 Spark 4.0+ 경계다.</li>
+    <li><strong>Extension 오류 = corrupt table</strong>이 아니다. Parser/analyzer/config failure와 FileIO/catalog failure를 계층별로 분류한다.</li>
+    <li><strong>Raw Parquet read = Iceberg read</strong>가 아니다. Delete, schema evolution, snapshot isolation을 잃는다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>10TB target에 매시간 1천만 CDC row를 MERGE할 때 Spark plan과 table layout을 설계하라.</strong><br><em>좋은 답변 구조:</em> Key uniqueness·late event·dedup 계약 → target predicate/selectivity 수치 → partition/sort와 touched files → COW/MOR 선택 → shuffle/AQE/file size → optimistic conflict → delete/compaction budget → metrics와 fallback.</li>
+    <li><strong>Executor는 모두 성공했는데 driver가 timeout으로 실패했다. 재실행 여부를 어떻게 판정하는가?</strong><br><em>좋은 답변 구조:</em> Task output과 commit 분리 → batch/app ID → base/current snapshot·summary·metadata log → explicit failure/unknown state → published면 checkpoint 전진, 미commit이면 latest replan → orphan safety window → blind retry 금지.</li>
+    <li><strong>Streaming writer가 있는 table에서 rewrite_data_files를 운영하라.</strong><br><em>좋은 답변 구조:</em> Small-file SLO와 target size → rewrite scope/file groups → concurrent snapshot timeline → partial progress/conflict retry → sequence/delete applicability → reader isolation → before/after rows/files/planning latency → rollback·retention.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Catalog token과 vended storage credential의 audience는 왜 달라야 하는가?</li>
+    <li>Credential vending이 data proxy가 아닌 이유는 무엇인가?</li>
+    <li>Load table 성공 뒤 manifest GET 403이면 어떤 증거를 먼저 수집하는가?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Catalog API와 object storage라는 서로 다른 trust boundary의 credential 재사용을 막는다. ② FileIO가 임시 credential로 storage에 직접 요청한다. ③ Failing path/action, expiration/clock, prefix/KMS/region, refresh endpoint와 FileIO version을 secret 없이 수집한다. Principal→session→request audit 연결을 말하면 만점.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>SELECT가 data file을 열기 전 driver가 따르는 metadata path를 순서대로 말하라.</li>
+    <li>MERGE에서 executor task success가 table commit success가 아닌 이유는?</li>
+    <li>Spark 3.5.8에서 SQL MERGE·CALL과 DataFrame mergeInto의 지원 경계를 설명하라.</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Catalog pointer→metadata JSON→snapshot→manifest list→manifest→scan task다. ② Task는 immutable candidate file과 commit message만 만들며 driver validation과 catalog pointer swap이 남는다. ③ SQL MERGE/CALL은 Iceberg extension으로 가능하고 DataFrame mergeInto는 Spark 4.0+다. Version과 API 층을 구분하면 만점.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-configuration/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Spark Configuration</a> — SparkCatalog, SQL extensions, option precedence.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-queries/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Spark Queries</a> — time travel, metadata tables, DataFrame read.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-writes/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Spark Writes</a> — SQL MERGE, overwrite, DataFrameWriterV2와 Spark version 경계.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/spark-procedures/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Spark Procedures</a> — Spark 3.x extension 요구와 rewrite/maintenance procedure.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">확인 기준: 2026-10-18. 프로젝트 runtime은 Spark 3.5.8 + Iceberg 1.11.0이다. 공식 latest 문서의 Spark 4.x DataFrame MERGE, function, snapshot summary 기능을 현재 환경에 적용하지 않고 위 1.11.0 문서와 실제 plan으로 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <p><strong>Week 6 · Day 39 — Flink streaming commit/checkpoint</strong></p>
+  <p>Flink checkpoint barrier, Iceberg writer result, committer, snapshot publish를 연결해 exactly-once의 성공 확정점과 checkpoint 복구·small-file trade-off를 추적한다.</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
