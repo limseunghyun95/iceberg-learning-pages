@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 39</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 6 / DAY 39</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">Flink streaming commit/checkpoint</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Catalog·Multi-engine·Streaming · 개념 45분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    Flink checkpoint는 source offset과 sink pending file을 복구 가능한 하나의 상태로 묶고, Iceberg sink는 완료 통지 뒤 그 checkpoint의 file을 snapshot으로 commit한다. Exactly-once는 “checkpoint 성공” 한 줄이 아니라 checkpoint ID·job ID·pending file·snapshot summary를 재시작 때 대조해 이미 publish한 구간을 다시 commit하지 않는 protocol이다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Checkpoint</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Flink이 source offset, operator state, sink pending state를 일관된 지점으로 저장하는 복구 단위다. 주기 번호인 checkpoint ID를 가진다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Checkpoint barrier</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Stream을 따라 흐르며 “여기까지가 checkpoint N”이라는 경계를 operator에 전달하는 marker다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Writer flush</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Barrier를 받은 Iceberg writer가 현재 file을 닫아 storage에 올리고 data/delete file metadata를 pending 결과로 내보내는 단계다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Committer</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">모든 writer subtask의 pending file을 checkpoint별로 모아 Iceberg snapshot과 manifest를 commit하는 operator다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">notifyCheckpointComplete</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Flink coordinator가 checkpoint 전체 완료를 operator에 알리는 callback이다. Iceberg commit 시도의 trigger이지 commit 성공 자체는 아니다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Pending file</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Storage에는 생성됐지만 아직 current Iceberg snapshot에서 참조되지 않는 file이다. Commit되거나 나중에 orphan으로 정리된다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Snapshot summary</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Snapshot의 operation·통계·engine metadata를 담는 map이다. Flink sink는 job/checkpoint 식별 정보를 기록해 복구 시 publish 여부를 판정한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Exactly-once</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">장애·재시작 뒤에도 한 logical input 구간이 table state에 0번이나 2번이 아니라 최종적으로 정확히 1번 반영되는 end-to-end 보장이다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Streaming에서는 process가 계속 살아 있으므로 “job 종료 후 commit”을 기다릴 수 없다. Flink checkpoint가 source progress와 sink output을 일정한 구간으로 자르고, Iceberg snapshot이 그 구간을 reader에게 원자적으로 공개한다. 따라서 checkpoint 간격은 복구 시간뿐 아니라 table visibility latency, commit QPS, snapshot 수, 작은 file 수를 함께 결정한다.</p>
+  <p>가장 위험한 오해는 Flink dashboard의 checkpoint green을 곧 Iceberg commit success로 보는 것이다. 공식 문서처럼 Iceberg commit은 성공한 checkpoint의 <code>notifyCheckpointComplete</code> 뒤 일어나며, checkpoint는 성공했지만 catalog commit은 실패할 수 있다. 반대로 catalog commit이 성공한 뒤 callback 응답·state update 전에 process가 죽으면 복구 시 중복 commit 위험이 생긴다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> Checkpoint N의 input progress와 pending file 집합은 함께 복구되어야 하고, 같은 Flink job의 checkpoint N은 Iceberg snapshot chain에 최대 한 번만 publish되어야 한다. Table의 snapshot summary와 restored sink state가 이 불변식의 양쪽 증거다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Source + checkpoint coordinator</strong><br><span style="font-size:14px;color:#cdebf0;">offset/event stream · barrier N 주입</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ records + barrier N</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>② Transform / shuffle / Iceberg writer subtasks</strong><br><span style="font-size:14px;">partition/equality key 분배 · data/delete file flush</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ WriteResult(checkpoint N): paths · metrics · partitions</td></tr>
+    <tr><td style="background:#f7fafb;text-align:center;padding:13px;border:1px solid #c8d5dc;border-radius:8px;"><strong>③ Iceberg committer state</strong><br><span style="font-size:14px;">subtask 결과를 N별로 모아 checkpoint state에 저장</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ global checkpoint N 완료 → notifyCheckpointComplete(N)</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④ Iceberg optimistic commit</strong><br><span style="font-size:14px;">manifest → manifest list → metadata JSON → conflict validation</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ atomic catalog pointer swap</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Snapshot summary</strong><br><span style="font-size:14px;color:#cdebf0;">flink job identity + max committed checkpoint ID · reader visibility</span></td></tr>
+  </table>
+
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Barrier:</strong> Coordinator가 checkpoint N barrier를 source부터 흘린다. Source offset과 모든 downstream operator의 state가 같은 logical cut에 맞춰진다.</li>
+    <li><strong>Flush:</strong> Writer subtask는 N 이전 record가 든 open file을 닫고 storage에 업로드한다. File은 존재하지만 아직 table member가 아니며, writer state는 path·metrics를 checkpoint N에 귀속한다.</li>
+    <li><strong>Aggregate:</strong> Committer는 모든 subtask의 WriteResult를 N별 pending state로 저장한다. 한 subtask라도 barrier/state 저장에 실패하면 global checkpoint는 완료되지 않는다.</li>
+    <li><strong>Notify:</strong> Flink이 checkpoint N의 durability를 확정하면 completion callback을 보낸다. 이때 source offset 복구점은 durable하지만 Iceberg catalog commit은 이제 시작할 수 있다.</li>
+    <li><strong>Publish:</strong> Committer가 file을 manifest graph에 넣고 optimistic commit을 수행한다. Catalog pointer swap 뒤 reader가 N의 row를 보며 snapshot summary가 job/checkpoint identity를 남긴다.</li>
+    <li><strong>Recover:</strong> 장애 후 sink는 restored state와 table snapshot summary를 비교한다. 이미 publish된 checkpoint는 skip하고 아직 publish되지 않은 pending checkpoint만 처리해야 중복을 막는다.</li>
+    <li><strong>Continue:</strong> Source는 checkpoint N offset 이후를 재처리한다. Stable operator UID, 동일 job identity, 보존된 checkpoint/savepoint state가 protocol continuity에 중요하다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">두 개의 state machine을 하나로 묶기</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:22%;">상태</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:34%;">소유자</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">성공 조건·실패 창</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Processed offsets</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Flink source/operator checkpoint state.</td><td style="padding:8px;border:1px solid #dbe3e8;">Checkpoint storage에 durable한 global completion이 있어야 복구점이 된다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Pending files</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Writer/committer state + object storage.</td><td style="padding:8px;border:1px solid #dbe3e8;">Checkpoint에 귀속되지만 snapshot 미참조. 실패 checkpoint file은 orphan 후보다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Committed files</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Iceberg snapshot/manifest graph.</td><td style="padding:8px;border:1px solid #dbe3e8;">Catalog pointer가 새 metadata JSON을 가리켜야 table member다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Dedup marker</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Snapshot summary의 Flink job/checkpoint identity.</td><td style="padding:8px;border:1px solid #dbe3e8;">Commit ack 유실 뒤 복구가 이미 publish된 N을 판별할 수 있어야 한다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Current pointer</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Catalog.</td><td style="padding:8px;border:1px solid #dbe3e8;">Optimistic validation + atomic swap이 linearization point다.</td></tr>
+  </table>
+
+  <h3 style="font-size:18px;color:#07566a;">Exactly-once가 깨지는 네 개의 창</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Flush 후 checkpoint 실패:</strong> File은 storage에 있지만 pending state도 global completion도 없다. Reader에는 안 보이고 충분한 safety window 뒤 orphan cleanup 대상이다.</li>
+    <li><strong>Checkpoint 성공 후 commit 실패:</strong> Flink UI는 green일 수 있지만 snapshot은 없다. <code>elapsedSecondsSinceLastSuccessfulCommit</code>와 catalog error를 함께 alert해야 한다.</li>
+    <li><strong>Commit 성공 후 ack/state 유실:</strong> Snapshot은 존재하지만 process가 실패를 관찰할 수 있다. 복구 시 summary의 job/checkpoint marker로 중복 publish를 막는다.</li>
+    <li><strong>Recovery state 손실:</strong> Operator UID 변경, 잘못된 savepoint, <code>allowNonRestoredState</code> 남용, last Flink snapshot expiration은 sink의 dedup evidence를 끊어 data loss/duplicate 위험을 만든다.</li>
+  </ol>
+
+  <h3 style="font-size:18px;color:#07566a;">Checkpoint interval의 비용 함수</h3>
+  <p>Interval을 짧게 하면 visibility latency와 RPO는 작아지지만 writer가 자주 flush되어 작은 file·snapshot·manifest·catalog commit QPS가 증가한다. 길게 하면 file은 커지기 쉽지만 장애 시 replay 범위, reader freshness, pending bytes가 증가한다. 최적값은 “1분/5분” 같은 관습이 아니라 ingest bytes/sec, writer parallelism, target file size, catalog p95 commit, recovery SLA로 계산한다.</p>
+  <p>예를 들어 40MB/s를 8 writer가 균등 처리하고 5분마다 flush하면 writer당 약 1.5GB이므로 target 256MB file 여러 개가 가능하다. 반대로 2MB/s 전체를 64 writer가 30초마다 flush하면 task당 약 0.94MB밖에 안 되어 small-file 폭증이 예상된다. Checkpoint를 줄이는 대신 distribution/parallelism/rolling policy와 post-commit compaction을 함께 조정한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · End-to-end identity:</strong> Flink job ID, stable operator UID, checkpoint ID, source offset range, Iceberg snapshot ID를 한 trace로 연결한다. 배포 때 UID를 바꾸면 savepoint state mapping이 깨질 수 있으므로 명시적으로 관리한다.</p>
+  <p><strong>Best practice 2 · 두 성공 지표:</strong> Flink completed checkpoint age와 Iceberg <code>elapsedSecondsSinceLastSuccessfulCommit</code>를 따로 alert한다. Checkpoint만 green이고 snapshot이 멈추는 상태를 독립 장애로 취급한다.</p>
+  <p><strong>Best practice 3 · Interval/parallelism/file size 공동 설계:</strong> 예상 <code>bytes per checkpoint ÷ active writers</code>를 target file size와 비교한다. Low-cardinality hash key에 writer 수만 늘리지 말고 skew·backpressure·open file 수도 본다.</p>
+  <p><strong>Best practice 4 · UPSERT 계약:</strong> Format v2, primary key/identifier field, equality field를 맞춘다. Partitioned table에서는 partition transform의 source column이 equality field에 포함돼야 old partition row를 정확히 지울 수 있다. Late event ordering과 tombstone policy도 별도다.</p>
+  <p><strong>Best practice 5 · Maintenance safety:</strong> Last Flink-created snapshot과 job summary를 retention한다. Orphan cleanup threshold는 최장 checkpoint, backpressure, restart, commit retry보다 길게 잡고 active job의 pending file을 지우지 않는다.</p>
+  <p><strong>Anti-pattern:</strong> Checkpoint 비활성 상태에서 streaming INSERT, checkpoint green만으로 freshness 판단, savepoint 없이 operator UID 변경, <code>allowNonRestoredState</code>로 배포 통과, commit lag를 checkpoint interval만 줄여 해결, active writer 중 aggressive orphan cleanup이다.</p>
+  <p><strong>Edge case:</strong> Checkpoint N commit이 catalog conflict로 지연되는 동안 N+1 file이 pending일 수 있다. Committer는 checkpoint order와 table current state를 보존해야 하며 운영자는 storage listing 순서나 file mtime으로 publish 순서를 추정하면 안 된다.</p>
+  <p><strong>Version/engine 차이:</strong> Iceberg 1.11.0의 기본 <code>FlinkSink</code>와 실험적 SinkV2 기반 <code>IcebergSink</code>는 feature·UID 설정·distribution 지원이 다르다. Flink/Iceberg runtime JAR의 major 조합, SQL/Table/DataStream API, SinkV2 flag를 capability matrix로 검증한다. 최신 1.12 문서의 default/version 예를 1.11 runtime에 그대로 적용하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Flink checkpoint는 계속 완료되는데 Iceberg snapshot이 전진하지 않거나 재시작 뒤 duplicate/missing row가 의심된다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Completed checkpoint ID는 증가하지만 snapshot 정지, <code>elapsedSecondsSinceLastSuccessfulCommit</code> 증가, pending/temp file 누적, restart 후 duplicate/missing, catalog conflict/timeout, commit duration 급증, small file·snapshot 폭증, checkpoint alignment/backpressure 악화.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Flink job ID·operator UID·checkpoint ID/status/time/duration, source offsets, savepoint path, writer flush/committer metrics, last commit age/duration, catalog exception/request ID, current snapshot/history/summary의 Flink properties, added data/delete files, pending path·mtime, checkpoint/storage/catalog availability timeline, runtime versions.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Completion callback 미호출/지연, catalog outage·credential expiry·conflict, backpressure로 flush 지연, operator UID/savepoint mismatch, 이미 commit됐으나 ack 유실, snapshot expiration으로 dedup marker 손실, orphan cleanup이 pending file 삭제, checkpoint 간격/parallelism 과다, upsert equality/partition key 오류.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">자동 restart·cleanup·새 배포를 잠시 제한하고 checkpoint/savepoint와 pending file을 보존한다. Table current snapshot summary에서 같은 job의 max committed checkpoint를 read-only로 확인해 Flink state와 대조한다. Catalog/auth를 복구하고 commit lag 원인을 분리한 뒤 검증된 savepoint에서 stable UID로 재시작한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Snapshot에 N이 있으면 N까지 published로 간주하고 이후 state를 이어 간다. N이 없고 pending state가 복구되면 connector protocol로 commit/replay한다. 잘못된 deployment는 compatible savepoint·UID로 rollback한다. Duplicate는 source/checkpoint/snapshot 증거로 범위를 특정해 forward correction하고 orphan은 safety window 뒤 제거한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Admin key 배포, checkpoint green만 보고 offset 수동 전진, <code>allowNonRestoredState</code>로 강제 기동, table summary/metadata 수동 편집, active pending file 즉시 삭제, last Flink snapshot expiration, 같은 input의 별도 job 중복 투입, evidence 전 savepoint/log 삭제를 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 실제 Flink cluster 없이 checkpoint→flush→notify→Iceberg commit→recovery의 상태 전이를 작은 model로 재현한다. 프로젝트에 Flink runtime이 아직 없으므로 protocol 불변식을 먼저 검증하고, production 적용 전 exact connector version으로 통합 test를 추가한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Node.js 18 이상만 필요하며 repository file은 바꾸지 않는다.</li>
+    <li>Checkpoint 41 commit 뒤 ack를 잃어도 restore가 table summary의 41을 보고 재commit하지 않아야 한다.</li>
+    <li>Checkpoint 42는 flush만 하고 global completion 전 crash하므로 snapshot에 없어야 하며 file은 orphan 후보다.</li>
+    <li>Checkpoint 43이 완료됐지만 catalog commit이 실패하면 Flink checkpoint와 Iceberg snapshot 진행이 갈라져야 한다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Happy path와 ambiguous ack</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+const state = {
+  jobId: 'job-A',
+  flinkCompleted: new Set(),
+  pending: new Map(),
+  snapshots: []
+};
+function flush(cp, files) { state.pending.set(cp, files); }
+function complete(cp) { state.flinkCompleted.add(cp); }
+function maxCommitted(jobId) {
+  return Math.max(-1, ...state.snapshots
+    .filter(s =&gt; s.jobId === jobId)
+    .map(s =&gt; s.checkpointId));
+}
+function notifyAndCommit(cp, loseAck=false) {
+  if (!state.flinkCompleted.has(cp)) throw Error('checkpoint-not-complete');
+  if (cp &lt;= maxCommitted(state.jobId)) return 'SKIP already-published';
+  const files = state.pending.get(cp) || [];
+  state.snapshots.push({jobId:state.jobId, checkpointId:cp, files});
+  if (!loseAck) state.pending.delete(cp);
+  return loseAck ? 'COMMITTED ack-lost' : 'COMMITTED';
+}
+
+flush(41, ['data-41-a.parquet', 'data-41-b.parquet']);
+complete(41);
+console.log('first-attempt=', notifyAndCommit(41, true));
+console.log('restore-sees-max=', maxCommitted('job-A'));
+console.log('retry=', notifyAndCommit(41));
+console.log('snapshots=', JSON.stringify(state.snapshots));
+NODE</pre>
+  <p><strong>예상 관찰:</strong> First attempt는 commit됐지만 ack를 잃고, restore는 max=41을 읽는다. Retry는 <code>SKIP already-published</code>이며 snapshot은 정확히 하나다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Failure injection: flush 후 checkpoint 실패</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+const objectStore = new Set(['data-42-a.parquet','data-42-b.parquet']);
+const globalCompleted = new Set();
+const snapshots = [];
+const checkpointId = 42;
+
+console.log('files-exist=', [...objectStore]);
+console.log('global-complete=', globalCompleted.has(checkpointId));
+if (globalCompleted.has(checkpointId)) snapshots.push({checkpointId});
+console.log('table-member=', snapshots.some(s =&gt; s.checkpointId === checkpointId));
+console.log('cleanup-now=', 'DENY; active/retry safety window 필요');
+NODE</pre>
+  <p><strong>예상 관찰:</strong> Object는 존재하지만 global-complete와 table-member는 false다. File existence를 commit success로 해석하지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Failure injection: green checkpoint, red commit</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+const nowSec = 10_000;
+const status = {
+  completedCheckpointId: 43,
+  lastCompletedCheckpointAtSec: 9_990,
+  lastIcebergSnapshotCheckpointId: 41,
+  lastSuccessfulCommitAtSec: 9_000,
+  expectedCommitIntervalSec: 300
+};
+const commitLag = nowSec - status.lastSuccessfulCommitAtSec;
+const checkpointLag = nowSec - status.lastCompletedCheckpointAtSec;
+console.log({checkpointLag, commitLag});
+console.log('flink-checkpoint-health=', checkpointLag &lt; 300 ? 'GREEN' : 'RED');
+console.log('iceberg-commit-health=', commitLag &gt; 2 * status.expectedCommitIntervalSec ? 'RED' : 'GREEN');
+console.log('checkpoint-gap=', status.completedCheckpointId - status.lastIcebergSnapshotCheckpointId);
+NODE</pre>
+  <p><strong>예상 관찰:</strong> Flink은 GREEN이지만 Iceberg commit은 RED이고 gap=2다. 실제 alert는 traffic idle 여부, expected interval, maintenance window를 반영하되 두 signal을 합치지 않는다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Checkpoint interval과 small-file 예측</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+function estimate(mbPerSec, writers, intervalSec, targetMb) {
+  const mbPerWriter = mbPerSec * intervalSec / writers;
+  return {
+    mbPerSec, writers, intervalSec, mbPerWriter,
+    targetMb,
+    risk: mbPerWriter &lt; targetMb * 0.25 ? 'HIGH small-file risk' :
+          mbPerWriter &lt; targetMb ? 'MEDIUM' : 'LOW'
+  };
+}
+console.table([
+  estimate(40, 8, 300, 256),
+  estimate(2, 64, 30, 256),
+  estimate(20, 16, 120, 256)
+]);
+NODE</pre>
+  <p><strong>판정:</strong> 단순 모델은 partition skew·rolling·compression을 생략했지만, interval만 정하기 전에 writer당 checkpoint bytes를 계산해야 함을 보여 준다. 실제로는 <code>flushedDataFiles</code>, file-size histogram, backpressure, commit latency로 보정한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>Checkpoint가 비활성:</strong> Streaming INSERT는 pending file을 durable snapshot으로 자주 publish하지 못한다. 실행 전 checkpoint interval과 storage를 검증한다.</li>
+    <li><strong>Commit lag metric만 증가:</strong> <code>notifyCheckpointComplete</code>, catalog/auth/conflict, traffic idle을 분리한다.</li>
+    <li><strong>Restore 뒤 state missing:</strong> Stable operator UID, savepoint provenance, connector version compatibility를 확인한다. 강제 non-restored state로 우회하지 않는다.</li>
+    <li><strong>UPSERT가 old row를 못 지움:</strong> V2, primary/identifier field, equality field, partition source column 포함 여부를 확인한다.</li>
+    <li><strong>File 수 폭증:</strong> Checkpoint interval만 늘리지 말고 writer parallelism·distribution skew·target size·compaction 비용을 같이 본다.</li>
+  </ul>
+
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <p>실습은 in-memory Node process만 사용하므로 file cleanup이 없다. 실제 Flink sandbox에서 재현했다면 job을 cancel-with-savepoint로 종료하고 test table의 last snapshot·pending file age를 확인한 뒤 table과 checkpoint storage를 순서대로 정리한다. Active job이 남아 있을 때 orphan cleanup을 실행하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px;">
+    <li><strong>Checkpoint complete = Iceberg commit complete</strong>가 아니다. Completion callback 뒤 catalog commit이 실패할 수 있다.</li>
+    <li><strong>Pending file = duplicate data</strong>가 아니다. Snapshot graph membership부터 확인한다.</li>
+    <li><strong>Exactly-once = connector만의 기능</strong>이 아니다. Source offset, stable state, catalog commit, recovery identity가 모두 이어져야 한다.</li>
+    <li><strong>짧은 checkpoint = 무조건 낮은 지연</strong>이 아니다. Backpressure·flush·commit QPS·small file 때문에 오히려 악화될 수 있다.</li>
+    <li><strong>UPSERT key = partition key</strong>가 아니다. Equality field에 partition transform source column을 포함해야 이동 row를 지울 수 있다.</li>
+    <li><strong>Snapshot expiration = reader retention만의 문제</strong>가 아니다. Flink 복구의 last committed checkpoint marker를 지울 수 있다.</li>
+    <li><strong>SinkV2 = 무조건 최신·안전</strong>이 아니다. 1.11.0 문서는 experimental 경계를 명시하므로 실제 capability test가 필요하다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Kafka→Flink→Iceberg exactly-once를 장애 창별로 방어하라.</strong><br><em>좋은 답변 구조:</em> Source offset/barrier → writer flush/pending file → global checkpoint → completion callback → catalog commit linearization → summary dedup marker → flush 전/후·commit 전/후 crash → restore reconciliation → orphan safety window와 test evidence.</li>
+    <li><strong>초당 200MB, writer 64개, target 256MB에서 checkpoint interval을 정하라.</strong><br><em>좋은 답변 구조:</em> Freshness/RPO 요구 → bytes per writer 계산 → partition skew·compression·rolling → checkpoint alignment/backpressure → catalog commit p95/QPS → snapshot/small-file 비용 → 60/120/300초 실험 → metrics와 adaptive tuning.</li>
+    <li><strong>Checkpoint는 green인데 40분간 snapshot이 없다. Incident commander라면?</strong><br><em>좋은 답변 구조:</em> 두 state machine 분리 → checkpoint/job/UID와 commit metric → table summary의 job/max checkpoint → catalog/auth/conflict 가설 → restart/cleanup freeze → safe savepoint → published/pending 판정 → 복구와 duplicate audit → SLO/alert 개선.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Spark SELECT가 data file 전 따라가는 metadata path는?</li>
+    <li>Executor task success가 Iceberg commit success가 아닌 이유는?</li>
+    <li>Spark 3.5.8에서 SQL MERGE/CALL과 DataFrame mergeInto의 경계는?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Catalog pointer→metadata JSON→snapshot→manifest list→manifest→scan task. ② Task는 immutable candidate file만 만들고 driver validation·catalog pointer swap이 남는다. ③ SQL MERGE/CALL은 Iceberg extension으로 가능하며 DataFrame mergeInto는 Spark 4.0+다. 성공 확정점을 말하면 만점.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Checkpoint N의 flush부터 reader visibility까지 상태 변화를 순서대로 말하라.</li>
+    <li>Checkpoint green인데 Iceberg snapshot이 멈출 수 있는 이유는?</li>
+    <li>복구 시 중복 commit을 막는 두 증거는 무엇인가?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Barrier→writer flush→pending state→global completion→notify→optimistic commit→pointer swap→summary. ② Iceberg commit은 completion callback 뒤 별도로 실패/미호출될 수 있다. ③ Restored committer state와 table snapshot summary의 Flink job/checkpoint marker다. File existence가 아닌 graph membership을 말하면 만점.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/flink/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Flink Getting Started</a> — Table/DataStream API, streaming read/write와 runtime 조합.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/flink-writes/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Flink Writes</a> — checkpoint commit metrics, UPSERT, distribution, recovery/maintenance 주의.</li>
+    <li><a href="https://iceberg.apache.org/docs/1.11.0/flink-configuration/" style="color:#087f8c;">Apache Iceberg 1.11.0 · Flink Configuration</a> — read/write option과 runtime 설정 기준.</li>
+    <li><a href="https://iceberg.apache.org/spec/" style="color:#087f8c;">Apache Iceberg · Table Specification</a> — snapshot summary, manifest graph, sequence와 commit 상태의 표준.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">확인 기준: 2026-10-19. 현재 프로젝트에는 Flink runtime이 없고 Spark 3.5.8 + Iceberg 1.11.0만 구성돼 있다. Flink 실배포 전 Flink major, Scala binary, Iceberg runtime JAR, FlinkSink/IcebergSink, catalog/FileIO 조합을 공식 compatibility와 통합 test로 검증한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <p><strong>Week 6 · Day 40 — Trino interoperability·type/feature matrix</strong></p>
+  <p>Spark·Flink가 쓴 같은 snapshot을 Trino가 읽을 때 format version, data/delete artifact, type, procedure, branch, catalog capability가 어디까지 호환되는지 matrix로 검증한다.</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

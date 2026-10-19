@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-10-18T09:05:48+09:00",
+  "updatedAt": "2026-10-19T09:07:36+09:00",
   "lessons": [
     {
       "day": 1,
@@ -347,6 +347,15 @@
       "path": "day-38.html",
       "kind": "lesson",
       "publishedAt": "2026-10-18T09:05:48+09:00"
+    },
+    {
+      "day": 39,
+      "week": 6,
+      "title": "Flink streaming commit/checkpoint",
+      "summary": "Flink barrier·writer flush·committer state·completion callback·Iceberg snapshot commit을 연결하고 checkpoint와 table state의 exactly-once 복구 경계를 검증합니다.",
+      "path": "day-39.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-19T09:07:36+09:00"
     }
   ]
 }
