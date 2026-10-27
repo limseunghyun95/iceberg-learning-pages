@@ -4,7 +4,7 @@
   "tagline": "metadata tree에서 transaction·multi-engine 운영까지",
   "accent": "#22d3ee",
   "totalDays": 63,
-  "updatedAt": "2026-10-19T09:07:36+09:00",
+  "updatedAt": "2026-10-28T01:28:36+09:00",
   "lessons": [
     {
       "day": 1,
@@ -356,6 +356,15 @@
       "path": "day-39.html",
       "kind": "lesson",
       "publishedAt": "2026-10-19T09:07:36+09:00"
+    },
+    {
+      "day": 40,
+      "week": 6,
+      "title": "Trino interoperability·type/feature matrix",
+      "summary": "Trino와 Spark/Flink가 같은 catalog pointer·snapshot·schema·delete artifact를 동일하게 해석하는지 format, type, DML, procedure capability matrix와 round-trip test로 검증합니다.",
+      "path": "day-40.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-28T01:28:36+09:00"
     }
   ]
 }

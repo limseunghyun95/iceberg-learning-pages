@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Iceberg 심화 커리큘럼 Day 40</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f6f8;color:#17212b;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;overflow-wrap:anywhere;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;table-layout:fixed;background:#f3f6f8;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;box-sizing:border-box;background:#ffffff;border:1px solid #dbe3e8;border-radius:14px;">
+<tr><td style="background:#073642;padding:30px 26px;color:#ffffff;">
+  <div style="font-size:13px;letter-spacing:1.5px;color:#8ee7f6;font-weight:700;">APACHE ICEBERG · WEEK 6 / DAY 40</div>
+  <h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#ffffff;">Trino interoperability·type/feature matrix</h1>
+  <p style="margin:0;color:#d5edf2;font-size:16px;">Catalog·Multi-engine·Streaming · 개념 45분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+  <div style="background:#e9f8fb;border-left:5px solid #0b8198;padding:16px 18px;margin-bottom:28px;">
+    <strong style="color:#07566a;">한 줄 요약</strong><br>
+    같은 Iceberg table을 연다는 사실은 호환성의 시작일 뿐이다. Catalog pointer와 snapshot을 동일하게 보고, format version·type·delete artifact·DML·procedure의 교집합을 round-trip test로 증명해야 multi-engine 계약이 성립한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:35%;font-weight:700;vertical-align:top;">Interoperability</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">서로 다른 engine이 같은 table state를 의미 손실 없이 읽고, 허용된 쓰기를 이어 가는 능력이다. 단순 file open보다 넓다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Capability matrix</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Engine·connector·catalog 조합별 read/write/type/delete/procedure 지원을 표로 고정한 배포 계약이다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Format version</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Metadata JSON의 <code>format-version</code>이다. V1은 analytic table, V2는 row-level delete, V3는 nanosecond timestamp·variant·deletion vector·row lineage 등을 추가한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Artifact</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Data file, equality/position delete file, deletion vector, manifest처럼 table semantics를 구성하는 물리 객체다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Round trip</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Spark write→Trino read→Trino write→Spark read처럼 양방향으로 값·schema·snapshot을 검증하는 test다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Semantic drift</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">Query는 성공하지만 timestamp precision, timezone, decimal, nested field 의미가 달라지는 조용한 불일치다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">Reader ceiling</td><td style="padding:11px;border:1px solid #dbe3e8;vertical-align:top;">모든 production reader 중 가장 낮은 지원 수준이다. Writer가 이 경계를 넘으면 table 전체가 읽히지 않을 수 있다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">2. 왜 중요한가</h2>
+  <p>Iceberg는 engine 독립 table format이지만 각 engine은 독립 release cadence와 connector 구현을 가진다. Spark가 V3 type이나 deletion vector를 쓰기 시작해도 Trino가 그 조합을 안정적으로 읽는다는 보장은 없다. “Spec에 있다”와 “이 connector version이 production-grade로 읽고 쓴다”를 분리해야 한다.</p>
+  <p>호환성 실패는 즉시 exception만 만들지 않는다. <code>TIME(6)</code>·<code>TIMESTAMP(6)</code> precision 축소, timezone 해석, <code>FIXED</code>→<code>VARBINARY</code> mapping처럼 query는 성공해도 round trip에서 정보가 달라질 수 있다. 행 수만 비교하는 test는 부족하다.</p>
+  <div style="background:#fff7e6;border:1px solid #f0cf88;padding:15px 17px;margin:18px 0;">
+    <strong>핵심 불변식:</strong> 어느 writer도 production reader ceiling보다 높은 format/type/artifact를 publish하지 않는다. 한 engine이 만든 snapshot은 다른 승인 engine이 동일 row set·schema identity·delete semantics로 해석해야 한다.
+  </div>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처 그림과 요청 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;table-layout:fixed;">
+    <tr><td style="background:#073642;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① Trino coordinator</strong><br><span style="font-size:14px;color:#cdebf0;">SQL parse · connector capability · query planning</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ table name / reference</td></tr>
+    <tr><td style="background:#fff7e6;text-align:center;padding:13px;border:1px solid #f0cf88;border-radius:8px;"><strong>② Catalog</strong><br><span style="font-size:14px;">name → current metadata JSON pointer · atomic commit primitive</span></td></tr>
+    <tr><td style="text-align:center;color:#0b8198;font-size:21px;">↓ metadata location + storage credential</td></tr>
+    <tr><td style="background:#eef5ff;text-align:center;padding:13px;border:1px solid #adc7e8;border-radius:8px;"><strong>③ Metadata JSON → snapshot → manifest list → manifest</strong><br><span style="font-size:14px;">format version · field ID · partition spec · data/delete artifact</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ prune / split planning</td></tr>
+    <tr><td style="background:#edf8f2;text-align:center;padding:13px;border:1px solid #9fd4b7;border-radius:8px;"><strong>④ Trino workers</strong><br><span style="font-size:14px;">Parquet/ORC/Avro read · delete merge · type conversion</span></td></tr>
+    <tr><td style="text-align:center;color:#b46a00;font-size:21px;">↓ DML이면 new files + manifests</td></tr>
+    <tr><td style="background:#123d49;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>⑤ Optimistic catalog commit</strong><br><span style="font-size:14px;color:#cdebf0;">validate base pointer → atomic swap → Spark/Flink reader에 공개</span></td></tr>
+  </table>
+  <h3 style="font-size:18px;margin:24px 0 8px;color:#07566a;">번호별 요청·응답·상태 변화</h3>
+  <ol style="padding-left:22px;">
+    <li><strong>Resolve:</strong> Coordinator는 connector와 catalog를 통해 table name을 current metadata location으로 해석한다.</li>
+    <li><strong>Load:</strong> Metadata JSON의 format version, schemas, partition specs, sort orders, snapshots, refs를 읽는다. 지원하지 않는 높은 version이면 반드시 실패해야 한다.</li>
+    <li><strong>Plan:</strong> Manifest list와 manifest metrics로 file을 prune한다. Delete file/DV를 인식하지 못하면 삭제 row가 되살아나는 correctness bug가 된다.</li>
+    <li><strong>Read:</strong> Worker가 data file과 적용 가능한 delete artifact를 합성하고 Iceberg type을 Trino type으로 바꾼다.</li>
+    <li><strong>Write:</strong> INSERT/UPDATE/MERGE/DELETE는 immutable candidate file과 새 metadata를 만든다. 지원 범위는 Trino·catalog·file format·table format의 교집합이다.</li>
+    <li><strong>Commit:</strong> Catalog pointer swap이 성공 확정점이다. Object storage에 file만 생긴 것은 commit이 아니다.</li>
+    <li><strong>Re-open:</strong> Spark/Flink가 새 pointer부터 graph를 다시 읽어 같은 값·delete semantics를 확인해야 round trip이 끝난다.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">4. CS 관점의 내부 동작</h2>
+  <h3 style="font-size:18px;color:#07566a;">호환성은 집합의 교집합</h3>
+  <p>배포 가능한 table 기능 집합은 <code>Spec ∩ Writer ∩ Reader ∩ Catalog ∩ FileIO ∩ Policy</code>다. Spec은 가능한 표현을 정의하지만 실제 release가 모두 구현했다는 뜻은 아니다. Catalog는 atomic commit과 credential 범위를 제공해야 하고 FileIO는 object storage scheme·encryption을 처리해야 한다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:25%;">축</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;width:32%;">호환 조건</th><th style="padding:8px;border:1px solid #dbe3e8;background:#073642;color:#fff;text-align:left;">깨질 때 결과</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Format</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">모든 reader가 version과 artifact를 지원.</td><td style="padding:8px;border:1px solid #dbe3e8;">Load 거부 또는 delete 무시.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Type</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">양방향 mapping과 precision 보존.</td><td style="padding:8px;border:1px solid #dbe3e8;">Query 실패 또는 silent coercion.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Operation</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">DML·DDL·procedure validation 일치.</td><td style="padding:8px;border:1px solid #dbe3e8;">충돌 누락, 예상 밖 rewrite.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Reference</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">Branch/tag/snapshot syntax·retention 일치.</td><td style="padding:8px;border:1px solid #dbe3e8;">다른 state 조회 또는 rollback 상실.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dbe3e8;"><strong>Control plane</strong></td><td style="padding:8px;border:1px solid #dbe3e8;">같은 catalog pointer와 auth scope 사용.</td><td style="padding:8px;border:1px solid #dbe3e8;">Split-brain table 또는 commit 실패.</td></tr>
+  </table>
+  <h3 style="font-size:18px;color:#07566a;">Type mapping에서 정보량 보기</h3>
+  <p>현재 공식 Trino 문서는 Iceberg <code>TIME</code>을 <code>TIME(6)</code>, <code>TIMESTAMP</code>를 <code>TIMESTAMP(6)</code>으로 mapping하고 V3 nanosecond timestamp는 <code>TIMESTAMP(9)</code>으로 mapping한다. <code>FIXED(L)</code>는 <code>VARBINARY</code>로 보이므로 길이 제약을 query type만으로 보존하지 않는다. Nested struct/list/map은 field ID와 nullability까지 비교한다.</p>
+  <p>V3는 deletion vector, row lineage, variant, nanosecond timestamp를 더한다. 현재 Trino 문서는 V1·V2 지원과 V3 experimental 지원을 구분한다. “Trino 최신은 V3를 읽는다”가 아니라 exact version과 필요한 V3 feature 각각을 test해야 한다.</p>
+  <h3 style="font-size:18px;color:#07566a;">성공 확정점과 cache</h3>
+  <p>Write 성공은 task가 file을 썼을 때가 아니라 catalog pointer가 새 metadata로 교체됐을 때다. Reader는 query planning 시 선택한 snapshot에 고정된다. Metadata/file-system cache가 켜져 있으면 새 query freshness와 cache TTL도 관찰하되, running query가 새 snapshot으로 이동한다고 기대하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+  <p><strong>Best practice 1 · Exact BOM:</strong> Spark/Flink/Trino version, Iceberg connector/runtime, JVM/Scala, catalog, FileIO, file format을 한 Bill of Materials로 version-control한다.</p>
+  <p><strong>Best practice 2 · Read/write gate 분리:</strong> Trino read 허용과 Trino MERGE/DELETE 허용은 별도 승인한다. Reader-only consumer가 많을수록 writer 수를 줄여 protocol surface를 작게 만든다.</p>
+  <p><strong>Best practice 3 · Golden table:</strong> Null, NaN, decimal 경계, pre/post epoch timestamp, timezone, UUID, binary, nested rename, old/new partition spec, equality/position delete를 가진 작은 table을 모든 release에서 round trip한다.</p>
+  <p><strong>Best practice 4 · Reader ceiling:</strong> V2→V3 upgrade 전 모든 reader와 fallback version이 V3 table load, 필요한 type, DV read, maintenance procedure를 통과해야 한다. Metadata-only upgrade라도 호환성 위험은 metadata-only가 아니다.</p>
+  <p><strong>Best practice 5 · Ownership:</strong> Table property·schema·partition·sort·format upgrade의 단일 owner와 change approval을 둔다. Engine session property가 durable table contract를 몰래 바꾸지 못하게 한다.</p>
+  <p><strong>Anti-pattern:</strong> 한 engine의 smoke SELECT만으로 호환 선언, latest 문서를 구버전 cluster에 적용, 행 수만 비교, timestamp를 문자열로 우회, production에서 바로 format upgrade, connector default 의존, 같은 warehouse를 서로 다른 catalog에 등록하는 것이다.</p>
+  <p><strong>Edge case:</strong> Engine A가 모르는 partition transform은 pruning만 못 할 수도 있고 table load가 실패할 수도 있다. V3 reader는 unknown transform을 무시하고 읽어야 하지만 older implementation은 깨질 수 있으므로 rollout test가 필요하다.</p>
+  <p><strong>Version/engine 차이:</strong> 현재 확인한 Trino 문서는 V1·V2를 지원하고 V3는 experimental로 명시한다. Iceberg 1.11.0과 Spark 3.5.8을 쓰는 이 프로젝트에서도 Trino connector는 별도 구현이므로 Java runtime version만 맞춘다고 feature parity가 생기지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+  <p><strong>상황:</strong> Spark에서는 정상인데 Trino에서 table load 실패, stale row, type 오류, MERGE 후 값 불일치가 발생한다.</p>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;width:34%;font-weight:700;vertical-align:top;">증상</td><td style="padding:11px;border:1px solid #dbe3e8;">Unsupported format/type, snapshot 불일치, 삭제 row 재등장, timestamp·decimal 차이, branch/tag 조회 실패, DML commit conflict, 한 engine만 stale metadata를 읽음.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">먼저 수집할 증거/지표</td><td style="padding:11px;border:1px solid #dbe3e8;">Exact engine/connector/catalog/FileIO version, query ID, catalog config, current metadata location·format-version·snapshot ID·schema/spec ID, manifest content, delete artifact, table properties, plan, source/target value hash, cache TTL, commit exception/request ID.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">가능한 가설</td><td style="padding:11px;border:1px solid #dbe3e8;">Reader ceiling 초과, V3 experimental feature, unsupported type/transform, timezone·precision coercion, delete artifact 미지원, 다른 catalog pointer, stale cache, storage 권한, concurrent conflict, procedure 차이.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#edf8f2;font-weight:700;vertical-align:top;">안전한 첫 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Write와 maintenance를 일시 중지하고 두 engine의 current metadata location·snapshot ID를 read-only로 비교한다. 실패 snapshot 이전 참조와 artifacts를 보존하고 golden query로 mismatch 축을 format/type/delete/catalog/cache 중 하나로 좁힌다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#f7fafb;font-weight:700;vertical-align:top;">rollback/복구</td><td style="padding:11px;border:1px solid #dbe3e8;">Compatible connector로 rollback하거나 검증된 snapshot/branch를 reader endpoint로 고정한다. 잘못 쓴 row는 evidence로 범위를 정해 forward correction한다. Format version은 숫자만 downgrade하지 말고 higher-version artifact/type 제거 가능성을 검증한다.</td></tr>
+    <tr><td style="padding:11px;border:1px solid #dbe3e8;background:#fff0f2;font-weight:700;vertical-align:top;">하지 말아야 할 조치</td><td style="padding:11px;border:1px solid #dbe3e8;">Metadata JSON 수동 편집, delete/Puffin file 삭제, format-version 숫자 강등, cache 전체 삭제로 덮기, 같은 warehouse를 새 catalog에 재등록, evidence 전 expire/orphan cleanup, mismatch table에 추가 MERGE를 하지 않는다.</td></tr>
+  </table>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">7. 35분 재현 실습</h2>
+  <p><strong>목표:</strong> 현재 저장소에는 Trino runtime이 없으므로 Node.js로 capability gate와 lossy type mapping을 재현한다. 결과를 먼저 예측한 뒤 실행하고, production 전에는 같은 case를 실제 Spark·Trino sandbox로 교체한다.</p>
+  <h3 style="font-size:18px;color:#07566a;">사전 조건과 실행 전 예측</h3>
+  <ul style="padding-left:22px;">
+    <li>Node.js 18 이상. Repository file은 변경하지 않는다.</li>
+    <li>V2 + position delete + microsecond timestamp는 승인되고, V3 + DV는 experimental policy로 차단될 것이다.</li>
+    <li><code>FIXED(16)</code>을 Trino <code>VARBINARY</code>로 round trip하면 길이 제약 metadata가 사라질 것이다.</li>
+    <li>두 engine이 다른 metadata pointer를 보면 row hash 비교 전에 split-brain으로 중단해야 한다.</li>
+  </ul>
+  <h3 style="font-size:18px;color:#07566a;">1단계 · Capability matrix gate</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+const engines = {
+  spark:{formats:[1,2,3],types:['timestamp_us','timestamp_ns','fixed'],artifacts:['data','position_delete','equality_delete','dv'],v3:'approved'},
+  trino:{formats:[1,2,3],types:['timestamp_us','timestamp_ns','fixed'],artifacts:['data','position_delete','equality_delete','dv'],v3:'experimental'}
+};
+const policy={allowExperimental:false};
+const tables=[
+  {name:'orders_v2',format:2,types:['timestamp_us'],artifacts:['data','position_delete']},
+  {name:'orders_v3',format:3,types:['timestamp_ns'],artifacts:['data','dv']}
+];
+for(const t of tables){
+  const failures=[];
+  for(const [name,e] of Object.entries(engines)){
+    if(!e.formats.includes(t.format)) failures.push(`${name}:format`);
+    if(t.types.some(x=&gt;!e.types.includes(x))) failures.push(`${name}:type`);
+    if(t.artifacts.some(x=&gt;!e.artifacts.includes(x))) failures.push(`${name}:artifact`);
+    if(t.format===3 &amp;&amp; e.v3==='experimental' &amp;&amp; !policy.allowExperimental) failures.push(`${name}:v3-experimental`);
+  }
+  console.log(t.name, failures.length?`BLOCK ${failures.join(',')}`:'APPROVE');
+}
+NODE</pre>
+  <p><strong>예상 관찰:</strong> <code>orders_v2 APPROVE</code>, <code>orders_v3 BLOCK trino:v3-experimental</code>. “읽을 수 있음”과 “조직이 production 승인함”은 다르다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">2단계 · Failure injection: type 정보 손실</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+const iceberg={type:'FIXED',length:16,value:Buffer.alloc(16,7)};
+const trino={type:'VARBINARY',value:iceberg.value};
+const writtenBack={type:'BINARY',value:trino.value};
+console.log('value-equal=',iceberg.value.equals(writtenBack.value));
+console.log('constraint-equal=',iceberg.type===writtenBack.type &amp;&amp; iceberg.length===writtenBack.length);
+console.log({icebergType:iceberg.type,trinoType:trino.type,roundTripType:writtenBack.type});
+NODE</pre>
+  <p><strong>예상 관찰:</strong> Byte 값은 같아도 constraint는 false다. Golden test는 값뿐 아니라 Iceberg schema type·field ID·nullability를 비교해야 한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">3단계 · Failure injection: 다른 catalog pointer</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+const observations={
+  spark:{catalog:'rest-prod',metadata:'s3://warehouse/orders/metadata/v105.metadata.json',snapshot:9005},
+  trino:{catalog:'hms-prod',metadata:'s3://warehouse/orders/metadata/v102.metadata.json',snapshot:9002}
+};
+const same=observations.spark.metadata===observations.trino.metadata;
+console.log(observations);
+console.log('same-current-pointer=',same);
+console.log('decision=',same?'continue row checksum':'STOP split-brain investigation');
+NODE</pre>
+  <p><strong>예상 관찰:</strong> Row checksum 전에 중단한다. 같은 warehouse path라도 catalog current pointer가 다르면 같은 table state가 아니다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">4단계 · Golden row checksum</h3>
+  <pre style="margin:10px 0;padding:14px;background:#102a33;color:#eefcff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">node &lt;&lt;'NODE'
+const crypto=require('crypto');
+function canonical(rows){return rows.slice().sort((a,b)=&gt;a.id-b.id).map(r=&gt;JSON.stringify(r)).join('\n');}
+function digest(rows){return crypto.createHash('sha256').update(canonical(rows)).digest('hex');}
+const spark=[{id:1,amount:'10.20',ts:'2026-10-28T00:00:00.123456Z'},{id:2,amount:null,ts:null}];
+const trino=[{id:1,amount:'10.20',ts:'2026-10-28T00:00:00.123456Z'},{id:2,amount:null,ts:null}];
+console.log('spark=',digest(spark));
+console.log('trino=',digest(trino));
+console.log('same=',digest(spark)===digest(trino));
+NODE</pre>
+  <p><strong>판정:</strong> Canonicalization은 type/precision을 숨기지 않게 설계한다. 실제 gate는 row hash와 함께 snapshot ID, schema JSON, data/delete file counts, plan을 저장한다.</p>
+
+  <h3 style="font-size:18px;color:#07566a;">자주 나는 오류와 해결</h3>
+  <ul style="padding-left:22px;">
+    <li><strong>실제 Trino에서 table not found:</strong> Catalog name·namespace·REST/HMS endpoint와 current metadata location을 비교한다.</li>
+    <li><strong>Unsupported type:</strong> 문자열 cast로 production을 통과시키지 말고 schema contract와 reader upgrade 순서를 결정한다.</li>
+    <li><strong>Delete row 재등장:</strong> Snapshot의 delete manifest content와 reader의 artifact 지원을 확인한다.</li>
+    <li><strong>DML 충돌:</strong> Base snapshot, isolation/validation, concurrent Spark/Flink job을 수집하고 blind retry하지 않는다.</li>
+    <li><strong>Node가 없음:</strong> 이론 결과를 기록하고 production과 분리된 sandbox에서 exact connector test를 수행한다.</li>
+  </ul>
+  <h3 style="font-size:18px;color:#07566a;">Cleanup</h3>
+  <p>실습은 in-memory process만 사용해 cleanup이 없다. 실제 sandbox에서는 writer를 중지하고 마지막 snapshot과 golden 결과를 보존한 뒤 test namespace를 catalog API로 제거한다. Object path를 먼저 직접 삭제하지 않는다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px;">
+    <li><strong>Spec 지원 = connector 지원</strong>이 아니다. Exact release와 feature를 확인한다.</li>
+    <li><strong>SELECT 성공 = write 호환</strong>이 아니다. DML과 procedure는 별도 gate다.</li>
+    <li><strong>값 동일 = schema 동일</strong>이 아니다. FIXED/BINARY, precision, nullability, field ID를 본다.</li>
+    <li><strong>Format V3 support = 모든 V3 기능 안정</strong>이 아니다. Type·DV·maintenance를 각각 test한다.</li>
+    <li><strong>같은 storage path = 같은 table</strong>이 아니다. Catalog current pointer가 identity 기준이다.</li>
+    <li><strong>Time travel = cache refresh</strong>가 아니다. Reference와 metadata cache를 구분한다.</li>
+    <li><strong>Format upgrade = 쉽게 downgrade 가능</strong>이 아니다. Higher-version artifact가 생기면 숫자만 되돌릴 수 없다.</li>
+  </ul>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+  <ol style="padding-left:22px;">
+    <li><strong>Spark writer와 Trino reader의 호환 gate를 설계하라.</strong><br><em>좋은 답변 구조:</em> Workload/SLO → exact BOM → catalog pointer → format/type/artifact matrix → golden dataset → 양방향 snapshot/schema/value 검증 → failure injection → canary → rollback과 owner.</li>
+    <li><strong>V2→V3 upgrade 승인 조건은?</strong><br><em>좋은 답변 구조:</em> 필요한 V3 feature → reader ceiling → Trino experimental 경계 → DV/type/row-lineage test → maintenance support → branch/canary → irreversible artifact → fallback 불가 조건.</li>
+    <li><strong>Spark와 Trino의 COUNT가 다르다. 어떻게 조사할 것인가?</strong><br><em>좋은 답변 구조:</em> Query time/reference 고정 → catalog/metadata/snapshot ID → schema/spec → manifest data/delete counts → delete capability → filter/plan/cache → row hash → writer freeze → compatible recovery.</li>
+  </ol>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">10. 복습과 정답</h2>
+  <h3 style="font-size:18px;color:#07566a;">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Flink checkpoint green이 Iceberg commit success를 뜻하지 않는 이유는?</li>
+    <li>Commit 성공 뒤 ack 유실 시 복구가 중복을 어떻게 막는가?</li>
+    <li>Checkpoint interval을 정할 때 file size 외 어떤 비용을 보는가?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Commit은 completion callback 뒤 별도로 실패할 수 있다. ② Restored state와 snapshot summary의 job/checkpoint marker를 대조한다. ③ Freshness/RPO, writer당 bytes, backpressure, catalog QPS·latency, snapshot/small-file 수를 본다. 두 state machine과 확정점을 말하면 만점.</p>
+  <h3 style="font-size:18px;color:#07566a;">오늘 내용 확인 3문제</h3>
+  <ol style="padding-left:22px;">
+    <li>Multi-engine 호환성의 여섯 교집합은 무엇인가?</li>
+    <li>Trino query가 성공해도 type round trip이 깨지는 예는?</li>
+    <li>두 engine의 COUNT가 다를 때 가장 먼저 비교할 pointer는?</li>
+  </ol>
+  <p style="background:#f7fafb;padding:14px;border:1px solid #dbe3e8;"><strong>짧은 정답/채점:</strong> ① Spec·Writer·Reader·Catalog·FileIO·Policy. ② FIXED→VARBINARY→BINARY 제약 손실, timestamp precision/timezone drift 등. ③ Catalog가 반환한 current metadata location과 snapshot ID. File listing보다 pointer를 먼저 말하면 만점.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">11. 공식 자료</h2>
+  <ul style="padding-left:22px;">
+    <li><a href="https://iceberg.apache.org/spec/" style="color:#087f8c;">Apache Iceberg · Table Specification</a> — format version, type, delete artifact와 reader 요구사항.</li>
+    <li><a href="https://iceberg.apache.org/multi-engine-support/" style="color:#087f8c;">Apache Iceberg · Multi-Engine Support</a> — engine integration과 lifecycle 경계.</li>
+    <li><a href="https://trino.io/docs/current/connector/iceberg.html" style="color:#087f8c;">Trino · Iceberg connector</a> — format support, type mapping, catalog, DML·procedure capability.</li>
+    <li><a href="https://iceberg.apache.org/docs/latest/evolution/" style="color:#087f8c;">Apache Iceberg · Evolution</a> — field ID 기반 schema·partition evolution.</li>
+  </ul>
+  <p style="font-size:14px;color:#53636d;">확인 기준: 2026-10-28. 현재 Trino 문서는 V1·V2 지원과 V3 experimental 지원을 구분한다. 실제 배포는 사용 중인 exact Trino release 문서와 capability test를 기준으로 한다.</p>
+
+  <h2 style="font-size:22px;color:#073642;border-bottom:2px solid #dbe8ec;padding-bottom:8px;margin:32px 0 14px;">12. 내일 예고</h2>
+  <p><strong>Week 6 · Day 41 — 랩: engine별 table property 차이 검토</strong></p>
+  <p>동일 table을 Spark·Flink·Trino에서 열고 durable table property와 engine session/config default를 분리해 compatibility test gate를 만든다.</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>
